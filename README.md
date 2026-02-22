@@ -15,7 +15,7 @@ Built with Python and tkinter. Single file. No install needed. Read-only -- your
 
 Most SQLite viewers choke on large databases, require SQL knowledge, or need complex installations. This tool is different:
 
-- **One file, zero setup** -- just run `python sqlite_forensic_analyzer.py`
+- **One file, zero setup** -- just run `python sqlite_gui_analyzer.py`
 - **Handles huge databases** -- tested on 5 GB+ databases with 270+ tables and millions of rows
 - **Blazing-fast search** -- searches 3000+ results across 272 tables in under 5 seconds
 - **Regex search with LIKE pre-filter** -- email/URL/phone regex patterns complete in 3-5 seconds on million-row tables
@@ -128,13 +128,13 @@ Numeric timestamps are automatically detected and decoded in the Row Detail view
 ### Run
 
 ```bash
-python sqlite_forensic_analyzer.py
+python sqlite_gui_analyzer.py
 ```
 
 Or open a database directly:
 
 ```bash
-python sqlite_forensic_analyzer.py path/to/database.db
+python sqlite_gui_analyzer.py path/to/database.db
 ```
 
 That's it. No pip install, no virtual env, no config files.
