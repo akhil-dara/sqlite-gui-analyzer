@@ -6,11 +6,9 @@ Built with Python and tkinter. Single file. No install needed. Read-only -- your
 
 > Perfect for developers, forensic investigators, data analysts, and anyone who needs to quickly explore SQLite databases without writing SQL.
 
-<!-- Add your screenshots here -->
-<!-- ![Search](screenshots/search.png) -->
-<!-- ![Browse](screenshots/browse.png) -->
-<!-- ![Schema](screenshots/schema.png) -->
-
+![Search](screenshots/search.png)
+![Browse](screenshots/browse.png)
+![Schema](screenshots/schema.png)
 ---
 
 ## Why This Tool?
