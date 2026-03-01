@@ -6,9 +6,9 @@ Built with Python and tkinter. Zero dependencies. Read-only -- your data is neve
 
 > Perfect for forensic investigators, developers, data analysts, and anyone who needs to quickly explore SQLite databases without writing SQL.
 
-![Search](Screenshots/search.png)
-![Browse](Screenshots/browse.png)
-![Schema](Screenshots/schema.png)
+![Search](screenshots/search.png)
+![Browse](screenshots/browse.png)
+![Schema](screenshots/schema.png)
 
 ---
 
@@ -67,8 +67,8 @@ Tree view of every table, view, index, and trigger.
 
 Dedicated tab for analyzing SQLite Write-Ahead Log (WAL) files at the binary level. Recovers data that standard SQLite tools cannot see.
 
-![WAL Tab](Screenshots/wal_tab.png)
-![WAL Search](Screenshots/wal-search.png)
+![WAL Tab](screenshots/wal_tab.png)
+![WAL Search](screenshots/wal-search.png)
 
 - **Pure binary WAL parser** using memory-mapped I/O -- reads data that standard SQLite APIs hide
 - **Automatic WAL backup** -- WAL file is backed up before opening so forensic data is never lost
