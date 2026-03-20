@@ -35,6 +35,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-#    version='version.txt',
-#    icon=['td.ico'],
+    version='version.txt',
+    icon=['icon.ico'],
 )
