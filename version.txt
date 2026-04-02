@@ -1,0 +1,29 @@
+# https://learn.microsoft.com/en-us/windows/win32/api/verrsrc/ns-verrsrc-vs_fixedfileinfo
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1,0,0,0),
+    prodvers=(1,0,0,0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0x01dcb8c3,0x08b3fa12)
+    ),
+  kids=[
+    StringFileInfo(
+      [
+      StringTable(
+        u'040904B0',
+        [StringStruct(u'CompanyName', u'Akhil Dara'),
+        StringStruct(u'FileDescription', u'SQLite Forensic Analyzer GUI'),
+        StringStruct(u'FileVersion', u'1.0.0'),
+        StringStruct(u'InternalName', u'SQLite Forensic Analyzer GUI'),
+        StringStruct(u'LegalCopyright', u'© 2026 Akhil Dara'),
+        StringStruct(u'OriginalFilename', u'SQLite Forensic Analyzer GUI'),
+        StringStruct(u'ProductName', u'SQLite Forensic Analyzer GUI v1.0.0'),
+        StringStruct(u'ProductVersion', u'1.0.0')])
+      ]), 
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)

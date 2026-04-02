@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools >= 77.0.30"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+exclude = ["binaries*", "build*", "dist*"]
+where = ["src"]
+
+[project]
+name = "sqlite-gui-analyzer"
+version = "1.0.0"
+requires-python = ">=3.9"
+authors = [
+  {name = "Akhil Dara"}
+]
+maintainers = [
+  {name = "Akhil Dara"}
+]
+description = "SQLite Forensic Analyzer"
+readme = "README.md"
+keywords = ["digital forensics", "dfir", "sqlite", "analyzer"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src", "sqlite_gui_analyzer" = "sqlite_gui_analyzer.py"}
+py-modules = ["sqlite_gui_analyzer"]
+
+[project.urls]
+Homepage = "https://github.com/akhil-dara/sqlite-gui-analyzer"
+
+[project.scripts]
+sqlite-gui-analyzer = "sqlite_gui_analyzer:main"
