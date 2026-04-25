@@ -1141,6 +1141,7 @@ class DB:
         except Exception:
             return {}, []
 
+
     @staticmethod
     def _fv(v):
         """Format value for display."""
@@ -1152,6 +1153,210 @@ class DB:
                 hx += "..."
             return hx
         return str(v)
+    # ── Freelist / Deleted Page Recovery ─────────────────────────────────
+    def freelist_count(self):
+        """Return the number of freelist pages reported by PRAGMA freelist_count."""
+        if not self.ok:
+            return 0
+        try:
+            r = self._conn.execute("PRAGMA freelist_count").fetchone()
+            return r[0] if r else 0
+        except Exception:
+            return 0
+
+    def read_freelist_pages(self):
+        """Read all freelist trunk and leaf pages directly from the main DB file.
+
+        Walks the freelist chain starting from DB header bytes 32–35.
+        Returns a list of dicts:
+        {page_num, page_type_byte, page_type, page_data, is_trunk}
+        """
+        if not self.ok or not self._path:
+            return []
+        try:
+            meta = self.meta()
+            page_size = int(meta.get("page_size", 4096) or 4096)
+            if page_size == 1:
+                page_size = 65536
+        except Exception:
+            page_size = 4096
+
+        results = []
+        visited = set()
+        try:
+            with open(self._path, "rb") as f:
+                f.seek(32)
+                trunk_num = int.from_bytes(f.read(4), "big")
+                if trunk_num == 0:
+                    return []
+                while trunk_num != 0 and trunk_num not in visited:
+                    visited.add(trunk_num)
+                    offset = (trunk_num - 1) * page_size
+                    f.seek(offset)
+                    trunk_data = f.read(page_size)
+                    if len(trunk_data) < 8:
+                        break
+                    next_trunk = int.from_bytes(trunk_data[0:4], "big")
+                    leaf_count = int.from_bytes(trunk_data[4:8], "big")
+                    max_leaves = (page_size - 8) // 4
+                    leaf_count = min(leaf_count, max_leaves)
+                    for i in range(leaf_count):
+                        leaf_num = int.from_bytes(
+                            trunk_data[8 + i * 4: 12 + i * 4], "big")
+                        if leaf_num == 0 or leaf_num in visited:
+                            continue
+                        visited.add(leaf_num)
+                        f.seek((leaf_num - 1) * page_size)
+                        leaf_data = f.read(page_size)
+                        if not leaf_data:
+                            continue
+                        pt_byte = leaf_data[0]
+                        from constants import PAGE_TYPES
+                        pt_label = PAGE_TYPES.get(
+                            pt_byte, "Unknown (0x{:02X})".format(pt_byte))
+                        results.append({
+                            "page_num":       leaf_num,
+                            "page_type_byte": pt_byte,
+                            "page_type":      pt_label,
+                            "page_data":      leaf_data,
+                            "is_trunk":       False,
+                        })
+                    results.append({
+                        "page_num":       trunk_num,
+                        "page_type_byte": 0x00,
+                        "page_type":      "Freelist Trunk",
+                        "page_data":      trunk_data,
+                        "is_trunk":       True,
+                    })
+                    trunk_num = next_trunk
+        except Exception:
+            pass
+        return results
+
+    def recover_freelist_records(self):
+        """Parse freelist leaf pages for recoverable deleted records.
+
+        Reuses WALParser.parse_leaf_cells() — same B-tree binary format.
+        Returns list of dicts:
+        {page_num, table, columns, records, confidence, page_type_byte, page_data}
+        Each record dict: {rowid, values (display list), values_dict, raw_values}
+        Confidence: High / Medium / Low
+        """
+        pages = self.read_freelist_pages()
+        if not pages:
+            return []
+
+        from wal_parser import WALParser
+        _wp = WALParser()
+
+        col_map    = {}
+        pk_col_idx = {}
+        if self.ok:
+            try:
+                rows = self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+                for (tname,) in rows:
+                    try:
+                        safe = tname.replace('"', '""')
+                        cols = self._conn.execute(
+                            'PRAGMA table_info("{}")'.format(safe)
+                        ).fetchall()
+                        col_map[tname] = [c[1] for c in cols]
+                        for c in cols:
+                            if c[5] == 1 and c[2].upper() == "INTEGER":
+                                pk_col_idx[tname] = c[0]
+                                break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        if self.has_wal and self._wal.col_map:
+            for k, v in self._wal.col_map.items():
+                if k not in col_map:
+                    col_map[k] = v
+
+        page_table_map = {}
+        if self.ok:
+            try:
+                rows2 = self._conn.execute(
+                    "SELECT name, rootpage FROM sqlite_master "
+                    "WHERE type='table' AND rootpage > 0"
+                ).fetchall()
+                for tname, rp in rows2:
+                    page_table_map[rp] = tname
+            except Exception:
+                pass
+        if self.has_wal and self._wal.page_map:
+            for pn, tn in self._wal.page_map.items():
+                if pn not in page_table_map:
+                    page_table_map[pn] = tn
+
+        results = []
+        for pg in pages:
+            if pg["is_trunk"]:
+                continue
+            page_data = pg["page_data"]
+            if not page_data:
+                continue
+            cells      = _wp.parse_leaf_cells(page_data)
+            table_name = page_table_map.get(pg["page_num"], "")
+            known_cols = col_map.get(table_name, []) if table_name else []
+
+            if cells and table_name and known_cols:
+                confidence = "High"
+            elif cells and table_name:
+                confidence = "Medium"
+            elif cells:
+                confidence = "Low"
+            else:
+                continue   # nothing decodable — skip
+
+            pk_idx = pk_col_idx.get(table_name, -1)
+            parsed_records = []
+            for cell in cells:
+                vals         = cell["values"]
+                row_dict     = {}
+                display_vals = []
+                for vi, v in enumerate(vals):
+                    col_key = (known_cols[vi] if vi < len(known_cols)
+                            else "col{}".format(vi))
+                    if vi == pk_idx and v is None:
+                        disp = str(cell["rowid"])
+                        row_dict[col_key] = cell["rowid"]
+                    elif v is None:
+                        disp = "NULL"
+                        row_dict[col_key] = None
+                    elif isinstance(v, bytes):
+                        from utils import blob_type, fmtb
+                        bt   = blob_type(v)
+                        disp = "[BLOB: {}, {}]".format(fmtb(len(v)), bt)
+                        row_dict[col_key] = v
+                    elif isinstance(v, float):
+                        disp = "{:.6g}".format(v)
+                        row_dict[col_key] = v
+                    else:
+                        sv   = str(v)
+                        disp = sv if len(sv) <= 200 else sv[:200] + "..."
+                        row_dict[col_key] = v
+                    display_vals.append(disp)
+                parsed_records.append({
+                    "rowid":       cell["rowid"],
+                    "values":      display_vals,
+                    "values_dict": row_dict,
+                    "raw_values":  cell["values"],
+                })
+            results.append({
+                "page_num":       pg["page_num"],
+                "page_type_byte": pg["page_type_byte"],
+                "page_type":      pg["page_type"],
+                "table":          table_name or "(unknown table)",
+                "columns":        known_cols,
+                "records":        parsed_records,
+                "confidence":     confidence,
+                "page_data":      page_data,
+            })
+        return results
 
     @staticmethod
     def _dt(v):

@@ -57,6 +57,17 @@ class App(tk.Tk):
         self._load_time = 0
         self._measure_font = None
         self._measure_bold_font = None
+        
+        # SQL Query Editor state
+        self._sql_query_history     = []
+        self._sql_query_history_idx = -1
+        self._sql_query_thread      = None
+        self._sql_query_cancel      = False
+        self._sql_result_rows       = []
+        self._sql_result_cols       = []
+        # Deleted Pages (Freelist) state
+        self._fl_tab_added = False
+        self._fl_data      = []
 
         self._build_header()
         self._build_body()
@@ -192,6 +203,17 @@ class App(tk.Tk):
         # WAL tab — added dynamically when a WAL-mode DB is opened
         self._wal_frame = ttk.Frame(self._nb)
         self._wal_tab_added = False
+        
+        # SQL Query Editor tab — always present
+        self._sql_frame = ttk.Frame(self._nb)
+        self._nb.add(self._sql_frame, text="  SQL Query  ")
+
+        # Deleted Pages tab — added dynamically when freelist pages exist
+        self._fl_frame     = ttk.Frame(self._nb)
+        self._fl_tab_added = False
+
+        # ... existing self._build_search_tab() and self._build_browse_tab() stay ...
+        self._build_sql_tab()   # <-- add this line after _build_browse_tab()
 
         self._build_search_tab()
         self._build_browse_tab()
@@ -877,6 +899,210 @@ class App(tk.Tk):
         self._sr_filtered = list(self._search_results)
         self._sr_page = 0
         self._display_search_page()
+    # ── Freelist / Deleted Page Recovery ─────────────────────────────────
+    def freelist_count(self):
+        """Return the number of freelist pages reported by PRAGMA freelist_count."""
+        if not self.ok:
+            return 0
+        try:
+            r = self._conn.execute("PRAGMA freelist_count").fetchone()
+            return r[0] if r else 0
+        except Exception:
+            return 0
+
+    def read_freelist_pages(self):
+        """Read all freelist trunk and leaf pages directly from the main DB file.
+
+        Walks the freelist chain starting from DB header bytes 32–35.
+        Returns a list of dicts:
+        {page_num, page_type_byte, page_type, page_data, is_trunk}
+        """
+        if not self.ok or not self._path:
+            return []
+        try:
+            meta = self.meta()
+            page_size = int(meta.get("page_size", 4096) or 4096)
+            if page_size == 1:
+                page_size = 65536
+        except Exception:
+            page_size = 4096
+
+        results = []
+        visited = set()
+        try:
+            with open(self._path, "rb") as f:
+                f.seek(32)
+                trunk_num = int.from_bytes(f.read(4), "big")
+                if trunk_num == 0:
+                    return []
+                while trunk_num != 0 and trunk_num not in visited:
+                    visited.add(trunk_num)
+                    offset = (trunk_num - 1) * page_size
+                    f.seek(offset)
+                    trunk_data = f.read(page_size)
+                    if len(trunk_data) < 8:
+                        break
+                    next_trunk = int.from_bytes(trunk_data[0:4], "big")
+                    leaf_count = int.from_bytes(trunk_data[4:8], "big")
+                    max_leaves = (page_size - 8) // 4
+                    leaf_count = min(leaf_count, max_leaves)
+                    for i in range(leaf_count):
+                        leaf_num = int.from_bytes(
+                            trunk_data[8 + i * 4: 12 + i * 4], "big")
+                        if leaf_num == 0 or leaf_num in visited:
+                            continue
+                        visited.add(leaf_num)
+                        f.seek((leaf_num - 1) * page_size)
+                        leaf_data = f.read(page_size)
+                        if not leaf_data:
+                            continue
+                        pt_byte = leaf_data[0]
+                        from constants import PAGE_TYPES
+                        pt_label = PAGE_TYPES.get(
+                            pt_byte, "Unknown (0x{:02X})".format(pt_byte))
+                        results.append({
+                            "page_num":       leaf_num,
+                            "page_type_byte": pt_byte,
+                            "page_type":      pt_label,
+                            "page_data":      leaf_data,
+                            "is_trunk":       False,
+                        })
+                    results.append({
+                        "page_num":       trunk_num,
+                        "page_type_byte": 0x00,
+                        "page_type":      "Freelist Trunk",
+                        "page_data":      trunk_data,
+                        "is_trunk":       True,
+                    })
+                    trunk_num = next_trunk
+        except Exception:
+            pass
+        return results
+
+    def recover_freelist_records(self):
+        """Parse freelist leaf pages for recoverable deleted records.
+
+        Reuses WALParser.parse_leaf_cells() — same B-tree binary format.
+        Returns list of dicts:
+        {page_num, table, columns, records, confidence, page_type_byte, page_data}
+        Each record dict: {rowid, values (display list), values_dict, raw_values}
+        Confidence: High / Medium / Low
+        """
+        pages = self.read_freelist_pages()
+        if not pages:
+            return []
+
+        from wal_parser import WALParser
+        _wp = WALParser()
+
+        col_map    = {}
+        pk_col_idx = {}
+        if self.ok:
+            try:
+                rows = self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+                for (tname,) in rows:
+                    try:
+                        safe = tname.replace('"', '""')
+                        cols = self._conn.execute(
+                            'PRAGMA table_info("{}")'.format(safe)
+                        ).fetchall()
+                        col_map[tname] = [c[1] for c in cols]
+                        for c in cols:
+                            if c[5] == 1 and c[2].upper() == "INTEGER":
+                                pk_col_idx[tname] = c[0]
+                                break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        if self.has_wal and self._wal.col_map:
+            for k, v in self._wal.col_map.items():
+                if k not in col_map:
+                    col_map[k] = v
+
+        page_table_map = {}
+        if self.ok:
+            try:
+                rows2 = self._conn.execute(
+                    "SELECT name, rootpage FROM sqlite_master "
+                    "WHERE type='table' AND rootpage > 0"
+                ).fetchall()
+                for tname, rp in rows2:
+                    page_table_map[rp] = tname
+            except Exception:
+                pass
+        if self.has_wal and self._wal.page_map:
+            for pn, tn in self._wal.page_map.items():
+                if pn not in page_table_map:
+                    page_table_map[pn] = tn
+
+        results = []
+        for pg in pages:
+            if pg["is_trunk"]:
+                continue
+            page_data = pg["page_data"]
+            if not page_data:
+                continue
+            cells      = _wp.parse_leaf_cells(page_data)
+            table_name = page_table_map.get(pg["page_num"], "")
+            known_cols = col_map.get(table_name, []) if table_name else []
+
+            if cells and table_name and known_cols:
+                confidence = "High"
+            elif cells and table_name:
+                confidence = "Medium"
+            elif cells:
+                confidence = "Low"
+            else:
+                continue   # nothing decodable — skip
+
+            pk_idx = pk_col_idx.get(table_name, -1)
+            parsed_records = []
+            for cell in cells:
+                vals         = cell["values"]
+                row_dict     = {}
+                display_vals = []
+                for vi, v in enumerate(vals):
+                    col_key = (known_cols[vi] if vi < len(known_cols)
+                            else "col{}".format(vi))
+                    if vi == pk_idx and v is None:
+                        disp = str(cell["rowid"])
+                        row_dict[col_key] = cell["rowid"]
+                    elif v is None:
+                        disp = "NULL"
+                        row_dict[col_key] = None
+                    elif isinstance(v, bytes):
+                        from utils import blob_type, fmtb
+                        bt   = blob_type(v)
+                        disp = "[BLOB: {}, {}]".format(fmtb(len(v)), bt)
+                        row_dict[col_key] = v
+                    elif isinstance(v, float):
+                        disp = "{:.6g}".format(v)
+                        row_dict[col_key] = v
+                    else:
+                        sv   = str(v)
+                        disp = sv if len(sv) <= 200 else sv[:200] + "..."
+                        row_dict[col_key] = v
+                    display_vals.append(disp)
+                parsed_records.append({
+                    "rowid":       cell["rowid"],
+                    "values":      display_vals,
+                    "values_dict": row_dict,
+                    "raw_values":  cell["values"],
+                })
+            results.append({
+                "page_num":       pg["page_num"],
+                "page_type_byte": pg["page_type_byte"],
+                "page_type":      pg["page_type"],
+                "table":          table_name or "(unknown table)",
+                "columns":        known_cols,
+                "records":        parsed_records,
+                "confidence":     confidence,
+                "page_data":      page_data,
+            })
+        return results
 
     @staticmethod
     def _auto_dropdown_width(combo):
@@ -2265,6 +2491,7 @@ class App(tk.Tk):
         self.bind("<Control-f>", lambda e: self._focus_search())
         self.bind("<Escape>", lambda e: self._stop_search())
         self._search_entry.bind("<Return>", lambda e: self._do_search())
+        self.bind("<Control-q>", lambda e: self._focus_sql_editor())
 
     def _setup_tooltips(self):
         """Add tooltips to all interactive widgets."""
@@ -2293,6 +2520,14 @@ class App(tk.Tk):
         # Sidebar
         ToolTip(self._schema_tree, "Expand tables to see columns, types, and indexes.\nRight-click for more options.")
         ToolTip(self._sb_toggle, "Toggle schema sidebar")
+        
+        if hasattr(self, "_sql_run_btn"):
+            ToolTip(self._sql_run_btn,
+                    "Run the SQL query (Ctrl+Enter)\n"
+                    "Only SELECT / EXPLAIN / WITH / VALUES / PRAGMA allowed")
+            ToolTip(self._sql_cancel_btn, "Cancel the running query")
+            ToolTip(self._sql_editor,
+                    "Ctrl+Enter: run  |  Alt+↑/↓: history  |  Ctrl+Q: focus")
 
     def _focus_search(self):
         self._nb.select(self._search_frame)
@@ -2367,6 +2602,22 @@ class App(tk.Tk):
                 self._wal_tab_added = False
             self._search_wal_cb.pack_forget()
             self._search_wal_var.set(False)
+            
+        # Freelist (Deleted Pages) tab
+        fl_count = self.db.freelist_count()
+        if fl_count > 0:
+            if not self._fl_tab_added:
+                self._nb.add(self._fl_frame, text="  Deleted Pages  ")
+                self._fl_tab_added = True
+                self._build_fl_tab()
+            self.after(300, self._populate_fl_tab)
+        else:
+            if self._fl_tab_added:
+                try:
+                    self._nb.forget(self._fl_frame)
+                except Exception:
+                    pass
+        self._fl_tab_added = False
 
         # Background count using SEPARATE connection (non-blocking)
         self._count_cancel = False
@@ -2467,6 +2718,25 @@ class App(tk.Tk):
         self._browse_display_rows = []
         # Clear per-column filters
         for w in self._col_filter_frame.winfo_children():
+            # Remove Deleted Pages tab if present
+            if self._fl_tab_added:
+                try:
+                    self._nb.forget(self._fl_frame)
+                except Exception:
+                    pass
+                self._fl_tab_added = False
+                for w in self._fl_frame.winfo_children():
+                    w.destroy()
+            self._fl_data = []
+            # Clear SQL editor state
+            if hasattr(self, '_sql_results_tree'):
+                self._sql_results_tree.delete(*self._sql_results_tree.get_children())
+            if hasattr(self, '_sql_status_label'):
+                self._sql_status_label.configure(text='Open a database to start querying.')
+            if hasattr(self, '_sql_col_info'):
+                self._sql_col_info.configure(text='')
+            self._sql_result_rows = []
+            self._sql_result_cols = []
             w.destroy()
         self._col_filters = {}
         self._col_filter_timer = None
@@ -3700,3 +3970,854 @@ class App(tk.Tk):
                                 f"WAL summary exported to:\n{path}")
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ── SQL QUERY EDITOR TAB ─────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _build_sql_tab(self):
+        sf = self._sql_frame
+
+        hdr = ttk.Frame(sf)
+        hdr.pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Label(hdr, text="SQL Query Editor", style="B.TLabel").pack(side="left")
+        ttk.Label(hdr, text="  (read-only • SELECT / EXPLAIN only)",
+                style="M.TLabel").pack(side="left", padx=(4, 0))
+
+        editor_outer = tk.Frame(sf, relief="solid", bd=1, bg=C["border"])
+        editor_outer.pack(fill="x", padx=10, pady=(2, 0))
+
+        self._sql_editor = tk.Text(
+            editor_outer, height=8, font=("Consolas", 10),
+            bg=C["bg2"], fg=C["text"], insertbackground=C["text"],
+            wrap="none", undo=True, relief="flat", padx=6, pady=4,
+        )
+        sql_xsb = ttk.Scrollbar(editor_outer, orient="horizontal",
+                                command=self._sql_editor.xview)
+        self._sql_editor.configure(xscrollcommand=sql_xsb.set)
+        sql_xsb.pack(side="bottom", fill="x")
+        self._sql_editor.pack(fill="both", expand=True)
+
+        self._sql_editor.tag_configure("kw",  foreground="#0052cc",
+                                        font=("Consolas", 10, "bold"))
+        self._sql_editor.tag_configure("str", foreground="#00875a")
+        self._sql_editor.tag_configure("cmt", foreground="#8993a4",
+                                        font=("Consolas", 10, "italic"))
+        self._sql_editor.tag_configure("num", foreground="#c25100")
+
+        self._sql_editor.bind("<KeyRelease>",     self._sql_on_key)
+        self._sql_editor.bind("<Control-Return>",
+            lambda e: (self._sql_run(), "break")[1])
+        self._sql_editor.bind("<Tab>",
+            lambda e: (self._sql_editor.insert("insert", "    "), "break")[1])
+        self._sql_editor.bind("<Alt-Up>",
+            lambda e: (self._sql_history_prev(), "break")[1])
+        self._sql_editor.bind("<Alt-Down>",
+            lambda e: (self._sql_history_next(), "break")[1])
+
+        tbar = ttk.Frame(sf)
+        tbar.pack(fill="x", padx=10, pady=(4, 2))
+
+        self._sql_run_btn = tk.Button(
+            tbar, text="▶  Run (Ctrl+Enter)",
+            font=("Segoe UI", 9, "bold"),
+            bg=C["accent"], fg="#ffffff",
+            activebackground="#003d99", activeforeground="#ffffff",
+            relief="flat", bd=0, padx=10, pady=4, cursor="hand2",
+            command=self._sql_run,
+        )
+        self._sql_run_btn.pack(side="left", padx=(0, 4))
+
+        self._sql_cancel_btn = tk.Button(
+            tbar, text="■  Cancel",
+            font=("Segoe UI", 9),
+            bg=C["red"], fg="#ffffff",
+            activebackground="#b02900", activeforeground="#ffffff",
+            relief="flat", bd=0, padx=10, pady=4, cursor="hand2",
+            command=self._sql_cancel, state="disabled",
+        )
+        self._sql_cancel_btn.pack(side="left", padx=(0, 6))
+
+        for label, cmd in [
+            ("Clear",    lambda: self._sql_editor.delete("1.0", "end")),
+            ("Copy SQL", self._sql_copy_query),
+        ]:
+            tk.Button(
+                tbar, text=label, font=("Segoe UI", 9),
+                bg=C["bg3"], fg=C["text2"],
+                activebackground=C["bg4"], relief="flat", bd=0,
+                padx=8, pady=4, cursor="hand2", command=cmd,
+            ).pack(side="left", padx=2)
+
+        self._sql_export_btn = tk.Button(
+            tbar, text="Export CSV", font=("Segoe UI", 9),
+            bg=C["bg3"], fg=C["text2"],
+            activebackground=C["bg4"], relief="flat", bd=0,
+            padx=8, pady=4, cursor="hand2",
+            command=self._sql_export_csv, state="disabled",
+        )
+        self._sql_export_btn.pack(side="left", padx=2)
+
+        self._sql_export_json_btn = tk.Button(
+            tbar, text="Export JSON", font=("Segoe UI", 9),
+            bg=C["bg3"], fg=C["text2"],
+            activebackground=C["bg4"], relief="flat", bd=0,
+            padx=8, pady=4, cursor="hand2",
+            command=self._sql_export_json, state="disabled",
+        )
+        self._sql_export_json_btn.pack(side="left", padx=2)
+
+        ttk.Label(tbar, text="Limit:", font=("Segoe UI", 9)).pack(
+            side="left", padx=(10, 2))
+        self._sql_limit_var = tk.StringVar(value="1000")
+        sql_lim_cb = ttk.Combobox(
+            tbar, textvariable=self._sql_limit_var,
+            values=["100", "500", "1000", "5000", "All"],
+            state="readonly", width=7,
+        )
+        sql_lim_cb.pack(side="left")
+        ToolTip(sql_lim_cb, "Maximum rows to return")
+
+        sbar = ttk.Frame(sf)
+        sbar.pack(fill="x", padx=10, pady=(0, 2))
+        self._sql_status_label = ttk.Label(
+            sbar, text="Open a database to start querying.", style="M.TLabel")
+        self._sql_status_label.pack(side="left")
+        self._sql_col_info = ttk.Label(sbar, text="", style="M.TLabel")
+        self._sql_col_info.pack(side="right")
+
+        self._sql_pw = ttk.PanedWindow(sf, orient="vertical")
+        self._sql_pw.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        res_outer = ttk.Frame(self._sql_pw)
+        self._sql_pw.add(res_outer, weight=4)
+        res_border = tk.Frame(res_outer, relief="solid", bd=1, bg=C["border"])
+        res_border.pack(fill="both", expand=True)
+
+        self._sql_results_tree = ttk.Treeview(
+            res_border, show="headings", selectmode="browse")
+        sql_ysb  = ttk.Scrollbar(res_border, orient="vertical",
+                                command=self._sql_results_tree.yview)
+        sql_xsb2 = ttk.Scrollbar(res_border, orient="horizontal",
+                                command=self._sql_results_tree.xview)
+        self._sql_results_tree.configure(
+            yscrollcommand=sql_ysb.set, xscrollcommand=sql_xsb2.set)
+        sql_ysb.pack(side="right", fill="y")
+        sql_xsb2.pack(side="bottom", fill="x")
+        self._sql_results_tree.pack(fill="both", expand=True)
+        self._sql_results_tree.bind("<Double-1>", self._sql_on_row_dblclick)
+        TreeviewTooltip(self._sql_results_tree)
+
+        hist_outer = ttk.Frame(self._sql_pw)
+        self._sql_pw.add(hist_outer, weight=1)
+
+        hist_hdr = ttk.Frame(hist_outer)
+        hist_hdr.pack(fill="x")
+        ttk.Label(hist_hdr, text="Query History", style="B.TLabel").pack(
+            side="left", padx=4, pady=(4, 2))
+        ttk.Label(hist_hdr, text="(Alt+↑/↓ in editor to navigate)",
+                style="M.TLabel").pack(side="left")
+        tk.Button(
+            hist_hdr, text="Clear History",
+            font=("Segoe UI", 8), bg=C["bg3"], fg=C["text2"],
+            activebackground=C["bg4"], relief="flat", bd=0,
+            padx=6, pady=2, cursor="hand2",
+            command=self._sql_clear_history,
+        ).pack(side="right", padx=4)
+
+        hist_border = tk.Frame(hist_outer, relief="solid", bd=1, bg=C["border"])
+        hist_border.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+
+        self._sql_hist_listbox = tk.Listbox(
+            hist_border, font=("Consolas", 9),
+            bg=C["bg2"], fg=C["text"],
+            selectbackground=C["tsel"], selectforeground=C["text"],
+            relief="flat", activestyle="none",
+        )
+        hist_vsb = ttk.Scrollbar(
+            hist_border, orient="vertical",
+            command=self._sql_hist_listbox.yview)
+        self._sql_hist_listbox.configure(yscrollcommand=hist_vsb.set)
+        hist_vsb.pack(side="right", fill="y")
+        self._sql_hist_listbox.pack(fill="both", expand=True)
+        self._sql_hist_listbox.bind("<Double-1>", self._sql_hist_load)
+        self._sql_hist_listbox.bind("<Return>",   self._sql_hist_load)
+        ToolTip(self._sql_hist_listbox, "Double-click to restore query in editor")
+
+    _SQL_KEYWORDS = frozenset({
+        "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "IS", "NULL",
+        "LIKE", "GLOB", "BETWEEN", "JOIN", "LEFT", "INNER", "OUTER", "CROSS",
+        "ON", "AS", "ORDER", "BY", "ASC", "DESC", "GROUP", "HAVING", "LIMIT",
+        "OFFSET", "DISTINCT", "ALL", "UNION", "EXCEPT", "INTERSECT", "WITH",
+        "CASE", "WHEN", "THEN", "ELSE", "END", "CAST", "EXISTS", "EXPLAIN",
+        "COUNT", "SUM", "AVG", "MIN", "MAX", "COALESCE", "IFNULL", "NULLIF",
+        "SUBSTR", "LENGTH", "TRIM", "UPPER", "LOWER", "REPLACE", "TYPEOF",
+        "DATE", "TIME", "DATETIME", "STRFTIME", "JULIANDAY", "ROWID",
+    })
+
+    def _sql_highlight(self, event=None):
+        try:
+            txt = self._sql_editor
+            for tag in ("kw", "str", "cmt", "num"):
+                txt.tag_remove(tag, "1.0", "end")
+            code = txt.get("1.0", "end")
+            for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", code):
+                if m.group(1).upper() in self._SQL_KEYWORDS:
+                    txt.tag_add("kw", "1.0+{}c".format(m.start()),
+                                "1.0+{}c".format(m.end()))
+            for m in re.finditer(r"'[^']*'|\"[^\"]*\"", code):
+                txt.tag_add("str", "1.0+{}c".format(m.start()),
+                            "1.0+{}c".format(m.end()))
+            for m in re.finditer(r"--[^\n]*", code):
+                txt.tag_add("cmt", "1.0+{}c".format(m.start()),
+                            "1.0+{}c".format(m.end()))
+            for m in re.finditer(r"\b\d+\.?\d*\b", code):
+                txt.tag_add("num", "1.0+{}c".format(m.start()),
+                            "1.0+{}c".format(m.end()))
+        except Exception:
+            pass
+
+    def _sql_on_key(self, event=None):
+        if hasattr(self, "_sql_hl_after"):
+            self.after_cancel(self._sql_hl_after)
+        self._sql_hl_after = self.after(150, self._sql_highlight)
+
+    def _focus_sql_editor(self):
+        self._nb.select(self._sql_frame)
+        if hasattr(self, "_sql_editor"):
+            self._sql_editor.focus_set()
+
+    def _sql_copy_query(self):
+        sql = self._sql_editor.get("1.0", "end-1c").strip()
+        if sql:
+            self.clipboard_clear()
+            self.clipboard_append(sql)
+
+    def _sql_clear_history(self):
+        self._sql_query_history.clear()
+        self._sql_query_history_idx = -1
+        if hasattr(self, "_sql_hist_listbox"):
+            self._sql_hist_listbox.delete(0, "end")
+
+    def _sql_history_prev(self):
+        if not self._sql_query_history:
+            return
+        idx = max(0, self._sql_query_history_idx - 1)
+        self._sql_query_history_idx = idx
+        self._sql_editor.delete("1.0", "end")
+        self._sql_editor.insert("1.0", self._sql_query_history[idx])
+
+    def _sql_history_next(self):
+        if not self._sql_query_history:
+            return
+        idx = min(len(self._sql_query_history) - 1,
+                self._sql_query_history_idx + 1)
+        self._sql_query_history_idx = idx
+        self._sql_editor.delete("1.0", "end")
+        self._sql_editor.insert("1.0", self._sql_query_history[idx])
+
+    def _sql_hist_load(self, event=None):
+        sel = self._sql_hist_listbox.curselection()
+        if not sel:
+            return
+        # Listbox is prepended so index 0 = most recent
+        real_idx = len(self._sql_query_history) - 1 - sel[0]
+        if 0 <= real_idx < len(self._sql_query_history):
+            self._sql_editor.delete("1.0", "end")
+            self._sql_editor.insert("1.0", self._sql_query_history[real_idx])
+            self._nb.select(self._sql_frame)
+            self._sql_editor.focus_set()
+
+    def _sql_is_safe(self, sql):
+        stripped = sql.strip().lstrip("(")
+        parts = stripped.split()
+        first = parts[0].upper() if parts else ""
+        return first in ("SELECT", "EXPLAIN", "WITH", "VALUES", "PRAGMA")
+
+    def _sql_run(self):
+        if not self.db.ok:
+            messagebox.showwarning("No Database",
+                                "Please open a database first.")
+            return
+        sql = self._sql_editor.get("1.0", "end-1c").strip()
+        if not sql:
+            return
+        if not self._sql_is_safe(sql):
+            messagebox.showerror(
+                "Read-Only Mode",
+                "Only SELECT, EXPLAIN, WITH, VALUES, and PRAGMA are allowed.\n"
+                "This tool is read-only to protect your data.",
+            )
+            return
+        if not self._sql_query_history or self._sql_query_history[-1] != sql:
+            self._sql_query_history.append(sql)
+            self._sql_query_history_idx = len(self._sql_query_history) - 1
+            display = sql[:90].replace("\n", " ")
+            self._sql_hist_listbox.insert(0, display)
+            if self._sql_hist_listbox.size() > 100:
+                self._sql_hist_listbox.delete("end")
+                self._sql_query_history.pop(0)
+
+        lim_str = self._sql_limit_var.get()
+        limit = None if lim_str == "All" else int(lim_str)
+
+        self._sql_results_tree["columns"] = []
+        self._sql_results_tree.delete(*self._sql_results_tree.get_children())
+        self._sql_result_rows = []
+        self._sql_result_cols = []
+        self._sql_status_label.configure(text="Running…")
+        self._sql_col_info.configure(text="")
+        self._sql_run_btn.configure(state="disabled")
+        self._sql_cancel_btn.configure(state="normal")
+        self._sql_export_btn.configure(state="disabled")
+        self._sql_export_json_btn.configure(state="disabled")
+        self._sql_query_cancel = False
+
+        def _worker():
+            try:
+                conn = self.db._search_conn or self.db._conn
+                cur  = conn.execute(sql)
+                cols = [d[0] for d in (cur.description or [])]
+                rows = []
+                for i, row in enumerate(cur):
+                    if self._sql_query_cancel:
+                        break
+                    rows.append(tuple(row))
+                    if limit and i + 1 >= limit:
+                        break
+                self.after(0, lambda: self._sql_show_results(cols, rows, limit))
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda: self._sql_show_error(err))
+
+        self._sql_query_thread = threading.Thread(target=_worker, daemon=True)
+        self._sql_query_thread.start()
+
+    def _sql_cancel(self):
+        self._sql_query_cancel = True
+        self._sql_run_btn.configure(state="normal")
+        self._sql_cancel_btn.configure(state="disabled")
+        self._sql_status_label.configure(text="Cancelled.")
+
+    def _sql_show_results(self, cols, rows, limit):
+        self._sql_run_btn.configure(state="normal")
+        self._sql_cancel_btn.configure(state="disabled")
+        self._sql_result_cols = cols
+        self._sql_result_rows = rows
+        tree = self._sql_results_tree
+
+        if not cols:
+            tree["columns"] = ["(no columns)"]
+            tree.heading("(no columns)", text="(no columns)")
+            tree.column("(no columns)", width=300)
+            self._sql_status_label.configure(
+                text="Statement executed. No rows returned.")
+            return
+
+        tree["columns"] = cols
+        tree.delete(*tree.get_children())
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, width=120, minwidth=60, stretch=True)
+
+        for i, row in enumerate(rows):
+            display = []
+            for v in row:
+                if v is None:
+                    display.append("NULL")
+                elif isinstance(v, bytes):
+                    bt = blob_type(v)
+                    display.append("[BLOB {}: {}]".format(bt, fmtb(len(v))))
+                else:
+                    sv = str(v)
+                    display.append(sv if len(sv) <= 300 else sv[:300] + "…")
+            tag = "odd" if i % 2 else "even"
+            tree.insert("", "end", values=display, tags=(tag,))
+
+        tree.tag_configure("odd",  background=C["alt"])
+        tree.tag_configure("even", background=C["bg"])
+
+        limited = limit and len(rows) >= limit
+        status = "{:,} row{} returned".format(
+            len(rows), "s" if len(rows) != 1 else "")
+        if limited:
+            status += "  (limit reached — increase Limit to see more)"
+        self._sql_status_label.configure(text=status)
+        self._sql_col_info.configure(text="{} column{}".format(
+            len(cols), "s" if len(cols) != 1 else ""))
+        if rows:
+            self._sql_export_btn.configure(state="normal")
+            self._sql_export_json_btn.configure(state="normal")
+
+    def _sql_show_error(self, err):
+        self._sql_run_btn.configure(state="normal")
+        self._sql_cancel_btn.configure(state="disabled")
+        self._sql_status_label.configure(
+            text="✖  Error: {}".format(err[:300]))
+        self._sql_col_info.configure(text="")
+
+    def _sql_on_row_dblclick(self, event=None):
+        sel = self._sql_results_tree.selection()
+        if not sel:
+            return
+        vals = self._sql_results_tree.item(sel[0], "values")
+        cols = self._sql_result_cols
+        if not vals:
+            return
+        win = tk.Toplevel(self)
+        win.title("Row Detail")
+        win.geometry("540x420")
+        win.configure(bg=C["bg"])
+        win.transient(self)
+        txt = tk.Text(win, wrap="word", bg=C["bg2"], fg=C["text"],
+                    font=("Consolas", 10), relief="flat", padx=8, pady=6)
+        vsb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True, padx=(8, 0), pady=8)
+        lines = ["{}: {}".format(
+            cols[i] if i < len(cols) else "col{}".format(i), v)
+            for i, v in enumerate(vals)]
+        txt.insert("1.0", "\n".join(lines))
+        txt.configure(state="disabled")
+        btn_f = tk.Frame(win, bg=C["bg"])
+        btn_f.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Button(btn_f, text="Copy",
+            command=lambda: (win.clipboard_clear(),
+                            win.clipboard_append("\n".join(lines))),
+            bg=C["acl"], fg=C["accent"],
+            font=("Segoe UI", 9), relief="flat", bd=0,
+            padx=10, pady=4, cursor="hand2").pack(side="left")
+        tk.Button(btn_f, text="Close", command=win.destroy,
+            bg=C["bg3"], fg=C["text2"],
+            font=("Segoe UI", 9), relief="flat", bd=0,
+            padx=10, pady=4, cursor="hand2").pack(side="right")
+
+    def _sql_export_csv(self):
+        if not self._sql_result_rows:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", initialfile="query_results.csv",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(self._sql_result_cols)
+                for row in self._sql_result_rows:
+                    w.writerow([
+                        v.decode("utf-8", errors="replace")
+                        if isinstance(v, bytes)
+                        else ("" if v is None else v)
+                        for v in row
+                    ])
+            messagebox.showinfo("Export Complete",
+                                "Exported {:,} rows to:\n{}".format(
+                                    len(self._sql_result_rows),
+                                    os.path.basename(path)))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _sql_export_json(self):
+        if not self._sql_result_rows:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json", initialfile="query_results.json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            out = []
+            for row in self._sql_result_rows:
+                rec = {}
+                for i, v in enumerate(row):
+                    k = (self._sql_result_cols[i]
+                        if i < len(self._sql_result_cols) else "col{}".format(i))
+                    rec[k] = (v.decode("utf-8", errors="replace")
+                            if isinstance(v, bytes) else v)
+                out.append(rec)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2, default=str)
+            messagebox.showinfo("Export Complete",
+                                "Exported {:,} rows to:\n{}".format(
+                                    len(out), os.path.basename(path)))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ── DELETED PAGES (FREELIST) TAB ─────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _build_fl_tab(self):
+        ff = self._fl_frame
+        for w in ff.winfo_children():
+            w.destroy()
+
+        hdr = ttk.Frame(ff)
+        hdr.pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Label(hdr, text="Deleted Pages  (Freelist Recovery)",
+                style="B.TLabel").pack(side="left")
+        legend = tk.Frame(hdr, bg=C["bg"])
+        legend.pack(side="right")
+        tk.Label(legend, text="Confidence:", bg=C["bg"], fg=C["text2"],
+                font=("Segoe UI", 8)).pack(side="left", padx=(8, 2))
+        for lbl, col in [("High", C["green"]),
+                        ("Medium", C["yellow"]),
+                        ("Low", C["red"])]:
+            tk.Label(legend, text="● " + lbl, fg=col, bg=C["bg"],
+                    font=("Segoe UI", 8)).pack(side="left", padx=3)
+
+        self._fl_summary = ttk.Label(ff, text="", style="M.TLabel")
+        self._fl_summary.pack(fill="x", padx=10, pady=(2, 0))
+
+        fbar = ttk.Frame(ff)
+        fbar.pack(fill="x", padx=10, pady=(4, 2))
+        ttk.Label(fbar, text="Table:", font=("Segoe UI", 9)).pack(side="left")
+        self._fl_table_var = tk.StringVar(value="All")
+        self._fl_table_combo = ttk.Combobox(
+            fbar, textvariable=self._fl_table_var,
+            values=["All"], state="readonly", width=22)
+        self._fl_table_combo.pack(side="left", padx=(2, 8))
+        self._fl_table_combo.bind("<<ComboboxSelected>>",
+                                lambda e: self._fl_display())
+        ToolTip(self._fl_table_combo, "Filter by table")
+
+        ttk.Label(fbar, text="Confidence:", font=("Segoe UI", 9)).pack(side="left")
+        self._fl_conf_var = tk.StringVar(value="All")
+        fl_conf_cb = ttk.Combobox(
+            fbar, textvariable=self._fl_conf_var,
+            values=["All", "High", "Medium", "Low"],
+            state="readonly", width=10)
+        fl_conf_cb.pack(side="left", padx=(2, 8))
+        fl_conf_cb.bind("<<ComboboxSelected>>", lambda e: self._fl_display())
+        ToolTip(fl_conf_cb,
+                "High: table + columns known\n"
+                "Medium: table known, partial columns\n"
+                "Low: page decoded but table unknown")
+
+        ttk.Button(fbar, text="Refresh",
+                command=self._populate_fl_tab).pack(side="left", padx=4)
+        ttk.Button(fbar, text="Export CSV",
+                command=self._fl_export_csv).pack(side="left", padx=2)
+        ttk.Button(fbar, text="Export JSON",
+                command=self._fl_export_json).pack(side="left", padx=2)
+
+        self._fl_pw = ttk.PanedWindow(ff, orient="vertical")
+        self._fl_pw.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+
+        top_f = ttk.Frame(self._fl_pw)
+        self._fl_pw.add(top_f, weight=2)
+        top_border = tk.Frame(top_f, relief="solid", bd=1, bg=C["border"])
+        top_border.pack(fill="both", expand=True)
+
+        fl_cols = ("Page #", "Table", "Confidence", "Records", "Page Type")
+        self._fl_tree = ttk.Treeview(
+            top_border, columns=fl_cols,
+            show="headings", selectmode="browse")
+        for col in fl_cols:
+            self._fl_tree.heading(col, text=col,
+                                command=lambda c=col: self._fl_sort(c))
+        self._fl_tree.column("Page #",     width=70,  minwidth=50,  stretch=False)
+        self._fl_tree.column("Table",      width=250, minwidth=120, stretch=True)
+        self._fl_tree.column("Confidence", width=90,  minwidth=70,  stretch=False)
+        self._fl_tree.column("Records",    width=80,  minwidth=50,  stretch=False)
+        self._fl_tree.column("Page Type",  width=140, minwidth=90,  stretch=False)
+        fl_ysb = ttk.Scrollbar(top_border, orient="vertical",
+                                command=self._fl_tree.yview)
+        self._fl_tree.configure(yscrollcommand=fl_ysb.set)
+        fl_ysb.pack(side="right", fill="y")
+        self._fl_tree.pack(fill="both", expand=True)
+        self._fl_tree.bind("<<TreeviewSelect>>", self._fl_on_select)
+        self._fl_tree.tag_configure("High",
+            foreground=C["green"],  background=C["gl"])
+        self._fl_tree.tag_configure("Medium",
+            foreground=C["orange"], background="#fff8e6")
+        self._fl_tree.tag_configure("Low",
+            foreground=C["red"],    background=C["rl"])
+        TreeviewTooltip(self._fl_tree)
+        self._fl_sort_col = None
+        self._fl_sort_rev = False
+
+        bot_f = ttk.Frame(self._fl_pw)
+        self._fl_pw.add(bot_f, weight=3)
+        self._fl_detail_nb = ttk.Notebook(bot_f)
+        self._fl_detail_nb.pack(fill="both", expand=True)
+
+        rec_tab = ttk.Frame(self._fl_detail_nb)
+        self._fl_detail_nb.add(rec_tab, text=" Recovered Records ")
+        self._fl_rec_border = tk.Frame(
+            rec_tab, relief="solid", bd=1, bg=C["border"])
+        self._fl_rec_border.pack(fill="both", expand=True)
+
+        hex_tab = ttk.Frame(self._fl_detail_nb)
+        self._fl_detail_nb.add(hex_tab, text=" Raw Hex ")
+        hex_btn_bar = ttk.Frame(hex_tab)
+        hex_btn_bar.pack(fill="x")
+        ttk.Button(hex_btn_bar, text="Copy Hex",
+                command=self._fl_copy_hex).pack(side="left", padx=4, pady=2)
+        self._fl_hex_view = tk.Text(
+            hex_tab, wrap="none", height=8,
+            bg=C["bg2"], fg=C["text"], font=("Consolas", 10))
+        fl_hex_ysb = ttk.Scrollbar(hex_tab, orient="vertical",
+                                    command=self._fl_hex_view.yview)
+        fl_hex_xsb = ttk.Scrollbar(hex_tab, orient="horizontal",
+                                    command=self._fl_hex_view.xview)
+        self._fl_hex_view.configure(yscrollcommand=fl_hex_ysb.set,
+                                    xscrollcommand=fl_hex_xsb.set)
+        fl_hex_ysb.pack(side="right", fill="y")
+        fl_hex_xsb.pack(side="bottom", fill="x")
+        self._fl_hex_view.pack(fill="both", expand=True)
+        self._fl_hex_view.configure(state="disabled")
+
+        info_tab = ttk.Frame(self._fl_detail_nb)
+        self._fl_detail_nb.add(info_tab, text=" Page Info ")
+        self._fl_info_text = tk.Text(
+            info_tab, wrap="word", height=8,
+            bg=C["bg2"], fg=C["text"], font=("Consolas", 10))
+        self._fl_info_text.pack(fill="both", expand=True)
+        self._fl_info_text.configure(state="disabled")
+
+    def _populate_fl_tab(self):
+        if not self.db.ok:
+            return
+        self._fl_summary.configure(text="Scanning freelist pages…")
+        self._fl_data = []
+        def _load():
+            try:
+                data = self.db.recover_freelist_records()
+            except Exception:
+                data = []
+            self.after(0, lambda: self._fl_loaded(data))
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _fl_loaded(self, data):
+        self._fl_data = data
+        tables = sorted({pg["table"] for pg in data})
+        if hasattr(self, "_fl_table_combo"):
+            self._fl_table_combo.configure(values=["All"] + tables)
+            self._fl_table_var.set("All")
+        self._fl_display()
+
+    def _fl_display(self):
+        if not hasattr(self, "_fl_tree"):
+            return
+        tree = self._fl_tree
+        tree.delete(*tree.get_children())
+        tbl_f  = self._fl_table_var.get()
+        conf_f = self._fl_conf_var.get()
+        total_recs = 0
+        shown = 0
+        for pg in self._fl_data:
+            if tbl_f  != "All" and pg["table"]      != tbl_f:
+                continue
+            if conf_f != "All" and pg["confidence"] != conf_f:
+                continue
+            rc = len(pg["records"])
+            total_recs += rc
+            tree.insert("", "end", iid=str(pg["page_num"]),
+                        values=(pg["page_num"], pg["table"],
+                                pg["confidence"], rc, pg["page_type"]),
+                        tags=(pg["confidence"],))
+            shown += 1
+        fc = self.db.freelist_count() if self.db.ok else 0
+        self._fl_summary.configure(text=(
+            "Freelist pages in DB: {:,}  •  "
+            "{:,} pages with recoverable data  •  "
+            "{:,} deleted records  •  Showing {:,}".format(
+                fc, len(self._fl_data), total_recs, shown)))
+
+    def _fl_on_select(self, event=None):
+        sel = self._fl_tree.selection()
+        if not sel:
+            return
+        page_num = int(sel[0])
+        pg = next((p for p in self._fl_data if p["page_num"] == page_num), None)
+        if not pg:
+            return
+
+        for w in self._fl_rec_border.winfo_children():
+            w.destroy()
+
+        records    = pg["records"]
+        known_cols = pg["columns"]
+        conf_colors = {"High": C["green"], "Medium": C["orange"], "Low": C["red"]}
+
+        if records:
+            badge = tk.Label(
+                self._fl_rec_border,
+                text="  Page {:,}  |  Table: {}  |  {} record{}  |  Confidence: {}".format(
+                    pg["page_num"], pg["table"],
+                    len(records), "s" if len(records) != 1 else "",
+                    pg["confidence"]),
+                font=("Segoe UI", 9, "bold"),
+                fg=conf_colors.get(pg["confidence"], C["text"]),
+                bg="#eef0f4", anchor="w",
+            )
+            badge.pack(fill="x")
+            max_cols = max((len(r["values"]) for r in records), default=0)
+            rec_cols = ["RowID"] + [
+                known_cols[i] if i < len(known_cols) else "col{}".format(i)
+                for i in range(max_cols)
+            ]
+            rec_tree = ttk.Treeview(
+                self._fl_rec_border, columns=rec_cols,
+                show="headings", selectmode="browse")
+            for col in rec_cols:
+                rec_tree.heading(col, text=col)
+                rec_tree.column(col, width=120, minwidth=60, stretch=True)
+            rec_tree.column("RowID", width=70, minwidth=50, stretch=False)
+            rec_ysb = ttk.Scrollbar(self._fl_rec_border, orient="vertical",
+                                    command=rec_tree.yview)
+            rec_tree.configure(yscrollcommand=rec_ysb.set)
+            rec_ysb.pack(side="right", fill="y")
+            rec_tree.pack(fill="both", expand=True)
+            rec_tree.tag_configure("odd",  background=C["alt"])
+            rec_tree.tag_configure("even", background=C["bg"])
+            TreeviewTooltip(rec_tree)
+            for ci, rec in enumerate(records):
+                rec_tree.insert("", "end",
+                                values=(rec["rowid"], *rec["values"]),
+                                tags=("odd" if ci % 2 else "even",))
+        else:
+            ttk.Label(self._fl_rec_border,
+                    text="No decodable records on this page.",
+                    style="M.TLabel").pack(padx=10, pady=10)
+
+        self._fl_hex_view.configure(state="normal")
+        self._fl_hex_view.delete("1.0", "end")
+        page_data  = pg.get("page_data", b"")
+        show_bytes = min(len(page_data), 4096)
+        lines = [
+            "Freelist Leaf Page {:,}  ({:,} bytes)".format(
+                pg["page_num"], len(page_data)),
+            "Showing first {:,} bytes:".format(show_bytes),
+            "=" * 72,
+            "Offset    Hexadecimal                                       ASCII",
+            "─" * 72,
+        ]
+        for off in range(0, show_bytes, 16):
+            chunk = page_data[off:off + 16]
+            hex_p   = " ".join("{:02X}".format(b) for b in chunk)
+            ascii_p = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            lines.append("{:08X}  {:<48s}  {}".format(off, hex_p, ascii_p))
+        if len(page_data) > 4096:
+            lines.append("\n... ({:,} more bytes)".format(len(page_data) - 4096))
+        self._fl_hex_view.insert("1.0", "\n".join(lines))
+        self._fl_hex_view.configure(state="disabled")
+
+        self._fl_info_text.configure(state="normal")
+        self._fl_info_text.delete("1.0", "end")
+        info = [
+            "Freelist Page #{}".format(pg["page_num"]),
+            "=" * 50, "",
+            "Table:       {}".format(pg["table"]),
+            "Page Type:   {}".format(pg["page_type"]),
+            "Confidence:  {}".format(pg["confidence"]),
+            "Records:     {}".format(len(records)),
+            "Page size:   {:,} bytes".format(len(page_data)), "",
+            "What is a freelist page?",
+            "  When SQLite deletes rows, pages are not wiped.",
+            "  They go onto the freelist and sit intact until",
+            "  SQLite reuses them for new data. Until that",
+            "  happens the original rows are recoverable.", "",
+        ]
+        if pg["confidence"] == "High":
+            info += ["Recovery: Full — table and column names known."]
+        elif pg["confidence"] == "Medium":
+            info += ["Recovery: Partial — table known, column info limited."]
+        else:
+            info += ["Recovery: Low — page decoded, table not in schema.",
+                    "          Columns shown as col0, col1, etc."]
+        if known_cols:
+            info += ["", "Columns ({})".format(len(known_cols)),
+                    "  " + ", ".join(known_cols[:20]) +
+                    ("..." if len(known_cols) > 20 else "")]
+        self._fl_info_text.insert("1.0", "\n".join(info))
+        self._fl_info_text.configure(state="disabled")
+
+    def _fl_sort(self, col):
+        reverse = (self._fl_sort_col == col and not self._fl_sort_rev)
+        self._fl_sort_col = col
+        self._fl_sort_rev = reverse
+        key_map = {
+            "Page #":     lambda pg: pg["page_num"],
+            "Table":      lambda pg: pg["table"],
+            "Confidence": lambda pg: {"High": 0, "Medium": 1,
+                                    "Low": 2}.get(pg["confidence"], 3),
+            "Records":    lambda pg: len(pg["records"]),
+            "Page Type":  lambda pg: pg["page_type"],
+        }
+        self._fl_data.sort(key=key_map.get(col, lambda pg: pg["page_num"]),
+                        reverse=reverse)
+        self._fl_display()
+
+    def _fl_copy_hex(self):
+        if not hasattr(self, "_fl_hex_view"):
+            return
+        txt = self._fl_hex_view.get("1.0", "end-1c")
+        if txt.strip():
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+
+    def _fl_export_csv(self):
+        if not self._fl_data:
+            messagebox.showinfo("Nothing to Export", "No freelist data loaded.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", initialfile="deleted_records.csv",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["Page#", "Table", "Confidence", "RowID", "Data"])
+                for pg in self._fl_data:
+                    for rec in pg["records"]:
+                        w.writerow([
+                            pg["page_num"], pg["table"],
+                            pg["confidence"], rec["rowid"],
+                            json.dumps(rec["values_dict"], default=str),
+                        ])
+            total = sum(len(pg["records"]) for pg in self._fl_data)
+            messagebox.showinfo("Export Complete",
+                                "Exported {:,} records to:\n{}".format(
+                                    total, os.path.basename(path)))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _fl_export_json(self):
+        if not self._fl_data:
+            messagebox.showinfo("Nothing to Export", "No freelist data loaded.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json", initialfile="deleted_records.json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            out = []
+            for pg in self._fl_data:
+                for rec in pg["records"]:
+                    out.append({
+                        "page_num":   pg["page_num"],
+                        "table":      pg["table"],
+                        "confidence": pg["confidence"],
+                        "rowid":      rec["rowid"],
+                        "data": {
+                            k: (v.decode("utf-8", errors="replace")
+                                if isinstance(v, bytes) else v)
+                            for k, v in rec["values_dict"].items()
+                        },
+                    })
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"deleted_records": out, "total": len(out)},
+                        f, indent=2, default=str)
+            messagebox.showinfo("Export Complete",
+                                "Exported {:,} records to:\n{}".format(
+                                    len(out), os.path.basename(path)))
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
