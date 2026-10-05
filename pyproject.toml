@@ -8,17 +8,17 @@ where = ["src"]
 
 [project]
 name = "sqlite-gui-analyzer"
-version = "1.0.0"
-requires-python = ">=3.9"
+dynamic = ["version"]
+requires-python = ">=3.8"
 authors = [
   {name = "Akhil Dara"}
 ]
 maintainers = [
   {name = "Akhil Dara"}
 ]
-description = "SQLite Forensic Analyzer"
+description = "Free SQLite viewer and forensic analyzer: search every table, decode BLOBs and timestamps, recover deleted records from the WAL, freed pages and journal, read-only"
 readme = "README.md"
-keywords = ["digital forensics", "dfir", "sqlite", "analyzer"]
+keywords = ["sqlite", "sqlite-browser", "sqlite-viewer", "digital-forensics", "dfir", "mobile-forensics", "wal", "deleted-records", "data-recovery", "bplist", "whatsapp", "chrome-history", "tkinter"]
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Programming Language :: Python :: 3",
@@ -28,6 +28,9 @@ classifiers = [
 [tool.setuptools]
 package-dir = {"" = "src", "sqlite_gui_analyzer" = "sqlite_gui_analyzer.py"}
 py-modules = ["sqlite_gui_analyzer"]
+
+[tool.setuptools.dynamic]
+version = {attr = "constants.VERSION"}
 
 [project.urls]
 Homepage = "https://github.com/akhil-dara/sqlite-gui-analyzer"

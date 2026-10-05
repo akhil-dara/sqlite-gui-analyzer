@@ -2,7 +2,9 @@
 
 from collections import OrderedDict
 
-VERSION = "1.0"
+# The one version source: the window title, About/Help, the schema report, the PyInstaller
+# builds, the installer and pyproject.toml all read it (see tools/release.py).
+VERSION = "2.1.0"
 
 # Windows taskbar icon fix — show app icon instead of Python icon
 try:
@@ -19,17 +21,20 @@ except ImportError:
     PILImage = None
     ImageTk = None
 
-# ── colours ──────────────────────────────────────────────────────────────
+# ── colours: the older names, as design tokens (tokens.py) ──────────────────
+from tokens import COLOR as _K   # noqa: E402
+
 C = dict(
-    bg="#ffffff", bg2="#f7f8fa", bg3="#eef0f4", bg4="#dfe2e8",
-    border="#c8cdd5", text="#1a1a2e", text2="#5e6c84",
-    accent="#0052cc", acl="#deebff", green="#00875a", gl="#e3fcef",
-    red="#de350b", rl="#ffebe6", yellow="#ff991f", orange="#c25100",
-    purple="#6554c0", tsel="#cce0ff", alt="#f8f9fb", hl="#fff0b3",
-    hbg="#0747a6", hfg="#ffffff", sbg="#f4f5f7",
+    bg=_K["card"], bg2=_K["background"], bg3=_K["muted"], bg4=_K["hover"],
+    border=_K["border"], text=_K["text"], text2=_K["muted_text"],
+    accent=_K["primary"], acl=_K["primary_soft"], green=_K["success_text"],
+    gl=_K["success_soft"], red=_K["danger"], rl=_K["danger_soft"], yellow=_K["accent"],
+    orange=_K["warning"], purple=_K["purple"], tsel=_K["selection"], alt=_K["row_alt"],
+    hl=_K["highlight"], hbg=_K["card"], hfg=_K["heading"], sbg=_K["background"],
 )
 
 # ── search modes ─────────────────────────────────────────────────────────
+# the nine modes, grouped: text (6), binary (2), schema (1). Earlier names still work.
 SEARCH_MODES = OrderedDict([
     ("Case-Insensitive", "ci"),
     ("Case-Sensitive", "cs"),
@@ -37,9 +42,64 @@ SEARCH_MODES = OrderedDict([
     ("Starts With", "sw"),
     ("Ends With", "ew"),
     ("Regex", "rx"),
-    ("BLOB/Hex", "blob"),
+    ("Text in BLOBs", "blob"),
+    ("Byte pattern (hex)", "hex"),
     ("Column Name", "col"),
 ])
+SEARCH_MODE_GROUPS = (("Text", ("ci", "cs", "ex", "sw", "ew", "rx")),
+                      ("Binary", ("blob", "hex")), ("Schema", ("col",)))
+_MODE_ALIASES = {"BLOB/Hex": "blob", "Hex Bytes": "hex"}
+
+
+def search_mode_key(label, default="ci"):
+    """Engine mode key of a mode label (current or earlier name) or of a key itself."""
+    if label in SEARCH_MODES:
+        return SEARCH_MODES[label]
+    if label in _MODE_ALIASES:
+        return _MODE_ALIASES[label]
+    return label if label in SEARCH_MODES.values() else default
+
+
+# a search hit's internal source key -> the name the UI shows (tag files keep the key)
+SOURCE_NAMES = {"Freelist": "Freed pages"}
+
+
+def source_name(source):
+    """How a source is shown: 'Freelist' (the internal key) reads 'Freed pages'."""
+    s = str(source or "")
+    for key, name in SOURCE_NAMES.items():
+        if s.startswith(key):
+            return name + s[len(key):]
+    return s
+
+
+# how a database was opened (engine.session modes): one name everywhere (the case chips,
+# Info, Evidence, row details); short for the chips, long where there is room
+MODE_LABELS = {
+    "immutable": ("immutable", "immutable (no WAL to merge)"),
+    "ram-overlay": ("WAL merged", "WAL merged in RAM (SQL sees the current state)"),
+    "main-only": ("WAL not in SQL", "WAL not in SQL (SQL sees the main file only)"),
+    "native": ("read natively", "read natively (SQLite could not open it)"),
+    "safe-parse": ("Safe parse", "Safe parse (only the built-in parser reads it; SQLite is "
+                                   "not used)"),
+}
+
+
+def mode_label(mode, long=False):
+    """The name of an open mode ('ram-overlay' reads 'WAL merged'); unknown ones as they
+    are."""
+    names = MODE_LABELS.get(str(mode or ""))
+    return names[1 if long else 0] if names else str(mode or "")
+
+
+def source_key(label):
+    """The internal source key of a label source_name() shows ('Freed pages' -> 'Freelist');
+    a key or any other text comes back unchanged."""
+    s = str(label or "")
+    for key, name in SOURCE_NAMES.items():
+        if s.startswith(name):
+            return key + s[len(name):]
+    return s
 
 # ── blob signatures ──────────────────────────────────────────────────────
 _SIGS = [
@@ -97,10 +157,45 @@ PAGE_TYPES = {
     0x00: "Overflow / Free",
 }
 
-# WAL frame category colours
-C.update({
-    "wal_committed": "#00875a",    # green — safe, in DB
-    "wal_uncommitted": "#ff991f",  # yellow/orange — pending
-    "wal_old": "#de350b",          # red — pre-checkpoint, potentially lost
-    "wal_bg": "#f5f0ff",           # light purple background for WAL results
-})
+# WAL frame states (engine.fileformat.wal): key -> (label, colour, row background, meaning)
+WAL_STATES = OrderedDict([
+    ("current", ("Current", _K["success_text"], _K["success_soft"],
+                 "Committed; latest version of this page (what SQLite shows)")),
+    ("superseded", ("Superseded", _K["purple"], _K["purple_soft"],
+                    "Committed, then replaced by a later commit (older version)")),
+    ("uncommitted", ("Uncommitted", _K["warning"], _K["warning_soft"],
+                     "Written after the last commit (in progress or rolled back); invisible to SQLite")),
+    ("stale", ("Stale", _K["danger_text"], _K["danger_soft"],
+               "Left from an earlier WAL generation (salt mismatch); older data")),
+])
+
+
+def wal_state_label(state):
+    return WAL_STATES.get(state, (state,))[0]
+
+
+def refresh_colors():
+    """Rebuild C and ROW_FLAG_BG from the current tokens, in place, so every module that
+    did `from constants import C` follows a tokens.set_theme() switch."""
+    C.clear()
+    C.update(dict(
+        bg=_K["card"], bg2=_K["background"], bg3=_K["muted"], bg4=_K["hover"],
+        border=_K["border"], text=_K["text"], text2=_K["muted_text"],
+        accent=_K["primary"], acl=_K["primary_soft"], green=_K["success_text"],
+        gl=_K["success_soft"], red=_K["danger"], rl=_K["danger_soft"], yellow=_K["accent"],
+        orange=_K["warning"], purple=_K["purple"], tsel=_K["selection"], alt=_K["row_alt"],
+        hl=_K["highlight"], hbg=_K["card"], hfg=_K["heading"], sbg=_K["background"],
+        wal_bg=_K["purple_soft"],
+    ))
+    ROW_FLAG_BG.clear()
+    ROW_FLAG_BG.update({"flag_damaged": _K["danger_soft"],
+                        "flag_prealter": _K["warning_soft"]})
+
+
+# Row backgrounds for engine row flags (utils.row_flag_tag -> colour): refreshed in place
+# by refresh_colors(), so a theme switch repaints them too.
+ROW_FLAG_BG = {}
+refresh_colors()
+
+# Row backgrounds for engine row flags (utils.row_flag_tag -> colour): rebuilt by
+# refresh_colors() above, in place, on every theme switch.

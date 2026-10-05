@@ -1,0 +1,194 @@
+name: Release
+
+# Every push to main builds and tests the Windows programs. When VERSION in src/constants.py
+# has no GitHub release yet, the push also publishes it: the tag vX.Y.Z is created on the
+# pushed commit and the installer, the portable builds and SHA256SUMS.txt are attached (so a
+# release is made by raising VERSION and adding its CHANGELOG.md section, then pushing).
+# Pushing a tag vX.Y.Z publishes that version too. Running the workflow by hand is a dry run:
+# it builds and tests everything and uploads the files as a workflow artifact only.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the v; must equal VERSION in src/constants.py"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUTF8: "1"
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      publish: ${{ steps.version.outputs.publish }}
+      tag_exists: ${{ steps.version.outputs.tag_exists }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: tools/build-requirements.txt
+
+      - name: Check the tag against VERSION
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = python tools/release.py version
+          if ($env:EVENT_NAME -eq "workflow_dispatch") { $tag = "v$env:INPUT_VERSION" }
+          elseif ($env:REF_TYPE -eq "tag") { $tag = $env:REF_NAME }
+          else { $tag = "v$version" }               # a push to main: the version's own tag
+          python tools/release.py check-tag $tag
+          $prerelease = if ($version.Contains("-")) { "true" } else { "false" }
+          # publish on a tag push, or on a push to main whose version has no release yet
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $tag --json tagName 2>$null | Out-Null
+          $released = ($LASTEXITCODE -eq 0)
+          git ls-remote --exit-code --tags origin "refs/tags/$tag" 2>$null | Out-Null
+          $tagExists = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+          $PSNativeCommandUseErrorActionPreference = $true
+          $publish = if ($env:EVENT_NAME -eq "push" -and -not $released) { "true" } else { "false" }
+          "version=$version", "tag=$tag", "prerelease=$prerelease", "publish=$publish",
+            "tag_exists=$(if ($tagExists) { 'true' } else { 'false' })" | Add-Content $env:GITHUB_OUTPUT
+          if ($publish -eq "true") { "Will publish $tag" } else { "Build and test only ($tag already released or a dry run)" }
+          "VERSION=$version", "DIST=$env:RUNNER_TEMP\dist", "WORK=$env:RUNNER_TEMP\build",
+            "OUT=$env:RUNNER_TEMP\release" | Add-Content $env:GITHUB_ENV
+
+      - name: Unit tests (standard library only)
+        run: python -m unittest discover -s tests -t .
+
+      - name: Install build tools
+        # a block: ':all: ' in a plain YAML value would end the workflow file's parsing
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r tools/build-requirements.txt
+
+      - name: Build onedir and onefile programs
+        run: python -m PyInstaller --noconfirm --clean --distpath $env:DIST --workpath $env:WORK sqlite-gui-analyzer.spec
+
+      - name: Self-test the built programs
+        timeout-minutes: 10
+        run: |
+          ./tools/run_self_test.ps1 -Exe "$env:DIST\SQLiteGUIAnalyzer\SQLiteGUIAnalyzer.exe"
+          ./tools/run_self_test.ps1 -Exe "$env:DIST\SQLiteGUIAnalyzer-$env:VERSION-portable.exe"
+
+      - name: Package the portable builds
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force $env:OUT | Out-Null
+          python tools/release.py zip "$env:DIST\SQLiteGUIAnalyzer" "$env:OUT\SQLiteGUIAnalyzer-$env:VERSION-portable.zip" --root "SQLiteGUIAnalyzer-$env:VERSION"
+          Copy-Item "$env:DIST\SQLiteGUIAnalyzer-$env:VERSION-portable.exe" $env:OUT
+
+      - name: Build the installer
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          function Find-Iscc {
+            @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe") |
+              Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            choco install innosetup --version=6.7.1 -y --no-progress
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw "ISCC.exe (Inno Setup 6) not found" }
+          Write-Host "Using $iscc"
+          & $iscc "/DAppVersion=$env:VERSION" "/DDistDir=$env:DIST\SQLiteGUIAnalyzer" "/DOutputDir=$env:OUT" installer\sqlite-gui-analyzer.iss
+
+      - name: Test the installer (per-user install, self-test, uninstall)
+        timeout-minutes: 10
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "installed"
+          $log = Join-Path $env:RUNNER_TEMP "install.log"
+          $setup = "$env:OUT\SQLiteGUIAnalyzer-$env:VERSION-setup.exe"
+          $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES",
+            "/NORESTART", "/CURRENTUSER", "/DIR=`"$dir`"", "/LOG=`"$log`""
+          if ($p.ExitCode -ne 0) { Get-Content $log -ErrorAction SilentlyContinue; throw "setup failed with exit code $($p.ExitCode)" }
+          ./tools/run_self_test.ps1 -Exe "$dir\SQLiteGUIAnalyzer.exe"
+          $p = Start-Process -FilePath "$dir\unins000.exe" -Wait -PassThru -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          if ($p.ExitCode -ne 0) { throw "uninstall failed with exit code $($p.ExitCode)" }
+          # The uninstaller finishes from a copy of itself: wait for the files to go
+          $deadline = (Get-Date).AddSeconds(120)
+          while ((Test-Path "$dir\SQLiteGUIAnalyzer.exe") -and ((Get-Date) -lt $deadline)) { Start-Sleep -Milliseconds 500 }
+          if (Test-Path "$dir\SQLiteGUIAnalyzer.exe") { throw "uninstall left the program behind" }
+          Write-Host "Installed, self-tested and uninstalled"
+
+      - name: Checksums and release notes
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $files = "setup.exe", "portable.zip", "portable.exe" | ForEach-Object { "$env:OUT\SQLiteGUIAnalyzer-$env:VERSION-$_" }
+          python tools/release.py checksums "$env:OUT\SHA256SUMS.txt" @files
+          python tools/release.py notes "$env:OUT\RELEASE_NOTES.md" --checksums "$env:OUT\SHA256SUMS.txt"
+          Get-ChildItem $env:OUT | Format-Table Name, Length -AutoSize
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SQLiteGUIAnalyzer-${{ steps.version.outputs.version }}
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+
+  publish:
+    name: Publish the GitHub release
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: SQLiteGUIAnalyzer-${{ needs.build.outputs.version }}
+          path: release
+
+      - name: Create the release
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          TAG_EXISTS: ${{ needs.build.outputs.tag_exists }}
+          SHA: ${{ github.sha }}
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+          # a push to main creates the tag on the pushed commit; a pushed tag is used as it is
+          if [ "$TAG_EXISTS" = "true" ]; then flags+=(--verify-tag); else flags+=(--target "$SHA"); fi
+          gh release create "$TAG" \
+            "SQLiteGUIAnalyzer-$VERSION-setup.exe" \
+            "SQLiteGUIAnalyzer-$VERSION-portable.zip" \
+            "SQLiteGUIAnalyzer-$VERSION-portable.exe" \
+            SHA256SUMS.txt \
+            --title "SQLite GUI Analyzer $VERSION" \
+            --notes-file RELEASE_NOTES.md \
+            "${flags[@]}"

@@ -11,25 +11,106 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import tkinter.font as tkfont
+import _tkinter
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
-from constants import C, VERSION, SEARCH_MODES, _EXT_MAP
-from utils import (_q, _le, fmtb, vb, _snippet, fmt_count, _int_count,
-                   blob_type, try_decode_timestamp, _build_schema_text,
-                   _build_schema_html)
+from combobox import SearchableCombobox
+from constants import (C, VERSION, SEARCH_MODES, SEARCH_MODE_GROUPS, _EXT_MAP, WAL_STATES,
+                       search_mode_key,
+                       mode_label, source_name, source_key, wal_state_label)
+from utils import (_q, fmtb, vb, _snippet, fmt_count, _int_count, plural, longest,
+                   blob_type, _build_schema_text,
+                   _build_schema_html, set_write_guard, write_allowed, safe_filename,
+                   export_row_blobs, flag_summary, plain_text, json_value, sql_first_keyword,
+                   sql_reads_only)
 from database import DB
-from widgets import ToolTip, TreeviewTooltip, setup_theme
-from dialogs import HelpDialog, ScopeDlg, BlobViewer, RowWin
+from case import Case
+from case_ui import OpenFolderDialog
+from navigator import CaseNavigator, case_name, member_warnings, short_count
+from overview_tab import OverviewTab
+from palette import CommandPalette, Item
+from parts import Chip, StatusLine, Toolbar
+from scope import ScopePicker, Scopes, scope_text
+from tokens import COLOR as K, FONT as F, XS, S, M
+from engine.tags import (TagError, add_recent_case, case_changes, case_file_path, read_case,
+                         sha256_change, write_case)
+from widgets import (ElideLabel, FlowFrame, SearchBox, TextFind, ToolTip, TreeFilter,
+                     TreeviewTooltip, add_placeholder, cancel_all_afters, fit_geometry,
+                     focus_search_in,
+                     menu_button, place_over, setup_theme, wrap_to_width)
+from dialogs import HelpDialog, ScopeDlg, BlobViewer, RowWin, TextWindow, ValuesWindow
+from search_results import ResultGrouper, is_wal, match_label, source_kind
+from forensics_tab import ForensicsTab, RecordWindow
+from timeline_tab import TimelineTab
+from date_columns import BrowseDates
+from lookups import BrowseLookups
+from engine import limits, uiyield
+from engine.decode import timestamps
+from engine.evidence import is_network_path
+from engine.export import mtime_utc as mtime_text, utc_text
+from engine.search import check_term
+from grid import DataGrid, Runner, grid_search, show_filter_help, warm_fallback_fonts
+from jobs import (Job, ask_path, blob_export_done, evidence_records, export_options,
+                  export_protected, export_rows, multi_table_options, write_export_manifest)
+from browse_sources import ListSource, TableSource
+from tagging import Tagging
+from wal_tab import WalTab, open_wal_record
+from tags_tab import TagsTab
+from relations_view import RelationWindows
+from relations_tab import RelationsTab
+from datamap_ui import DataMapUI
+from engine.relations import ROWID
+from engine.filters import value_expr
+from engine.schema import Locator
+
+
+# Tk events served while _stop_workers waits: the calls worker threads make into Tk (after(),
+# variable reads) are always served; FILE_EVENTS only keeps Tcl from treating an empty event mask
+# as "all events", so user input and timers stay queued until the wait is over.
+WORKER_CALLS_ONLY = _tkinter.DONT_WAIT | _tkinter.FILE_EVENTS
+WORKER_STOP_WAIT = 3.0      # seconds _close_db waits for the worker threads to end
+UI_BEAT_MS = 10             # the Tk thread tells the workers it serves events (uiyield)
+NAV_BREAKPOINT = 1000       # a window narrower than this folds the navigator to its toggle
+
+# Interface-size choices (View menu): key, menu label, multiplier of the platform's
+# own Tk scaling. Point-sized fonts follow "tk scaling", so the whole UI grows/shrinks.
+UI_SCALES = (("compact", "Small", 0.9),
+             ("default", "Default", 1.0),
+             ("large", "Large", 1.2),
+             ("xlarge", "Extra large", 1.4))
+_UI_SCALE_FACTORS = dict((k, f) for k, _label, f in UI_SCALES)
 
 
 # ── Combobox type-ahead helper ────────────────────────────────────────────
 # ── Main Application ─────────────────────────────────────────────────────
 class App(tk.Tk):
     def __init__(self, initial_path=None):
+        from widgets import enable_dpi_awareness
+        enable_dpi_awareness()          # crisp at 125-200% display scaling
         super().__init__()
+        forced = os.environ.get("SGA_TK_SCALING")      # tests: a display scaling to lay out at
+        if forced:
+            try:
+                self.tk.call("tk", "scaling", float(forced))
+            except (tk.TclError, ValueError):
+                pass
+        try:
+            self._base_scaling = float(self.tk.call("tk", "scaling"))
+        except (tk.TclError, ValueError):
+            self._base_scaling = 96 / 72.0
         self.title("SQLite GUI Analyzer v" + VERSION)
-        self.geometry("1200x750")
+        # sizes grow with the display scaling (Tk's scaling is 1.33 at 100%)
+        try:
+            f = max(1.0, float(self.tk.call("tk", "scaling")) / (96 / 72.0))
+        except (tk.TclError, ValueError):
+            f = 1.0
+        self.geometry("%dx%d" % (1200 * f, 750 * f))
         self.configure(bg=C["bg"])
-        self.minsize(900, 500)
+        # never larger than the screen (a 1080p screen at 200%: 1800x1000 only just fitted)
+        self.minsize(min(int(900 * f), max(600, self.winfo_screenwidth() - 40)),
+                     min(int(500 * f), max(400, self.winfo_screenheight() - 100)))
         # Start maximized
         try:
             self.state('zoomed')  # Windows/macOS
@@ -41,155 +122,686 @@ class App(tk.Tk):
 
         setup_theme(self)
         self._set_app_icon()
-        self.db = DB()
-        self._count_cache = {}
+        # The open databases: a case of one or more. self.db is the active one's DB (see the
+        # property), so every tab written for one database works on it unchanged.
+        self.case = Case()
+        self._no_db = DB()
+        self._no_counts, self._no_scope = {}, []
+        self._case_path = None           # the saved case file (2+ databases)
+        self._case_state = {}            # what the case file keeps besides the databases
         self._search_cancel = False
+        self._safe_paths = set()     # databases the user chose to open with Safe parse
         self._search_thread = None
-        self._count_cancel = False
-        self._scope_tables = []
-        self._browse_cache_data = []
-        self._browse_cache_cols = []
-        self._browse_sort_col = None
-        self._browse_sort_dir = "ASC"
-        self._browse_offset = 0
-        self._browse_filter_after = None
+        self._search_threads = []    # threads searching the databases of a case side by side
+        self._search_gen = 0         # bumped by each search
+        self._count_gen = 0          # bumped on every open/close; stale count threads stop
+        self._bg_count_thread = None
+        self._count_threads = []
+        self._count_queue = []           # databases waiting for the row-count worker
+        self._count_lock = threading.Lock()
+        self._count_worker, self._count_worker_gen = None, None
+        self._browse_source = None       # the Browse grid's row source (browse_sources)
+        self._browse_count_gen = 0       # bumped per count request; stale counts are dropped
+        self._browse_count_error = ""
+        self._browse_pos_gen = 0         # bumped per position index request (engine.positions)
+        self._browse_pos_busy = False    # a position index is being built for the Browse view
+        self._browse_pos_db = None       # the database (case member) it is built on
+        self._browse_t0 = None           # when the table was chosen: first-rows time
+        self._browse_first_ms = None
+        self._browse_first_range = None  # the rows that time was measured for
+        self._browse_table_gen = 0       # bumped per table choice; stale table reads are dropped
+        self._browse_has_blobs = False   # the Browse table holds BLOB values (checked on a worker)
+        self._browse_wal_loading = None  # 'WAL: name' whose records are being read
+        self._jobs = []                  # jobs.Job running now (exports, verification...)
+        self._open_state = None          # the databases being opened (_start_open)
+        self._open_waiting = []          # opens asked for while one runs
+        self._open_finishing = None      # an open whose databases are being shown everywhere
+        self._case_change_gen = 0        # bumped per _case_changed (a spread one stops)
+        self._close_verify = None        # the evidence of databases just closed, verifying
+        self.last_closed = []            # what the last close verified, database by database
+        self._activity_log = None        # engine.activity.ActivityLog of the open case
         self._schema_filter_after = None
         self._load_time = 0
         self._measure_font = None
-        self._measure_bold_font = None
-        
+
         # SQL Query Editor state
         self._sql_query_history     = []
         self._sql_query_history_idx = -1
         self._sql_query_thread      = None
         self._sql_query_cancel      = False
+        self._sql_conn              = None   # connection of the running SQL-tab query
         self._sql_result_rows       = []
         self._sql_result_cols       = []
-        # Deleted Pages (Freelist) state
-        self._fl_tab_added = False
-        self._fl_data      = []
+        self._sql_limited           = False  # the last query stopped at the row limit
 
+        set_write_guard(lambda p: self.case.is_protected(p))
+        # Row tags of the open database (saved in the user's app-data folder, never beside it)
+        self.tags = Tagging(self)
+        from engine.tags import data_dir
+        self._data_dir_in_use = data_dir()   # a changed folder is used from the next start
+        self._theme_var = tk.StringVar(self, value="light")
+        self.set_theme(self.tags.settings.get("theme") or "light", save=False)
+        self._ui_scale_var = tk.StringVar(self, value="default")
+        self.set_ui_scale(self.tags.settings.get("ui_scale") or "default", save=False)
+        # Column relationship windows (related rows of a value, the map of a column)
+        self.relations = RelationWindows(self)
+        # Copy with related and the Database Map (datamap_ui)
+        self.datamap = DataMapUI(self)
+        self._browse_dates = BrowseDates(self)      # 'Show as date' of the Browse columns
+        self._browse_lookups = BrowseLookups(self)  # 'Show value from linked table'
+        # which databases each feature covers (one scope control everywhere)
+        self.scopes = Scopes(lambda: list(self.case))
+        self.scopes.listeners.append(lambda features: self._save_case())
+        self._palette = None
         self._build_header()
         self._build_body()
         self._bind_keys()
         self._setup_tooltips()
+        if self.tags.settings.get("navigator_hidden") is True:
+            self._set_sidebar(False)    # hidden by hand last time: still hidden
+        self._update_welcome(False)     # nothing is open yet
+        self._tags_tab = TagsTab(self._nb, self)
+        self._nb.add(self._tags_tab, text="Tagged")
+        self._relations_tab = RelationsTab(self._nb, self)
+        self._nb.add(self._relations_tab, text="Relationships")
+        # the landing page of a case of several databases (added only for one)
+        self._overview = OverviewTab(self._nb, self)
+        self._overview_added = False
+        self.tags.bind_keys()
         self.protocol("WM_DELETE_WINDOW", self._on_app_close)
+        # a narrow window gives the schema sidebar less room, the tabs more
+        self.bind("<Configure>", self._on_resize, add="+")
+        self._issues_win = None
+        self._verify_close_win = None    # the window of the re-hash on close, while it runs
+        self._poll_issue_count()
+        self._ui_beat()
+        self._warm_tabs()
 
         if initial_path and os.path.isfile(initial_path):
             self.after(200, lambda: self._open_db(initial_path))
 
-    def _set_app_icon(self):
-        """Generate and set a programmatic app icon (no external file needed)."""
+    def _storage_text(self):
+        """The saved-data folder in use, and the one used from the next start if it was
+        changed."""
+        from engine.tags import data_dir
+        now = self._data_dir_in_use
+        nxt = data_dir()
+        if os.path.normcase(nxt) == os.path.normcase(now):
+            return now
+        return "%s\nfrom the next start: %s" % (now, nxt)
+
+    def _refresh_welcome_storage(self):
+        lbl = getattr(self, "_welcome_store", None)
+        if lbl is not None:
+            lbl.configure(text=self._storage_text())
+
+    def open_data_folder(self):
+        """Open the saved-data folder in the file manager (made first if it is new: it is
+        the tool's own folder, never an evidence folder)."""
+        import subprocess
+        from engine.tags import data_dir
+        path = data_dir()
         try:
-            # Create a 32x32 icon image using a PhotoImage
-            icon_size = 32
-            img = tk.PhotoImage(width=icon_size, height=icon_size)
-            # Draw a simple database cylinder icon with blue/white colors
-            # Background: transparent
-            # Blue database body
-            for y in range(8, 26):
-                for x in range(6, 26):
-                    img.put("#3b82f6", (x, y))
-            # Top ellipse (lighter blue)
-            for x in range(6, 26):
-                dx = x - 16
-                if abs(dx) <= 10:
-                    for dy in range(-3, 4):
-                        ry = 8 + dy
-                        if 0 <= ry < icon_size and (dx * dx / 100 + dy * dy / 9) <= 1:
-                            img.put("#60a5fa", (x, ry))
-            # Bottom ellipse
-            for x in range(6, 26):
-                dx = x - 16
-                if abs(dx) <= 10:
-                    for dy in range(-3, 4):
-                        ry = 24 + dy
-                        if 0 <= ry < icon_size and (dx * dx / 100 + dy * dy / 9) <= 1:
-                            img.put("#2563eb", (x, ry))
-            # Magnifying glass (white circle + handle)
-            for x in range(18, 30):
-                for y in range(16, 28):
-                    dx = x - 23
-                    dy = y - 21
-                    r2 = dx * dx + dy * dy
-                    if 16 <= r2 <= 36:
-                        if 0 <= x < icon_size and 0 <= y < icon_size:
-                            img.put("white", (x, y))
-            # Handle
-            for i in range(5):
-                px = 27 + i
-                py = 25 + i
-                if 0 <= px < icon_size and 0 <= py < icon_size:
-                    img.put("white", (px, py))
-                    if px + 1 < icon_size:
-                        img.put("white", (px + 1, py))
-            self._app_icon = img  # prevent GC
-            self.wm_iconphoto(True, img)
-        except Exception:
-            pass  # Icon is cosmetic; don't crash if it fails
+            os.makedirs(path, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except OSError as e:
+            messagebox.showerror("Open folder", str(e), parent=self)
+
+    def _show_storage(self):
+        """Where the app keeps its data (tags, recent files, settings): what is stored,
+        where, and how to change it."""
+        from engine.tags import data_dir, save_settings, DATA_DIR_ENV
+        import os
+        win = tk.Toplevel(self)
+        win.title("Storage")
+        win.transient(self)
+        frm = ttk.Frame(win, padding=14)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Saved data folder", style="B.TLabel").pack(anchor="w")
+        folder_lbl = ttk.Label(frm, text=self._storage_text(), style="Mono.TLabel", wraplength=420,
+                               justify="left")
+        folder_lbl.pack(anchor="w", pady=(2, 4))
+        fb = ttk.Frame(frm)
+        fb.pack(anchor="w")
+        ttk.Button(fb, text="Open folder",
+                   command=self.open_data_folder).pack(side="left")
+        ttk.Button(fb, text="Change folder\u2026",
+                   command=lambda: self._change_data_dir(win, folder_lbl)).pack(side="left", padx=6)
+        from engine.tags import data_dir_override
+        if data_dir_override() or os.environ.get(DATA_DIR_ENV):
+            ttk.Button(fb, text="Reset to default",
+                       command=lambda: self._reset_data_dir(win, folder_lbl)).pack(side="left")
+        ttk.Label(frm, text="Your tags, recent files and settings move with the folder. "
+                  "Takes effect after you restart the app.", style="Muted.TLabel", wraplength=420,
+                  justify="left").pack(anchor="w", pady=(6, 0))
+        ttk.Label(frm, text="What is stored there", style="B.TLabel").pack(anchor="w", pady=(12, 0))
+        for what in ("settings.json \u2013 recent databases and cases, theme, window state",
+                     "cases/<database>-<id>.json \u2013 your tags and saved view state per database",
+                     "case-lists/ \u2013 multi-database case definitions"):
+            ttk.Label(frm, text="\u2022 " + what, style="M.TLabel", wraplength=420,
+                      justify="left").pack(anchor="w")
+        ttk.Label(frm, text="Nothing is ever written into your evidence databases.",
+                  style="Muted.TLabel", wraplength=420, justify="left").pack(anchor="w", pady=(6, 0))
+        ttk.Label(frm, text="Recent items kept", style="B.TLabel").pack(anchor="w", pady=(12, 0))
+        nvar = tk.IntVar(value=self.tags.settings.get("recent_max", 10))
+        sf = ttk.Frame(frm)
+        sf.pack(anchor="w", pady=(2, 0))
+        ttk.Spinbox(sf, from_=0, to=50, width=5, textvariable=nvar).pack(side="left")
+        ttk.Label(sf, text="databases and cases in Open \u25be Recent",
+                  style="M.TLabel").pack(side="left", padx=(6, 0))
+
+        def _save():
+            try:
+                self.tags.settings["recent_max"] = int(nvar.get())
+            except (tk.TclError, ValueError):
+                pass
+            try:
+                save_settings(self.tags.settings)
+            except (OSError, ValueError):
+                pass
+            win.destroy()
+
+        bar = ttk.Frame(frm)
+        bar.pack(fill="x", pady=(14, 0))
+        ttk.Button(bar, text="OK", style="P.TButton", command=_save).pack(side="right")
+        ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="right", padx=6)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def _change_data_dir(self, win, folder_lbl):
+        """Pick a new app-data folder: optionally move the current data there, point the
+        app at it, and ask for a restart."""
+        from tkinter import filedialog, messagebox
+        from engine.tags import data_dir, set_data_dir_override
+        import os, shutil
+        new = filedialog.askdirectory(parent=win, title="Choose the app data folder",
+                                      mustexist=False)
+        if not new:
+            return
+        new = os.path.abspath(new)
+        old = data_dir()
+        if os.path.normcase(new) == os.path.normcase(old):
+            return
+        move = messagebox.askyesno("Move app data?",
+            "Move your tags, recent files and settings to the new folder?\n\n"
+            "Yes: everything is copied there now.\n"
+            "No: the new folder starts empty (your old data stays where it is).",
+            parent=win)
+        if move:
+            try:
+                os.makedirs(new, exist_ok=True)
+                for name in ("settings.json", "cases", "case-lists"):
+                    src = os.path.join(old, name)
+                    dst = os.path.join(new, name)
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                    elif os.path.isfile(src) and not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+            except OSError as e:
+                messagebox.showerror("Move failed", "Could not copy the data:\n%s" % e,
+                                     parent=win)
+                return
+        try:
+            set_data_dir_override(new)
+        except OSError as e:
+            messagebox.showerror("Not saved", "Could not remember the new folder:\n%s" % e,
+                                 parent=win)
+            return
+        folder_lbl.configure(text=self._storage_text())
+        self._refresh_welcome_storage()
+        messagebox.showinfo("Restart needed",
+            "The new app data folder takes effect after you restart the app.", parent=win)
+
+    def _reset_data_dir(self, win, folder_lbl):
+        """Forget the picked folder (and the env var note): back to the default on restart."""
+        from tkinter import messagebox
+        from engine.tags import set_data_dir_override, data_dir, DATA_DIR_ENV
+        import os
+        if os.environ.get(DATA_DIR_ENV):
+            messagebox.showinfo("Reset to default",
+                "The %s environment variable is set: unset it and restart " % DATA_DIR_ENV +
+                "to go back to the default folder.", parent=win)
+            return
+        set_data_dir_override(None)
+        folder_lbl.configure(text=self._storage_text())
+        self._refresh_welcome_storage()
+        messagebox.showinfo("Restart needed",
+            "The default app data folder takes effect after you restart the app.", parent=win)
+
+    def set_theme(self, name, save=True):
+        """Switch the app between the light and dark theme, live; the choice is kept in
+        the app settings."""
+        from widgets import set_app_theme
+        name = set_app_theme(self, name)
+        try:
+            self._theme_var.set(name)
+        except (tk.TclError, AttributeError):
+            pass
+        if save:
+            try:
+                self.tags.settings["theme"] = name
+                from engine.tags import save_settings
+                save_settings(self.tags.settings)
+            except (OSError, ValueError, AttributeError):
+                pass
+        return name
+
+    def _apply_font_sizes(self, changed):
+        """The FONT tokens changed size (tokens.set_font_scale): rebuild the ttk styles
+        (fonts, row heights) and the named default fonts, and give every classic widget the
+        new size of the font it was made with. (Changing Tk's own scaling instead reaches
+        only fonts made afterwards: Tk keeps the pixel size of a font it already made.)"""
+        from widgets import setup_theme
+        setup_theme(self)
+        if not changed:
+            return
+        by_text = dict((self.tk.call("list", *old) if False else " ".join(
+            ("{%s}" % x) if " " in str(x) else str(x) for x in old), new)
+            for old, new in changed.items())
+        stack = [self]
+        while stack:
+            w = stack.pop()
+            try:
+                stack.extend(w.winfo_children())
+                spec = w.cget("font")
+            except (tk.TclError, AttributeError):
+                continue
+            key = tuple(spec) if isinstance(spec, (tuple, list)) else None
+            new = changed.get(key) if key is not None else by_text.get(str(spec))
+            if new is None and not isinstance(spec, (tuple, list)) and spec:
+                try:
+                    new = changed.get(tuple(self.tk.splitlist(spec)))
+                    if new is None:
+                        parts = self.tk.splitlist(spec)
+                        new = changed.get((parts[0], int(parts[1])) + tuple(parts[2:]))
+                except (tk.TclError, ValueError, IndexError):
+                    new = None
+            if new is not None:
+                try:
+                    w.configure(font=new)
+                except tk.TclError:
+                    pass
+
+    def set_ui_scale(self, name, save=True):
+        """Grow or shrink the interface (View menu > Interface size): every font token
+        changes size, at once, in every window. The choice is kept in the app settings and
+        applied again at startup."""
+        import tokens
+        if name not in _UI_SCALE_FACTORS:
+            name = "default"
+        try:
+            factor = _UI_SCALE_FACTORS[name]
+            if abs(tokens.font_scale() - factor) > 1e-6:
+                self._apply_font_sizes(tokens.set_font_scale(factor))
+                self.update_idletasks()
+        except (tk.TclError, ValueError, AttributeError):
+            pass
+        try:
+            self._ui_scale_var.set(name)
+        except (tk.TclError, AttributeError):
+            pass
+        if save:
+            try:
+                self.tags.settings["ui_scale"] = name
+                from engine.tags import save_settings
+                save_settings(self.tags.settings)
+            except (OSError, ValueError, AttributeError):
+                pass
+        return name
+
+    def _ui_beat(self):
+        """Tell the worker threads the Tk thread is serving events (engine.uiyield): while
+        it is busy instead, they give way to it."""
+        uiyield.beat()
+        try:
+            self._ui_beat_id = self.after(UI_BEAT_MS, self._ui_beat)
+        except tk.TclError:
+            uiyield.stop()
+
+    def _warm_tabs(self):
+        """Show every tab once while the window is still fully transparent, at start: Tk
+        draws a tab's widgets for the first time when the tab is first shown, which made the
+        first switch to each tab pause for 100-300 ms. Done here it costs about as much
+        once, before the window becomes visible. Only where the window manager supports
+        transparency (otherwise the tabs would be seen flicking by)."""
+        nb = self._nb
+        self.tabs_warmed = []
+        if self._windowingsystem not in ("win32", "aqua"):
+            return                  # X11: transparency needs a compositor, which may be absent
+        try:
+            self.attributes("-alpha", 0.0)
+        except tk.TclError:
+            return
+        extra = [(self._overview, "Overview"), (self._wal_frame, "WAL")]
+        try:
+            for w, text in extra:
+                nb.add(w, text=text)
+            self.update()                       # maps the (transparent) window
+            for t in nb.tabs():
+                nb.select(t)
+                self.update_idletasks()
+                self.tabs_warmed.append(nb.tab(t, "text"))
+            for w, _text in extra:
+                nb.forget(w)
+            nb.select(self._search_frame)
+            warm_fallback_fonts(self)           # emoji and other scripts: see grid.py
+            self.update_idletasks()
+        except tk.TclError:
+            pass
+        finally:
+            try:
+                self.attributes("-alpha", 1.0)
+            except tk.TclError:
+                pass
+
+    # ── The active database of the case ──────────────────────────────
+    @property
+    def db(self):
+        """The active database (an empty DB when none is open)."""
+        m = self.case.active
+        return m.db if m is not None else self._no_db
+
+    @property
+    def _count_cache(self):
+        """Row counts of the active database's tables."""
+        m = self.case.active
+        return m.counts if m is not None else self._no_counts
+
+    @_count_cache.setter
+    def _count_cache(self, value):
+        m = self.case.active
+        if m is not None:
+            m.counts = value
+        else:
+            self._no_counts = value
+
+    @property
+    def _scope_tables(self):
+        """The tables (and views) of the active database a search covers."""
+        m = self.case.active
+        return m.scope_tables if m is not None else self._no_scope
+
+    @_scope_tables.setter
+    def _scope_tables(self, value):
+        m = self.case.active
+        if m is not None:
+            m.scope_tables = value
+        else:
+            self._no_scope = value
+
+    def member_label(self, member, table=None):
+        """How a table is written: 'table' with one database open, 'wa.db › table' in a case."""
+        if member is None or not self.case.multi:
+            return table if table is not None else (member.name if member else "")
+        return member.label(table)
+
+    def _set_app_icon(self):
+        """The window and taskbar icon: the logo images in src/assets (bundled as 'assets'
+        in the frozen app)."""
+        from appicons import window_icons
+        try:
+            imgs = window_icons(self)
+            if imgs:
+                self._app_icons = imgs          # Tk drops images Python no longer holds
+                self.wm_iconphoto(True, *imgs)
+        except tk.TclError:
+            pass                                # the icon is cosmetic
 
     # ── Header ───────────────────────────────────────────────────────
     def _build_header(self):
-        hf = ttk.Frame(self, style="H.TFrame")
+        """One line, whatever the number of databases: the navigator toggle, the app name,
+        the case name and its summary ('com.phonepe.app · 16 databases · 1.2 GB · 247
+        tables'), the evidence state as one chip ('16 read-only · 7 WAL merged') with a
+        warnings chip beside it when there are any, then the main buttons."""
+        hf = ttk.Frame(self, style="Header.TFrame")
         hf.pack(fill="x")
-        inner = ttk.Frame(hf, style="H.TFrame")
-        inner.pack(fill="x", padx=10, pady=6)
+        self._header_frame = hf
+        self._header_rule = tk.Frame(self, height=1, background=K["border"])
+        self._header_rule.pack(fill="x")
+        inner = self._header_inner = ttk.Frame(hf, style="Header.TFrame")
+        inner.pack(fill="x", padx=M, pady=S)
 
-        # Canvas logo - larger and more prominent
-        logo = tk.Canvas(inner, width=48, height=44, bg=C["hbg"], highlightthickness=0)
-        logo.pack(side="left", padx=(0, 10))
-        # Database cylinder - stacked disks
-        logo.create_rectangle(8, 10, 36, 34, fill="#3b82f6", outline="")
-        logo.create_oval(8, 4, 36, 16, fill="#60a5fa", outline="#2563eb", width=1.5)
-        logo.create_oval(8, 14, 36, 24, outline="#93c5fd", width=1)
-        logo.create_oval(8, 28, 36, 38, fill="#2563eb", outline="#1d4ed8", width=1.5)
-        logo.create_line(8, 10, 8, 33, fill="#1d4ed8", width=1.5)
-        logo.create_line(36, 10, 36, 33, fill="#1d4ed8", width=1.5)
-        # Magnifying glass - prominent white
-        logo.create_oval(24, 18, 40, 34, outline="white", width=2.5)
-        logo.create_line(38, 32, 46, 42, fill="white", width=3, capstyle=tk.ROUND)
+        self._nav_btn = ttk.Button(inner, text="☰", width=3, style="Icon.TButton",
+                                   command=self._toggle_sidebar_by_hand)
+        self._nav_btn.pack(side="left", padx=(0, S))
+        # the logo (src/assets), sized for the display scaling
+        from appicons import logo_image
+        try:
+            px = int(round(24 * float(self.tk.call("tk", "scaling")) / (96 / 72.0)))
+        except (tk.TclError, ValueError):
+            px = 24
+        self._logo_img = logo_image(self, px)
+        if self._logo_img is not None:
+            logo = self._logo = ttk.Label(inner, image=self._logo_img, style="Header.TLabel")
+        else:
+            logo = self._logo = ttk.Label(inner, text="", style="Header.TLabel")
+        logo.pack(side="left")
+        # the name, left out in a narrow window (the buttons and the case summary need room)
+        self._title_lbl = ttk.Label(inner, text="SQLite GUI Analyzer", style="HeaderTitle.TLabel")
+        self._title_lbl.pack(side="left", padx=(S, 0))
 
-        ttk.Label(inner, text="  SQLite GUI Analyzer", style="H.TLabel").pack(side="left")
+        # Buttons on the right (packed before the summary so a narrow window keeps them)
+        self._close_btn = ttk.Button(inner, text="Close", command=self._close_db)
+        self._close_btn.pack(side="right", padx=(XS, 0))
+        self._help_btn = ttk.Button(inner, text="Help", command=lambda: HelpDialog(self))
+        self._help_btn.pack(side="right", padx=(XS, 0))
+        # Everything the engine had to skip, substitute or guess: a button only when there is
+        # something (and always in the Database menu)
+        self._issues_btn = ttk.Button(inner, text="Issues", command=self._show_issues)
+        self._view_btn = ttk.Button(inner, text="View ▾")
+        self._view_menu = tk.Menu(self, tearoff=0)
+        self._view_menu.add_radiobutton(label="Light", variable=self._theme_var,
+                                        value="light",
+                                        command=lambda: self.set_theme("light"))
+        self._view_menu.add_radiobutton(label="Dark", variable=self._theme_var,
+                                        value="dark",
+                                        command=lambda: self.set_theme("dark"))
+        self._view_menu.add_separator()
+        self._size_menu = tk.Menu(self._view_menu, tearoff=0)
+        for _key, _label, _factor in UI_SCALES:
+            self._size_menu.add_radiobutton(label=_label, variable=self._ui_scale_var,
+                                          value=_key,
+                                          command=lambda k=_key: self.set_ui_scale(k))
+        self._view_menu.add_cascade(label="Interface size", menu=self._size_menu)
+        self._view_menu.add_separator()
+        self._view_menu.add_command(label="Storage\u2026", command=self._show_storage)
+        self._view_btn.configure(command=lambda: self._post_menu(self._view_menu,
+                                                                 self._view_btn))
+        self._view_btn.pack(side="right", padx=(XS, 0))
+        self._db_btn = ttk.Button(inner, text="Database ▾")
+        self._db_menu = tk.Menu(self, tearoff=0, postcommand=self._fill_db_menu)
+        self._db_btn.configure(command=lambda: self._post_menu(self._db_menu, self._db_btn))
+        self._db_btn.pack(side="right", padx=(XS, 0))
+        # Open ▾: a database, a folder of databases, more databases, the recent ones
+        self._open_btn = ttk.Button(inner, text="Open ▾", style="Primary.TButton")
+        self._open_menu = tk.Menu(self, tearoff=0, postcommand=self._fill_open_menu)
+        self._open_btn.configure(command=lambda: self._post_menu(self._open_menu,
+                                                                 self._open_btn))
+        self._open_btn.pack(side="right", padx=(XS, 0))
+        # the command palette: every database, table, column, tab and action
+        self._palette_btn = ttk.Button(inner, text="Go to…  Ctrl+K", style="Subtle.TButton",
+                                       command=self.open_palette)
+        self._palette_btn.pack(side="right", padx=(XS, 0))
 
-        self._db_info = ttk.Label(inner, text="  No database loaded", style="HI.TLabel")
-        self._db_info.pack(side="left", padx=(16, 0))
+        # the evidence state (one chip) and the warnings (a chip only when there are some)
+        self._warn_chip = Chip(inner, "", bg=K["card"], active=True,
+                               on_click=lambda: self._show_status_detail())
+        self._evidence_chip = Chip(inner, "", bg=K["card"],
+                                   on_click=lambda: self._show_status_detail())
+        self._evidence_tip = ToolTip(self._evidence_chip, "")
+        # the case (or database) name and its summary, shortened in the middle to fit
+        self._case_lbl = ttk.Label(inner, text="", style="Header.TLabel", font=F["body_bold"])
+        # (the name leads the summary line, which shortens itself to fit: the header never
+        # cuts a control, however narrow the window)
+        self._db_info = ElideLabel(inner, text="No database loaded", style="Header.TLabel")
+        self._db_info.pack(side="left", fill="x", expand=True, padx=(M, S))
+        self._banners = []
 
-        # Buttons right side
-        ttk.Button(inner, text="Close DB", style="HB.TButton",
-                   command=self._close_db).pack(side="right", padx=3)
-        ttk.Button(inner, text="Help", style="HB.TButton",
-                   command=lambda: HelpDialog(self)).pack(side="right", padx=3)
-        ttk.Button(inner, text="Info", style="HB.TButton",
-                   command=self._show_info).pack(side="right", padx=3)
-        ttk.Button(inner, text="Open", style="HB.TButton",
-                   command=self._open_file).pack(side="right", padx=3)
+    def _fill_open_menu(self):
+        m = self._open_menu
+        m.delete(0, "end")
+        m.add_command(label="Open database…", accelerator="Ctrl+O", command=self._open_file)
+        m.add_command(label="Open with Safe parse…", command=lambda: self._open_file(safe=True))
+        m.add_command(label="Open folder…", command=self._open_folder)
+        m.add_command(label="Add database(s)…", command=self._add_databases)
+        m.add_separator()
+        m.add_cascade(label="Recent", menu=self.tags.recent_menu())
+
+    def _update_welcome(self, have_databases):
+        """The welcome screen over the tabs while nothing is open: what the tool does, the two
+        ways to start and the read-only promise; gone as soon as a database is open."""
+        w = getattr(self, "_welcome", None)
+        if have_databases:
+            if w is not None and w.winfo_manager():
+                w.place_forget()
+            return
+        if w is None:
+            from appicons import illustration
+            # a plain page over the whole tab area, the card centred on it (the empty tabs
+            # behind would only be noise)
+            outer = self._welcome = ttk.Frame(self._main)
+            w = ttk.Frame(outer, style="Card.TFrame", padding=28)
+            w.place(relx=0.5, rely=0.45, anchor="center")
+            outer.art = w.art = illustration(self, "welcome", 260)
+            if w.art is not None:
+                ttk.Label(w, image=w.art, style="Card.TLabel").pack()
+            ttk.Label(w, text="Open a SQLite database to begin", style="CardTitle.TLabel").pack(
+                pady=(12, 4))
+            ttk.Label(w, text="Search every table, browse millions of rows, decode BLOBs and "
+                              "timestamps, and recover deleted records from the WAL and freed "
+                              "pages. Files are opened read-only: nothing is ever written next "
+                              "to them.", style="CardMuted.TLabel", wraplength=460,
+                      justify="center").pack()
+            row = ttk.Frame(w, style="Plain.TFrame")
+            row.pack(pady=(14, 0))
+            ttk.Button(row, text="Open database…", style="Primary.TButton",
+                       command=self._open_file).pack(side="left", padx=4)
+            ttk.Button(row, text="Open folder…", command=self._open_folder).pack(
+                side="left", padx=4)
+            ttk.Label(w, text="Ctrl+O opens a database · a folder lists every SQLite file "
+                              "in it, whatever its name", style="CardMuted.TLabel").pack(
+                pady=(10, 0))
+            # where the tool keeps what it saves (never next to the evidence)
+            store = ttk.Frame(w, style="Plain.TFrame")
+            store.pack(fill="x", pady=(18, 0))
+            ttk.Separator(store).pack(fill="x", pady=(0, 10))
+            ttk.Label(store, text="Your tags, notes, recent files and settings are saved in",
+                      style="CardMuted.TLabel").pack()
+            self._welcome_store = ttk.Label(store, style="Card.TLabel", wraplength=460,
+                                            justify="center")
+            self._welcome_store.pack(pady=(2, 6))
+            sb = ttk.Frame(store, style="Plain.TFrame")
+            sb.pack()
+            ttk.Button(sb, text="Open folder", style="Small.TButton",
+                       command=lambda: self.open_data_folder()).pack(side="left", padx=4)
+            ttk.Button(sb, text="Change…", style="Small.TButton",
+                       command=self._show_storage).pack(side="left", padx=4)
+            w = outer
+        self._refresh_welcome_storage()
+        if not w.winfo_manager():
+            w.place(x=0, y=0, relwidth=1, relheight=1)
+        w.lift()
+
+    def _refresh_header(self):
+        """The case name, its summary and the evidence chips (after any change of the case)."""
+        ms = [m for m in self.case if m.db.ok]
+        self._update_welcome(bool(ms))
+        chips = (self._warn_chip, self._evidence_chip)
+        for c in chips:
+            if c.winfo_manager():
+                c.pack_forget()
+        self._open_btn.configure(style="TButton" if ms else "Primary.TButton")
+        if not ms:
+            self._case_lbl.configure(text="")
+            return
+        total = sum((m.size or 0) for m in ms)
+        tables = sum(len(m.db.tables()) for m in ms)
+        if len(ms) > 1:
+            name = case_name([m.path for m in ms])
+            self._case_lbl.configure(text=name if len(name) <= 28 else name[:27] + "…")
+            self._db_info.set_text("%s · %d databases · %s · %s tables · active: %s" % (
+                name, len(ms), fmtb(total), format(tables, ","), self.case.active.name))
+        else:
+            m = ms[0]
+            self._case_lbl.configure(text=m.name if len(m.name) <= 28 else m.name[:27] + "…")
+            self._db_info.set_text("%s · %s · %d tables · loaded in %.2fs" % (
+                m.path, fmtb(total), tables, m.load_time))
+        modes = OrderedDict()
+        for m in ms:
+            key = mode_label(m.db.mode)
+            modes[key] = modes.get(key, 0) + 1
+        if len(ms) > 1:
+            text = "%d read-only" % len(ms)
+            merged = modes.get(mode_label("ram-overlay"), 0)
+            if merged:
+                text += " · %d WAL merged" % merged
+            safe = modes.get(mode_label("safe-parse"), 0)
+            if safe:
+                text += " · %d Safe parse" % safe
+        else:
+            text = "Read-only · %s" % mode_label(ms[0].db.mode)
+        self._evidence_chip.set(text=text)
+        self._evidence_tip.text = "Every database is opened read-only (nothing is written " \
+            "next to the evidence):\n" + "\n".join("  %d: %s" % (n, k)
+                                                   for k, n in modes.items()) + \
+            "\nClick for the status of every database."
+        warns = sum(len(member_warnings(m)) for m in ms)
+        # packed right after the palette button: to its left, and before the summary gets
+        # its share of the line
+        last = self._palette_btn
+        if warns:
+            self._warn_chip.set(text="⚠ %d warning%s" % (warns, "" if warns == 1 else "s"))
+            self._warn_chip.pack(side="right", padx=(XS, S), after=last)
+            last = self._warn_chip
+        self._evidence_chip.pack(side="right", padx=(S, 0), after=last)
+
+    def _fill_db_menu(self):
+        """The Database menu: what there is to know about the open database(s)."""
+        m = self._db_menu
+        m.delete(0, "end")
+        ok = self.db.ok
+        st = "normal" if ok else "disabled"
+        n = self._issue_count()
+        m.add_command(label="Info", command=self._show_info, state=st)
+        m.add_command(label="Evidence and verification…", command=self._show_evidence,
+                      state=st)
+        m.add_command(label="Issues (%d)…" % n if n else "Issues…", command=self._show_issues,
+                      state=st)
+        m.add_command(label="Activity log…", command=self._show_activity, state=st)
+        m.add_separator()
+        m.add_command(label="Schema report (HTML)…", command=self._schema_export_html, state=st)
+        m.add_command(label="Database Map…", command=lambda: self.datamap.export_map(),
+                      state=st)
+        m.add_separator()
+        m.add_command(label="Limits…", command=lambda: self.datamap.limits_window(self))
 
     # ── Body ─────────────────────────────────────────────────────────
     def _build_body(self):
-        body = ttk.Frame(self)
+        """The Case navigator on the left (resizable, Ctrl+B hides it), the tabs on the
+        right."""
+        body = self._body = ttk.Panedwindow(self, orient="horizontal")
         body.pack(fill="both", expand=True)
-
-        # Sidebar container with collapse toggle
         self._sidebar_visible = True
-        sb_outer = ttk.Frame(body)
-        sb_outer.pack(side="left", fill="y")
-        self._sb_outer = sb_outer
+        self._navigator = CaseNavigator(body, self)
+        self._navigator.configure(width=300)
+        body.add(self._navigator, weight=0)
+        body.bind("<ButtonRelease-1>", self._nav_sash_moved, add="+")
+        main = self._main = ttk.Frame(body)
+        body.add(main, weight=1)
 
-        # Toggle button
-        self._sb_toggle = tk.Button(
-            sb_outer, text="\u25C0", font=("Segoe UI", 8), width=2, bd=0,
-            bg=C["sbg"], fg=C["text2"], activebackground=C["bg4"],
-            command=self._toggle_sidebar, relief="flat", cursor="hand2")
-        self._sb_toggle.pack(side="right", fill="y")
-
-        self._sidebar = ttk.Frame(sb_outer, style="S.TFrame", width=300)
-        self._sidebar.pack(side="left", fill="y")
-        self._sidebar.pack_propagate(False)
-        self._build_sidebar()
-
-        # Main area with notebook
-        main = ttk.Frame(body)
-        main.pack(side="left", fill="both", expand=True)
+        # a thin strip at the navigator's edge: ◀ folds it, ▶ (then at the window's edge)
+        # brings it back - always in view, like the ☰ button and Ctrl+B
+        rail = self._nav_rail = tk.Button(
+            main, text="◀", font=F["small"], width=2, bd=0, relief="flat",
+            bg=K["muted"], fg=K["muted_text"], activebackground=K["hover"],
+            activeforeground=K["text"], cursor="hand2", takefocus=0, highlightthickness=0,
+            command=self._toggle_sidebar_by_hand)
+        rail.pack(side="left", fill="y")
+        self._nav_rail_tip = ToolTip(rail, "Hide the databases panel (Ctrl+B)")
 
         self._nb = ttk.Notebook(main)
         self._nb.pack(fill="both", expand=True)
@@ -197,278 +809,77 @@ class App(tk.Tk):
         self._search_frame = ttk.Frame(self._nb)
         self._browse_frame = ttk.Frame(self._nb)
 
-        self._nb.add(self._search_frame, text="  Search  ")
-        self._nb.add(self._browse_frame, text="  Browse  ")
+        self._nb.add(self._search_frame, text="Search")
+        self._nb.add(self._browse_frame, text="Browse")
 
-        # WAL tab — added dynamically when a WAL-mode DB is opened
-        self._wal_frame = ttk.Frame(self._nb)
+        # WAL tab: inserted after Browse for a database with a -wal file (also one that cannot
+        # be read: the tab then says why)
+        self._wal_frame = WalTab(self._nb, self)
         self._wal_tab_added = False
-        
+
         # SQL Query Editor tab — always present
         self._sql_frame = ttk.Frame(self._nb)
-        self._nb.add(self._sql_frame, text="  SQL Query  ")
+        self._nb.add(self._sql_frame, text="SQL")
 
-        # Deleted Pages tab — added dynamically when freelist pages exist
-        self._fl_frame     = ttk.Frame(self._nb)
-        self._fl_tab_added = False
+        # Forensics tab (deleted records, row history, dropped tables, journal, audit)
+        self._forensics = ForensicsTab(self._nb, self)
+        self._nb.add(self._forensics, text="Forensics")
 
-        # ... existing self._build_search_tab() and self._build_browse_tab() stay ...
-        self._build_sql_tab()   # <-- add this line after _build_browse_tab()
+        # Timeline tab (every dated row in time order)
+        self._timeline = TimelineTab(self._nb, self)
+        self._nb.add(self._timeline, text="Timeline")
 
+        self._build_sql_tab()
         self._build_search_tab()
         self._build_browse_tab()
+        # the tabs that work on one database say which in a breadcrumb bar at their top
+        from breadcrumb import Breadcrumb
+        self._crumbs = [self._browse_crumb]
+        for frame in (self._sql_frame, self._forensics, self._wal_frame):
+            kids = frame.pack_slaves()
+            crumb = Breadcrumb(frame, self)
+            if kids:
+                crumb.pack(fill="x", padx=M, pady=(S, 0), before=kids[0])
+            else:
+                crumb.pack(fill="x", padx=M, pady=(S, 0))
+            self._crumbs.append(crumb)
 
-    # ── Sidebar ──────────────────────────────────────────────────────
-    def _build_sidebar(self):
-        sf = self._sidebar
+    # ── The Case navigator's actions ─────────────────────────────────
+    def browse_member_table(self, member, table=None):
+        """Open a table of a database in Browse (its database made active); table None: the
+        database's current (or first) table."""
+        if member is None or member not in self.case.members:
+            return
+        self.activate_member(member)
+        self._nb.select(self._browse_frame)
+        if table:
+            self._browse_table_var.set(table)
+            self._load_browse_table()
 
-        ttk.Label(sf, text="Schema", style="B.TLabel").pack(padx=8, pady=(8, 2), anchor="w")
+    def search_in_table(self, member, table):
+        self._schema_ctx_search(table, member)
 
-        filt_f = ttk.Frame(sf, style="S.TFrame")
-        filt_f.pack(fill="x", padx=8, pady=2)
-        self._schema_filter_var = tk.StringVar()
-        self._schema_filter_var.trace_add("write", self._on_schema_filter)
-        ttk.Entry(filt_f, textvariable=self._schema_filter_var, width=18).pack(side="left", fill="x", expand=True)
-        self._schema_cols_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(filt_f, text="Cols", variable=self._schema_cols_var,
-                         command=lambda: self._on_schema_filter()).pack(side="left", padx=4)
+    def show_in_folder(self, path):
+        """Open the folder of a database in the file manager with the file selected (only
+        opens a window there; nothing is written)."""
+        import subprocess
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        except OSError as e:
+            messagebox.showerror("Show in folder", str(e), parent=self)
 
-        tree_f = ttk.Frame(sf, style="S.TFrame")
-        tree_f.pack(fill="both", expand=True, padx=4, pady=4)
-
-        self._schema_tree = ttk.Treeview(tree_f, style="Sc.Treeview", show="tree", selectmode="browse")
-        ssb_x = ttk.Scrollbar(tree_f, orient="horizontal", command=self._schema_tree.xview)
-        ssb = ttk.Scrollbar(tree_f, orient="vertical", command=self._schema_tree.yview)
-        self._schema_tree.configure(yscrollcommand=ssb.set, xscrollcommand=ssb_x.set)
-        self._schema_tree.column("#0", minwidth=280, width=500, stretch=True)
-        ssb.pack(side="right", fill="y")
-        ssb_x.pack(side="bottom", fill="x")
-        self._schema_tree.pack(fill="both", expand=True)
-        self._schema_tree.bind("<<TreeviewOpen>>", self._on_schema_expand)
-        self._schema_tree.bind("<Double-1>", self._on_schema_dblclick)
-        self._schema_tree.bind("<Button-3>", self._on_schema_rightclick)
-
-        # SQL preview
-        self._sql_preview = tk.Text(sf, height=5, font=("Consolas", 8), bg=C["bg2"],
-                                     fg=C["text"], wrap="word", state="disabled")
-        self._sql_preview.pack(fill="x", padx=8, pady=(0, 4))
-
-        btn_f = ttk.Frame(sf, style="S.TFrame")
-        btn_f.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Button(btn_f, text="Copy Schema", style="Sm.TButton",
-                   command=self._copy_schema).pack(side="left", padx=2)
-        ttk.Button(btn_f, text="Copy SQL", style="Sm.TButton",
-                   command=self._copy_sql).pack(side="left", padx=2)
+    def _flash_schema(self, text):
+        """Say in the navigator what a Copy did (cleared after a few seconds)."""
+        self._navigator.flash(text)
 
     def _populate_schema(self):
-        tree = self._schema_tree
-        tree.delete(*tree.get_children())
-        if not self.db.ok:
-            return
-        tables = self.db.tables()
-        self._scope_tables = list(tables)
-
-        # Tables node
-        tbl_node = tree.insert("", "end", text="Tables", open=True, tags=("header",))
-        for t in tables:
-            cnt = self._count_cache.get(t, "?")
-            iid = tree.insert(tbl_node, "end", text=f"{t}  ({fmt_count(cnt)})", values=(t, "table"))
-            tree.insert(iid, "end", text="loading...")  # placeholder
-
-        # Views
-        views = self.db.views()
-        if views:
-            v_node = tree.insert("", "end", text="Views", open=False, tags=("header",))
-            for v in views:
-                tree.insert(v_node, "end", text=v, values=(v, "view"))
-
-        # Indexes
-        indexes = self.db.all_indexes()
-        if indexes:
-            i_node = tree.insert("", "end", text="Indexes", open=False, tags=("header",))
-            for idx in indexes:
-                tree.insert(i_node, "end", text=idx, values=(idx, "index"))
-
-        # Triggers
-        triggers = self.db.triggers()
-        if triggers:
-            tr_node = tree.insert("", "end", text="Triggers", open=False, tags=("header",))
-            for trg in triggers:
-                tree.insert(tr_node, "end", text=trg, values=(trg, "trigger"))
-
-        # WAL-Only Tables
-        if self.db.has_wal:
-            wal_only = self.db.wal_tables()
-            if wal_only:
-                wal_node = tree.insert("", "end", text=f"WAL-Only Tables ({len(wal_only)})",
-                                       open=False, tags=("header",))
-                col_map = getattr(self.db.wal, 'col_map', {})
-                for wt in wal_only:
-                    wt_iid = tree.insert(wal_node, "end",
-                                         text=f"{wt}  (WAL-only)",
-                                         values=(f"WAL: {wt}", "wal_table"))
-                    # Show columns if known
-                    wcols = col_map.get(wt, [])
-                    for wc in wcols:
-                        tree.insert(wt_iid, "end", text=f"  {wc}",
-                                    values=(f"WAL: {wt}", "wal_column"))
-
-    def _on_schema_expand(self, event):
-        iid = self._schema_tree.focus()
-        vals = self._schema_tree.item(iid, "values")
-        if not vals or len(vals) < 2:
-            return
-        tbl, typ = vals[0], vals[1]
-        if typ != "table":
-            return
-        children = self._schema_tree.get_children(iid)
-        if len(children) == 1 and self._schema_tree.item(children[0], "text") == "loading...":
-            self._schema_tree.delete(children[0])
-            # Columns
-            cols = self.db.columns(tbl)
-            for cn, ct in cols:
-                self._schema_tree.insert(iid, "end", text=f"  {cn}  ({ct})", values=(tbl, "column"))
-            # Indexes
-            idxs = self.db.indexes(tbl)
-            for name, unique, icols in idxs:
-                ustr = " UNIQUE" if unique else ""
-                self._schema_tree.insert(iid, "end",
-                    text=f"  IDX{ustr}: {name} ({', '.join(icols)})", values=(tbl, "index_detail"))
-            # Foreign keys (with ON DELETE/UPDATE details)
-            try:
-                fks = self.db.fkeys_full(tbl)
-                for fk in fks:
-                    detail = f"  FK: {fk['from']} \u2192 {fk['table']}({fk['to']})"
-                    actions = []
-                    if fk.get('on_delete'):
-                        actions.append(f"ON DELETE {fk['on_delete']}")
-                    if fk.get('on_update'):
-                        actions.append(f"ON UPDATE {fk['on_update']}")
-                    if actions:
-                        detail += f"  [{', '.join(actions)}]"
-                    self._schema_tree.insert(iid, "end", text=detail, values=(tbl, "fk"))
-            except Exception:
-                fks = self.db.fkeys(tbl)
-                for ref_tbl, from_col, to_col in fks:
-                    self._schema_tree.insert(iid, "end",
-                        text=f"  FK: {from_col} \u2192 {ref_tbl}({to_col})", values=(tbl, "fk"))
-            # CHECK constraints
-            try:
-                checks = self.db.check_constraints(tbl)
-                for chk in checks:
-                    self._schema_tree.insert(iid, "end",
-                        text=f"  CHECK: {chk}", values=(tbl, "check"))
-            except Exception:
-                pass
-
-        # Show CREATE SQL
-        sql = self.db.create_sql(tbl)
-        self._sql_preview.configure(state="normal")
-        self._sql_preview.delete("1.0", "end")
-        self._sql_preview.insert("1.0", sql)
-        self._sql_preview.configure(state="disabled")
-
-    def _on_schema_dblclick(self, event):
-        iid = self._schema_tree.focus()
-        vals = self._schema_tree.item(iid, "values")
-        if not vals or len(vals) < 2:
-            return
-        tbl, typ = vals[0], vals[1]
-        if typ in ("table", "column", "index_detail", "fk"):
-            self._nb.select(self._browse_frame)
-            self._browse_table_var.set(tbl)
-            self._load_browse_table()
-        elif typ in ("wal_table", "wal_column"):
-            self._nb.select(self._browse_frame)
-            self._browse_table_var.set(tbl)  # tbl is already "WAL: name"
-            self._load_browse_table()
-
-    def _on_schema_rightclick(self, event):
-        iid = self._schema_tree.identify_row(event.y)
-        if not iid:
-            return
-        self._schema_tree.selection_set(iid)
-        vals = self._schema_tree.item(iid, "values")
-        if not vals or len(vals) < 2:
-            return
-        tbl, typ = vals[0], vals[1]
-        if typ not in ("table", "column", "index_detail", "fk"):
-            return
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label=f"Browse '{tbl}'",
-                         command=lambda: self._schema_ctx_browse(tbl))
-        menu.add_command(label="Show 10 Rows",
-                         command=lambda: self._schema_ctx_sample(tbl))
-        menu.add_separator()
-        menu.add_command(label="Copy CREATE SQL",
-                         command=lambda: self._schema_ctx_copy_sql(tbl))
-        menu.add_command(label="Copy Schema Text",
-                         command=lambda: self._schema_ctx_copy_schema(tbl))
-        menu.add_command(label="Copy Table Name",
-                         command=lambda: self._schema_ctx_copy_name(tbl))
-        menu.add_separator()
-        menu.add_command(label="Export All Schema (HTML)",
-                         command=self._schema_export_html)
-        menu.add_separator()
-        menu.add_command(label=f"Search in '{tbl}'",
-                         command=lambda: self._schema_ctx_search(tbl))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-
-    def _schema_ctx_browse(self, tbl):
-        self._nb.select(self._browse_frame)
-        self._browse_table_var.set(tbl)
-        self._load_browse_table()
-
-    def _schema_ctx_copy_sql(self, tbl):
-        sql = self.db.create_sql(tbl)
-        if sql:
-            self.clipboard_clear()
-            self.clipboard_append(sql)
-
-    def _schema_ctx_copy_schema(self, tbl):
-        self.clipboard_clear()
-        self.clipboard_append(_build_schema_text(self.db, tbl, self._count_cache.get(tbl, "?")))
-
-    def _schema_ctx_copy_name(self, tbl):
-        self.clipboard_clear()
-        self.clipboard_append(tbl)
-
-    def _schema_ctx_sample(self, tbl):
-        """Show 10 sample rows in a popup window."""
-        cols, rows = self.db.browse(tbl, 10, 0)
-        w = tk.Toplevel(self)
-        w.title(f"Sample: {tbl} (first 10 rows)")
-        w.geometry("900x400")
-        w.configure(bg=C["bg"])
-        # Tree
-        tree = ttk.Treeview(w, columns=cols, show="headings", height=10)
-        sb = ttk.Scrollbar(w, orient="vertical", command=tree.yview)
-        sbh = ttk.Scrollbar(w, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=sb.set, xscrollcommand=sbh.set)
-        sb.pack(side="right", fill="y")
-        sbh.pack(side="bottom", fill="x")
-        tree.pack(fill="both", expand=True)
-        for c in cols:
-            tree.heading(c, text=c)
-            tree.column(c, width=120, minwidth=60, anchor="w")
-        for ri, row in enumerate(rows):
-            tag = "odd" if ri % 2 else "even"
-            tree.insert("", "end", values=[vb(v) for v in row], tags=(tag,))
-        tree.tag_configure("odd", background=C["alt"])
-        tree.tag_configure("even", background=C["bg"])
-        # Bottom bar
-        bot = tk.Frame(w, bg=C["bg3"])
-        bot.pack(fill="x")
-        tk.Label(bot, text=f"{len(rows)} rows  |  {len(cols)} columns",
-                 font=("Segoe UI", 8), bg=C["bg3"], fg=C["text2"]).pack(side="left", padx=6, pady=3)
-        tk.Button(bot, text="Open in Browse", font=("Segoe UI", 8),
-                  command=lambda: (w.destroy(), self._schema_ctx_browse(tbl)),
-                  relief="flat", bg=C["bg"], fg=C["accent"], padx=8).pack(side="right", padx=4, pady=3)
-        tk.Button(bot, text="Close", font=("Segoe UI", 8),
-                  command=w.destroy, relief="flat", bg=C["bg"], padx=8).pack(side="right", padx=4, pady=3)
+        """List the case in the navigator again."""
+        self._navigator.rebuild()
 
     def _schema_export_html(self):
         """Export full schema report as HTML."""
@@ -479,62 +890,47 @@ class App(tk.Tk):
             defaultextension=".html",
             initialfile="schema_report.html",
             filetypes=[("HTML", "*.html"), ("All", "*.*")])
-        if not path:
+        if not write_allowed(path):
             return
-        try:
-            html = _build_schema_html(self.db, self.db._path or "", VERSION,
-                                      tables=tables, row_counts=self._count_cache)
+        db, counts = self.db, dict(self._count_cache)
+        from engine.export import evidence_record, provenance, write_manifest
+
+        def work(job):
+            job.status = "Reading the evidence hashes…"
+            files = evidence_record(db.evidence, True, lambda: job.cancelled)
+            job.status = "Writing the schema report…"
+            html = _build_schema_html(db, db.evidence.main, VERSION, tables=tables,
+                                      row_counts=counts, evidence=files)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(html)
-            messagebox.showinfo("Exported", f"Schema report exported:\n{os.path.basename(path)}\n"
-                                f"{len(tables)} tables documented.")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+            info = provenance(VERSION, [(db.evidence.main, files)], "schema report",
+                              rows=len(tables))
+            return write_manifest(path, info, [path], True, self.case.is_protected)
 
-    def _schema_ctx_search(self, tbl):
-        self._scope_tables = [tbl]
+        def done(manifest, error, cancelled):
+            if error is not None:
+                messagebox.showerror("Schema report", str(error), parent=self)
+                return
+            self.activity("export", what="schema report", path=path, manifest=manifest)
+            messagebox.showinfo("Schema report", "%d tables documented in:\n%s\n\nManifest:"
+                                "\n%s" % (len(tables), path, manifest), parent=self)
+        Job(self, "Schema report", work, done, release=self._release_worker_connection,
+            members=[self.case.active])
+
+    def _schema_ctx_search(self, tbl, member=None):
+        """Search only this table (of this database, in a case)."""
+        member = member if member is not None else self.case.active
+        if member is not None:
+            member.scope_tables = [tbl]
+            if self.case.multi:
+                # only this database for the Search tab (the other features keep theirs)
+                self.scopes.set("search", [member.uid], own=True)
+        self._update_scope_chip()
         self._nb.select(self._search_frame)
         self._search_entry.focus_set()
 
-    def _on_schema_filter(self, *args):
-        if self._schema_filter_after:
-            self.after_cancel(self._schema_filter_after)
-        self._schema_filter_after = self.after(300, self._apply_schema_filter)
-
-    def _apply_schema_filter(self):
-        filt = self._schema_filter_var.get().lower().strip()
-        search_cols = self._schema_cols_var.get()
-        if not filt:
-            self._populate_schema()
-            return
-        tree = self._schema_tree
-        tree.delete(*tree.get_children())
-        if not self.db.ok:
-            return
-        tables = self.db.tables()
-        tbl_node = tree.insert("", "end", text=f"Matches", open=True)
-        for t in tables:
-            tbl_match = filt in t.lower()
-            col_matches = []
-            if search_cols:
-                cols = self.db.columns(t)
-                col_matches = [(cn, ct) for cn, ct in cols if filt in cn.lower()]
-            if tbl_match or col_matches:
-                cnt = self._count_cache.get(t, "?")
-                iid = tree.insert(tbl_node, "end", text=f"{t}  ({fmt_count(cnt)})",
-                                  values=(t, "table"), open=bool(col_matches))
-                if col_matches:
-                    # Show matching columns directly — no need to expand
-                    for cn, ct in col_matches:
-                        tree.insert(iid, "end",
-                                    text=f"  >> {cn}  ({ct})",
-                                    values=(t, "column"),
-                                    tags=("col_match",))
-                else:
-                    tree.insert(iid, "end", text="loading...")
-        tree.tag_configure("col_match", foreground=C["orange"])
-
     def _copy_schema(self):
+        """Copy the schema of every table of the active database."""
         if not self.db.ok:
             return
         lines = []
@@ -558,135 +954,160 @@ class App(tk.Tk):
             lines.append("")
         self.clipboard_clear()
         self.clipboard_append("\n".join(lines))
-
-    def _copy_sql(self):
-        self.clipboard_clear()
-        self._sql_preview.configure(state="normal")
-        txt = self._sql_preview.get("1.0", "end").strip()
-        self._sql_preview.configure(state="disabled")
-        self.clipboard_append(txt)
+        self._flash_schema("Copied the schema of %d tables" % len(self.db.tables()))
 
     # ── Search Tab ───────────────────────────────────────────────────
     def _build_search_tab(self):
         sf = self._search_frame
 
-        # Top controls
-        top = ttk.Frame(sf)
-        top.pack(fill="x", padx=10, pady=(10, 4))
-
-        ttk.Label(top, text="Search:", style="B.TLabel").pack(side="left")
+        # Row 1: the term, the mode, Search and Stop (the rows wrap in a narrow window)
+        top = self._search_top = FlowFrame(sf)
+        top.pack(fill="x", padx=M, pady=(M, XS))
         self._search_var = tk.StringVar()
-        self._search_entry = ttk.Entry(top, textvariable=self._search_var, width=40, style="SE.TEntry")
-        self._search_entry.pack(side="left", padx=6, fill="x", expand=True)
-
+        self._search_entry = top.add(ttk.Entry(top, textvariable=self._search_var, width=40,
+                                               style="Search.TEntry"), stretch=True)
+        add_placeholder(self._search_entry, self._search_var,
+                        "Search the text of every table in scope…", font=F["large"])
         self._search_mode_var = tk.StringVar(value="Case-Insensitive")
-        self._mode_combo = ttk.Combobox(top, textvariable=self._search_mode_var,
-                                         values=list(SEARCH_MODES.keys()), state="readonly", width=16)
-        self._mode_combo.pack(side="left", padx=4)
-        self._mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
+        # the nine modes in their groups (Text, Binary, Schema), searchable
+        labels = dict((key, label) for label, key in SEARCH_MODES.items())
+        self._mode_combo = top.add(SearchableCombobox(
+            top, textvariable=self._search_mode_var, state="readonly", width=18,
+            groups=[(group, [labels[k] for k in keys]) for group, keys in SEARCH_MODE_GROUPS]),
+            gap=S)
+        self._mode_combo.bind("<<ComboboxSelected>>", lambda e: self._on_mode_change())
+        self._search_btn = top.add(ttk.Button(top, text="Search", style="Primary.TButton",
+                                              command=self._do_search), gap=S)
+        self._stop_btn = top.add(ttk.Button(top, text="Stop", command=self._stop_search),
+                                 visible=False)
 
-
+        # Row 2: where a search looks and what it includes; the rest behind Advanced ▾
+        opts = self._search_opts = Toolbar(sf)
+        opts.pack(fill="x", padx=M, pady=(0, XS))
+        # which databases a search covers: shown only in a case of 2+ databases
+        self._search_db_picker = opts.add(
+            ScopePicker(opts, self, "search", on_change=self._search_dbs_changed),
+            visible=False)
+        self._scope_btn = opts.add(ttk.Button(opts, text="All tables ▾",
+                                              command=self._show_scope), gap=S)
+        self._reset_scope_btn = opts.add(ttk.Button(opts, text="Reset", style="Link.TButton",
+                                                    command=self._reset_scope), gap=XS,
+                                         visible=False)
+        self._scope_chip = self._scope_btn          # says the table scope itself
         self._deep_blob_var = tk.BooleanVar(value=False)
-        self._deep_blob_cb = ttk.Checkbutton(top, text="Deep BLOB", variable=self._deep_blob_var)
-        self._deep_blob_cb.pack(side="left", padx=4)
-
+        self._search_decoded_var = tk.BooleanVar(value=False)
+        self._search_views_var = tk.BooleanVar(value=False)
+        self._search_view_names = set()
+        # offered only when a searched database has WAL frames / freed pages
         self._search_wal_var = tk.BooleanVar(value=False)
-        self._search_wal_cb = ttk.Checkbutton(top, text="Include Hidden Data (WAL)",
-                                                variable=self._search_wal_var)
-        # Don't pack yet — only shown when a DB with WAL is opened
-
-        self._search_max_lbl = ttk.Label(top, text="Max/table:")
-        self._search_max_lbl.pack(side="left", padx=(8, 2))
+        self._search_wal_cb = opts.add(ttk.Checkbutton(opts, text="WAL row versions",
+                                                       variable=self._search_wal_var),
+                                       gap=M, visible=False)
+        self._search_free_var = tk.BooleanVar(value=False)
+        self._search_free_cb = opts.add(ttk.Checkbutton(opts, text="Freed pages",
+                                                        variable=self._search_free_var),
+                                        gap=S, visible=False)
         self._limit_var = tk.StringVar(value="500")
-        limit_combo = ttk.Combobox(top, textvariable=self._limit_var,
-                                    values=["100", "500", "1000", "5000", "All"],
-                                    state="readonly", width=6)
-        limit_combo.pack(side="left")
+        self._search_adv_btn, adv = menu_button(opts, "Advanced ▾")
+        opts.add(self._search_adv_btn, gap=M)
+        self._search_adv_menu = adv
+        adv.add_checkbutton(label="Include BLOB bytes (UTF-8, UTF-16, hex)",
+                            variable=self._deep_blob_var)
+        adv.add_checkbutton(label="Include decoded BLOBs (plists, protobuf, JSON, gzip…)",
+                            variable=self._search_decoded_var)
+        adv.add_checkbutton(label="Include views", variable=self._search_views_var)
+        adv.add_separator()
+        lim = tk.Menu(adv, tearoff=0)
+        for v in ("100", "500", "1000", "5000", "All"):
+            lim.add_radiobutton(label=v, value=v, variable=self._limit_var,
+                                command=self._update_adv_label)
+        adv.add_cascade(label="Max matching rows per table", menu=lim)
+        for var in (self._deep_blob_var, self._search_decoded_var, self._search_views_var):
+            var.trace_add("write", lambda *a: self._update_adv_label())
+        self._search_export_btn = opts.add(ttk.Button(opts, text="Export ▾"), gap=M)
+        self._search_export_menu = tk.Menu(self, tearoff=0)
+        self._search_export_menu.add_command(label="Matches (CSV or JSON)…",
+                                             command=self._search_export_csv)
+        self._search_export_menu.add_command(label="Matches with their whole rows (JSON)…",
+                                             command=self._search_export_details)
+        self._search_export_menu.add_command(label="Copy results",
+                                             command=self._search_copy)
+        self._search_export_btn.configure(command=lambda: self._post_menu(
+            self._search_export_menu, self._search_export_btn))
+        # errors: a button only when a table could not be searched
+        self._search_err_btn = opts.add(ttk.Button(opts, text="", style="Small.TButton",
+                                                   command=self._show_search_errors),
+                                        gap=S, visible=False)
+        self._search_btn_row = opts
 
-        # Hint label
-        self._hint_label = ttk.Label(sf, text="", style="M.TLabel", foreground=C["green"])
-        self._hint_label.pack(fill="x", padx=16, pady=(0, 2))
+        # what the chosen mode matches (only for the modes that need saying)
+        self._hint_label = wrap_to_width(ttk.Label(sf, text="", style="Muted.TLabel"))
+        self._hint_label.pack(fill="x", padx=M + XS, pady=(0, XS))
 
-        # Buttons row
-        btn_row = ttk.Frame(sf)
-        btn_row.pack(fill="x", padx=10, pady=2)
-
-        self._search_btn = ttk.Button(btn_row, text="Search", style="P.TButton",
-                   command=self._do_search)
-        self._search_btn.pack(side="left", padx=3)
-        self._stop_btn = ttk.Button(btn_row, text="Stop", style="D.TButton",
-                   command=self._stop_search)
-        self._stop_btn.pack(side="left", padx=3)
-        self._scope_btn = ttk.Button(btn_row, text="Scope", command=self._show_scope)
-        self._scope_btn.pack(side="left", padx=3)
-        self._reset_scope_btn = ttk.Button(btn_row, text="Reset Scope", command=self._reset_scope)
-        self._reset_scope_btn.pack(side="left", padx=3)
-
-        ttk.Button(btn_row, text="Export Details", command=self._search_export_details).pack(side="right", padx=3)
-        ttk.Button(btn_row, text="Export CSV", command=self._search_export_csv).pack(side="right", padx=3)
-        ttk.Button(btn_row, text="Export JSON", command=self._search_export_json).pack(side="right", padx=3)
-        ttk.Button(btn_row, text="Copy Results", command=self._search_copy).pack(side="right", padx=3)
-
-        self._search_err_btn = ttk.Button(btn_row, text="0 errors", style="Sm.TButton",
-                                           command=self._show_search_errors)
-        self._search_err_btn.pack(side="right", padx=3)
-
-        # Progress
+        # Progress (a thin bar), and the status: one line, the details folded away
         prog_f = ttk.Frame(sf)
-        prog_f.pack(fill="x", padx=10, pady=2)
+        prog_f.pack(fill="x", padx=M, pady=(XS, 0))
         self._search_progress = ttk.Progressbar(prog_f, mode="determinate")
-        self._search_progress.pack(fill="x", side="left", expand=True, padx=(0, 8))
-        self._search_status = ttk.Label(prog_f, text="Ready", style="M.TLabel")
-        self._search_status.pack(side="right")
+        # shown only while a search runs (nothing looks busy at idle)
+        self._search_prog_f = prog_f
+        self._search_status = StatusLine(sf)
+        self._search_status.set("Type text above and press Search \u2014 every table in scope is scanned.")
+        self._search_status.pack(fill="x", padx=M, pady=(XS, XS))
 
-        # Compact filter + pagination bar
+        # Filters of the results (paging is under the results)
         self._sr_page = 0
         self._sr_page_size = 200
         self._sr_filtered = []
         self._search_start_time = time.time()
 
-        fp_bar = ttk.Frame(sf)
-        fp_bar.pack(fill="x", padx=10, pady=(1, 2))
+        # Filters of the results: searchable dropdowns (the Table one lists each table with
+        # its rows found), the Database one only in a case of 2+ databases
+        fp_bar = self._sr_filter_bar = FlowFrame(sf)
+        fp_bar.pack(fill="x", padx=M, pady=(XS, XS))
 
-        ttk.Label(fp_bar, text="Source:", font=("Segoe UI", 8)).pack(side="left")
-        self._sr_source_filter = ttk.Combobox(fp_bar, values=["All", "DB", "WAL"], state="readonly", width=6)
-        self._sr_source_filter.set("All")
-        self._sr_source_filter.pack(side="left", padx=(1, 4))
-        self._sr_source_filter.bind("<<ComboboxSelected>>", lambda e: self._filter_search_results())
+        def dropdown(label, width, values=("All",), visible=True, gap=S):
+            lbl = fp_bar.add(ttk.Label(fp_bar, text=label, style="Muted.TLabel"), gap=gap,
+                             visible=visible)
+            combo = fp_bar.add(SearchableCombobox(fp_bar, values=list(values),
+                                                  state="readonly", width=width),
+                               gap=XS, visible=visible)
+            combo.set("All")
+            combo.bind("<<ComboboxSelected>>", lambda e: self._filter_search_results())
+            return lbl, combo
+        self._sr_db_lbl, self._sr_db_filter = dropdown("Database", 16, visible=False, gap=0)
+        self._sr_source_lbl, self._sr_source_filter = dropdown(
+            "Source", 11, ["All", "DB", "WAL", source_name("Freelist")])
+        _l, self._sr_table_filter = dropdown("Table", 30)
+        _l, self._sr_col_filter = dropdown("Column", 20)
+        _l, self._sr_type_filter = dropdown("Type", 8)
 
-        ttk.Label(fp_bar, text="Table:", font=("Segoe UI", 8)).pack(side="left")
-        self._sr_table_filter = ttk.Combobox(fp_bar, values=["All"], state="readonly", width=32)
-        self._sr_table_filter.set("All")
-        self._sr_table_filter.pack(side="left", padx=(1, 4))
-        self._sr_table_filter.bind("<<ComboboxSelected>>", lambda e: self._filter_search_results())
-        self._sr_table_filter.configure(postcommand=lambda: self._auto_dropdown_width(self._sr_table_filter))
+        # One line per row (its matching cells and WAL copies listed under it), or one per cell
+        self._sr_group_var = tk.BooleanVar(value=True)
+        self._sr_group_cb = fp_bar.add(ttk.Checkbutton(fp_bar, text="One line per row",
+                                                       variable=self._sr_group_var,
+                                                       command=self._filter_search_results),
+                                       gap=M)
 
-        ttk.Label(fp_bar, text="Col:", font=("Segoe UI", 8)).pack(side="left")
-        self._sr_col_filter = ttk.Combobox(fp_bar, values=["All"], state="readonly", width=24)
-        self._sr_col_filter.set("All")
-        self._sr_col_filter.pack(side="left", padx=(1, 4))
-        self._sr_col_filter.bind("<<ComboboxSelected>>", lambda e: self._filter_search_results())
-        self._sr_col_filter.configure(postcommand=lambda: self._auto_dropdown_width(self._sr_col_filter))
+        # Paging, under the results
+        self._sr_page_bar = ttk.Frame(sf)
+        self._sr_page_bar.pack(side="bottom", fill="x", padx=M, pady=(0, S))
+        ttk.Button(self._sr_page_bar, text="◀", width=3, style="Small.TButton",
+                   command=self._sr_prev_page).pack(side="left", padx=1)
+        ttk.Button(self._sr_page_bar, text="▶", width=3, style="Small.TButton",
+                   command=self._sr_next_page).pack(side="left", padx=1)
+        self._sr_page_label = ttk.Label(self._sr_page_bar, text="", style="Muted.TLabel")
+        self._sr_page_label.pack(side="left", padx=XS)
 
-        ttk.Label(fp_bar, text="Type:", font=("Segoe UI", 8)).pack(side="left")
-        self._sr_type_filter = ttk.Combobox(fp_bar, values=["All"], state="readonly", width=8)
-        self._sr_type_filter.set("All")
-        self._sr_type_filter.pack(side="left", padx=(1, 6))
-        self._sr_type_filter.bind("<<ComboboxSelected>>", lambda e: self._filter_search_results())
-
-        ttk.Button(fp_bar, text="\u25C0", width=3, command=self._sr_prev_page).pack(side="left", padx=1)
-        ttk.Button(fp_bar, text="\u25B6", width=3, command=self._sr_next_page).pack(side="left", padx=1)
-        self._sr_page_label = ttk.Label(fp_bar, text="", font=("Segoe UI", 8))
-        self._sr_page_label.pack(side="left", padx=4)
-
-        # Results treeview in bordered frame
-        border_frame = tk.Frame(sf, relief="solid", bd=1, bg=C["border"])
-        border_frame.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+        # Results treeview in a bordered card
+        border_frame = tk.Frame(sf, relief="flat", bd=0, bg=K["border"], padx=1, pady=1)
+        border_frame.pack(fill="both", expand=True, padx=M, pady=(XS, XS))
 
         cols = ("#", "Source", "Table", "Column", "RowID", "Matched Value", "Type")
-        self._search_tree = ttk.Treeview(border_frame, columns=cols, show="headings", selectmode="browse")
+        self._search_tree = ttk.Treeview(border_frame, columns=cols, show="tree headings",
+                                         selectmode="browse")
         for c in cols:
             self._search_tree.heading(c, text=c)
+        self._search_tree.column("#0", width=24, minwidth=24, stretch=False)   # expand arrow
         self._search_tree.column("#", width=50, minwidth=40, stretch=False)
         self._search_tree.column("Source", width=120, minwidth=70, stretch=False)
         self._search_tree.column("Table", width=200, minwidth=120, stretch=True)
@@ -708,6 +1129,24 @@ class App(tk.Tk):
 
         self._search_results = []
         self._search_errors = []
+        self._sr_reset_groups()
+
+    def _sr_reset_groups(self):
+        """Forget the grouped view of the results (a new search, or the DB closed)."""
+        self._sr_grouper = ResultGrouper()
+        self._sr_grouped_upto = 0        # _search_results[:n] are filed in _sr_grouper
+        self._sr_groups_filtered = []
+        self._sr_iid_map = {}            # tree item -> (hit, RowGroup or None)
+        self._search_table_hits = {}     # table -> its hits, kept in table order at the end
+        self._search_wal_hits = []
+
+    def _sr_ingest(self):
+        """File the hits the search worker added since the last call (Tk thread only)."""
+        results = self._search_results
+        n = len(results)
+        for i in range(self._sr_grouped_upto, n):
+            self._sr_grouper.add(results[i])
+        self._sr_grouped_upto = n
 
     def _on_mode_change(self, event=None):
         mode = self._search_mode_var.get()
@@ -718,7 +1157,13 @@ class App(tk.Tk):
                 foreground=C["green"])
         elif mk == "blob":
             self._hint_label.configure(
-                text="Searches text in binary data. Enable 'Deep BLOB' for hex-level matching.",
+                text="Finds text inside BLOBs as UTF-8, UTF-16LE and UTF-16BE (any case); with "
+                     "'Include BLOB bytes' a term like 'ff d8 ff' is also matched as bytes.",
+                foreground=C["orange"])
+        elif mk == "hex":
+            self._hint_label.configure(
+                text="Byte pattern, byte-aligned: 'ff d8 ff', '0x1f8b', '\\x89PNG', 'de ad ?? ef' "
+                     "(?? = any byte). Searches BLOBs and text as stored bytes.",
                 foreground=C["orange"])
         elif mk == "col":
             self._hint_label.configure(
@@ -731,450 +1176,615 @@ class App(tk.Tk):
         term = self._search_var.get()
         if not term or not self.db.ok:
             return
+        try:
+            check_term(term, search_mode_key(self._search_mode_var.get()))
+        except ValueError as e:        # a malformed hex pattern or regular expression
+            self._hint_label.configure(text="Cannot search: %s" % e, foreground=C["red"])
+            return
+        self._on_mode_change()
+        # a search still finishing is stopped and ignored (its generation is old): its hits
+        # never mix into this one's, and the Tk thread does not wait for it
         self._stop_search()
-        # Wait for previous search thread to fully stop (avoids connection contention)
-        if self._search_thread and self._search_thread.is_alive():
-            self._search_thread.join(timeout=3)
+        self._search_gen += 1
         self._search_cancel = False
         self._search_results = []
         self._search_errors = []
+        self._search_capped = []        # (uid, where, rows kept) of the tables the limit cut
+        self._search_removed = []       # databases removed from the case since (their names)
+        self._sr_reset_groups()
+        self._sr_filtered = []
+        self._sr_page = 0
         self._search_tree.delete(*self._search_tree.get_children())
-        self._search_err_btn.configure(text="0 errors")
+        self._refresh_search_errors()
         self._search_start_time = time.time()
-
-        self._count_cancel = True  # Cancel bg counting to free connection
+        for combo in (self._sr_db_filter, self._sr_source_filter, self._sr_table_filter, self._sr_col_filter,
+                      self._sr_type_filter):
+            combo.set("All")
 
         mode = self._search_mode_var.get()
         self._search_term = term
-        self._search_mode_key = SEARCH_MODES.get(mode, "ci")
+        self._search_mode_key = search_mode_key(mode)
         lv = self._limit_var.get()
-        limit = 999999 if lv == "All" else int(lv)
+        limit = None if lv == "All" else int(lv)        # All: no limit at all
+        self._search_limit = limit
         deep = self._deep_blob_var.get()
-        tables = list(self._scope_tables) if self._scope_tables else self.db.tables()
+        decoded = self._search_decoded_var.get()
+        freelist = self._search_free_var.get()
+        wal = self._search_wal_var.get()
+        self._search_view_names = set()
+        work = [(m, self._search_scope_names(m)) for m in self._search_members()]
+        self._search_work = work
+        self._search_tables = [(m.uid, t) for m, tables in work for t in tables]
+        total = len(self._search_tables)
 
-        self._search_progress.configure(maximum=len(tables), value=0)
-        self._search_status.configure(text=f"Searching {len(tables)} tables...")
+        self._search_progress.configure(maximum=max(total, 1), value=0)
+        self._search_progress.pack(fill="x", expand=True)
+        self._search_status.set(*self._search_scope_text(work))
 
-        self._search_thread = threading.Thread(target=self._search_worker,
-                                                args=(tables, term, mode, limit, deep), daemon=True)
+        self._search_thread = threading.Thread(
+            target=self._search_worker, args=(work, term, mode, limit, deep, decoded, freelist,
+                                              wal),
+            daemon=True)
         self._search_thread.start()
+        self._search_top.show(self._stop_btn, True)
+        self.activity("search", term=term, mode=search_mode_key(mode),
+                      limit=limit if limit is not None else "all", databases=[
+                          m.path for m, _t in work], tables=total,
+                      options=dict(blob_bytes=deep, decoded=decoded, freed_pages=freelist,
+                                   wal=wal, views=self._search_views_var.get()))
 
-    def _search_worker(self, tables, term, mode, limit, deep):
-        last_update = 0
-        last_progress = 0
-        count = 0
-        self._search_table_counts = {}  # per-table result count
-        for ti, tbl in enumerate(tables):
-            if self._search_cancel:
-                break
-            cols = self.db.columns(tbl)
-            tbl_count = 0
-            try:
-                for result in self.db.search(tbl, cols, term, mode, limit, deep,
-                                              cancel=lambda: self._search_cancel):
-                    if self._search_cancel:
-                        break
-                    result["source"] = "DB"
-                    count += 1
-                    tbl_count += 1
-                    self._search_results.append(result)
-                    now = time.time()
-                    if now - last_update >= 0.3:
-                        last_update = now
-                        self.after(0, self._update_search_ui, count, ti, len(tables))
-            except Exception as e:
-                self._search_errors.append(f"{tbl}: {e}")
-            if tbl_count > 0:
-                self._search_table_counts[tbl] = tbl_count
+    def _search_members(self):
+        """The databases a search covers: the open one, or in a case those the 'Databases:'
+        button ticks (all by default)."""
+        if not self.case.multi:
+            return [self.case.active] if self.case.active is not None else []
+        return [m for m in self.scopes.members("search") if m.db.ok]
+
+    def _search_scope_text(self, work=None, verb="Searching"):
+        """('Searching 12 tables…', details) or in a case ('Searching 2 of 3 databases ·
+        40 tables…', [the databases]) - where the search looks, always said before it
+        starts."""
+        if work is None:
+            self._search_view_names = set()
+            work = [(m, self._search_scope_names(m)) for m in self._search_members()]
+        n = sum(len(t) for _m, t in work)
+        if not self.case.multi:
+            return "%s %s…" % (verb, plural(n, "table")), []
+        names = [m.name for m, _t in work]
+        summary = "%s %s · %s…" % (verb, scope_text(len(work), len(self.case)),
+                                   plural(n, "table"))
+        return summary, ["Databases: " + ", ".join(names)]
+
+    def _search_dbs_changed(self):
+        """The Search tab's scope changed (it is saved with the case): show it."""
+        self._update_search_options()
+        if not (self._search_thread and self._search_thread.is_alive()):
+            summary, details = self._search_scope_text(verb="Will search")
+            self._search_status.set(summary.rstrip("…"), details)
+
+    def _update_adv_label(self):
+        """'Advanced ▾', or 'Advanced (2) ▾' while options there are on."""
+        n = sum(1 for v in (self._deep_blob_var, self._search_decoded_var,
+                            self._search_views_var) if v.get())
+        n += self._limit_var.get() != "500"
+        self._search_adv_btn.configure(text="Advanced (%d) ▾" % n if n else "Advanced ▾")
+
+    def _update_search_options(self):
+        """'Include WAL row versions' and 'Include freed pages' are offered only when a
+        searched database has WAL frames / freed pages."""
+        members = self._search_members()
+        has_wal = any(m.db.has_wal for m in members)
+        self._search_opts.show(self._search_wal_cb, has_wal)
+        if not has_wal:
+            self._search_wal_var.set(False)
+        has_free = any(m.db.freelist_count() > 0 for m in members)
+        self._search_opts.show(self._search_free_cb, has_free)
+        if not has_free:
+            self._search_free_var.set(False)
+        self._update_scope_chip()
+
+    def _update_scope_chip(self):
+        """The table scope button says what it covers: 'All tables ▾', or '12 of 19 tables ▾'
+        when narrowed (then Reset shows); the tooltip names the databases narrowed."""
+        parts, n_all, n_in = [], 0, 0
+        for m in self._search_members():
+            tables = m.db.tables()
+            scope = set(m.scope_tables or ())
+            n = len([t for t in tables if not scope or t in scope])
+            n_all += len(tables)
+            n_in += n
+            if n != len(tables):
+                parts.append(("%s: " % m.name if self.case.multi else "") +
+                              "%d of %d tables" % (n, len(tables)))
+        self._scope_btn.configure(text=("%s of %s tables ▾" % (format(n_in, ","),
+                                                             format(n_all, ","))) if parts
+                                  else "All tables ▾")
+        self._search_opts.show(self._reset_scope_btn, bool(parts))
+        tip = getattr(self, "_scope_btn_tip", None)
+        if tip is None:
+            tip = self._scope_btn_tip = ToolTip(self._scope_btn, "")
+        tip.text = "Choose which tables (and views) a search covers" + (
+            ":\n" + "\n".join(parts) if parts else "")
+
+    def _after_safe(self, ms, func, *args):
+        """after() called from a worker thread: if the interpreter is already gone
+        (a straggler past _stop_workers, or a late tick after destroy()), after()
+        raises in the worker. Swallow it: the UI update is simply lost."""
+        try:
+            self.after(ms, func, *args)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _search_worker(self, work, term, mode, limit, deep, decoded=False, freelist=False,
+                       wal=False):
+        """Search each database of `work` [(member, tables)]: its tables in parallel (the
+        engine runs several SQLite scans at once), then its WAL row versions and freed pages
+        when asked. Every hit carries its database (dbid, database). Hits are appended to
+        _search_results; the Tk thread groups and shows them."""
+        total = sum(len(t) for _m, t in work)
+        # this search's own lists and generation: a search replaced by a newer one (still
+        # finishing an interrupted statement) stops and never mixes into the new results
+        gen = self._search_gen
+        results, errors, table_hits = (self._search_results, self._search_errors,
+                                       self._search_table_hits)
+        capped = self._search_capped
+        cancel = lambda: self._search_cancel or gen != self._search_gen   # noqa: E731
+
+        # one matching row more than the limit is read, so a place with exactly `limit`
+        # matching rows is not taken for one that has more
+        probe = None if limit is None else limit + 1
+
+        def keep(m, where, hits, key):
+            """The hits of a table (or WAL / freed pages) up to `limit` matching rows; when
+            there were more, the place is noted as stopped at the limit."""
+            if limit is None or not hits:
+                return hits
+            seen, out = set(), []
+            for h in hits:
+                k = key(h)
+                if k not in seen:
+                    if len(seen) >= limit:
+                        continue            # a row past the limit: only says there are more
+                    seen.add(k)
+                out.append(h)
+            if len(out) < len(hits):
+                capped.append((m.uid, where, limit))
+            return out
+        mode_key = search_mode_key(mode)
+        multi = len(self.case) > 1
+        done_dbs = self._search_done_dbs = []
+        # per database: [tables searched, tables, what it is doing]
+        progress = self._search_db_progress = OrderedDict(
+            (m.uid, [0, len(t), "waiting"]) for m, t in work)
+        last = [0.0]
+        wal_hits = OrderedDict((m.uid, []) for m, _t in work)
+
+        def tick():
             now = time.time()
-            if now - last_progress >= 0.3:
-                last_progress = now
-                self.after(0, lambda i=ti: self._search_progress.configure(value=i + 1))
+            if now - last[0] >= 0.3 and gen == self._search_gen:
+                last[0] = now
+                self._after_safe(0, self._update_search_ui,
+                                         sum(p[0] for p in progress.values()), total)
 
-        # Phase 2: Search WAL if checkbox is checked and WAL exists
-        if self._search_wal_var.get() and self.db.has_wal:
-            self.after(0, lambda: self._search_status.configure(
-                text=f"Searching WAL frames..."))
-            wal_table_counts = {}
+        def one(m, tables):
+            db = m.db
+            prefix = (m.name + ": ") if multi else ""
+            prog = progress[m.uid]
+            prog[2] = "tables"
             try:
-                for result in self.db.wal.search(term, mode, limit=limit,
-                                                  cancel=lambda: self._search_cancel):
-                    if self._search_cancel:
-                        break
-                    count += 1
-                    self._search_results.append(result)
-                    # Count per real table name
-                    key = f"WAL: {result['table']}"
-                    wal_table_counts[key] = wal_table_counts.get(key, 0) + 1
-                    now = time.time()
-                    if now - last_update >= 0.3:
-                        last_update = now
-                        self.after(0, self._update_search_ui, count,
-                                   len(tables), len(tables))
+                for tbl, hits, err in db.search_tables(
+                        tables, term, mode, probe if mode_key != "col" else limit, deep,
+                        cancel, decoded=decoded):
+                    prog[0] += 1
+                    if err is not None:
+                        errors.append(f"{prefix}{tbl}: {err}")
+                    if hits and mode_key != "col":
+                        hits = keep(m, tbl, hits, lambda h: repr(h.get("locator")))
+                    for h in hits:
+                        h["source"] = "DB"
+                        h["dbid"], h["database"] = m.uid, m.name
+                    if hits:
+                        table_hits[(m.uid, tbl)] = hits
+                        results.extend(hits)
+                    tick()
             except Exception as e:
-                self._search_errors.append(f"WAL: {e}")
-            self._search_table_counts.update(wal_table_counts)
+                if not cancel():
+                    errors.append(f"{prefix}search: {e}")
 
-        self.after(0, self._finalize_search, count, len(tables))
+            # Hidden data: every row version kept in WAL frames (identical copies searched once)
+            if wal and db.has_wal and not cancel():
+                prog[2] = "WAL frames"
+                tick()
+                got = []
+                try:
+                    for result in db.wal.search(term, mode, limit=probe, cancel=cancel,
+                                                deep_blob=deep, decoded=decoded):
+                        if cancel():
+                            break
+                        result["dbid"], result["database"] = m.uid, m.name
+                        got.append(result)
+                        tick()
+                except Exception as e:
+                    errors.append(f"{prefix}WAL: {e}")
+                got = keep(m, "WAL row versions", got, lambda h: id(h.get("frames")))
+                wal_hits[m.uid].extend(got)
+                results.extend(got)
 
-    def _update_search_ui(self, count, ti, total):
+            # Deleted records still held by freed pages
+            if freelist and db.freelist_count() > 0 and not cancel():
+                prog[2] = "freed pages"
+                tick()
+                got = []
+                try:
+                    for result in db.search_freelist(term, mode, limit=probe, deep_blob=deep,
+                                                     cancel=cancel, decoded=decoded):
+                        if cancel():
+                            break
+                        result["dbid"], result["database"] = m.uid, m.name
+                        got.append(result)
+                except Exception as e:
+                    errors.append(f"{prefix}freed pages: {e}")
+                got = keep(m, source_name("Freelist"), got,
+                           lambda h: (h.get("page"), h.get("cell_offset")))
+                wal_hits[m.uid].extend(got)          # after the tables, in order
+                results.extend(got)
+            prog[2] = "stopped" if cancel() else "done"
+            if not cancel():
+                done_dbs.append(m.uid)
+            tick()
+
+        if len(work) <= 1:
+            for m, tables in work:
+                one(m, tables)
+        else:
+            # several databases side by side (each one's tables in parallel as well); every
+            # thread closes its connections when its database is done
+            def task(m, tables):
+                self._search_threads.append(threading.current_thread())
+                try:
+                    one(m, tables)
+                finally:
+                    self._release_worker_connection()
+            self._search_threads = []
+            with ThreadPoolExecutor(max_workers=min(limits.get("case_search_parallel"),
+                                                    len(work))) as ex:
+                for f in [ex.submit(task, m, t) for m, t in work]:
+                    try:
+                        f.result()
+                    except Exception as e:      # reported, never lost
+                        errors.append(f"search: {e}")
+        if gen != self._search_gen:
+            return                              # replaced by a newer search
+        for uid, hits in wal_hits.items():      # in database order
+            self._search_wal_hits.extend(hits)
+
+        self._after_safe(0, self._finalize_search, total)
+
+    def _update_search_ui(self, done, total):
+        self._sr_ingest()
         elapsed = time.time() - self._search_start_time
-        self._search_status.configure(text=f"Found {count}... ({ti + 1}/{total} tables, {elapsed:.1f}s)")
-        self._search_err_btn.configure(text=f"{len(self._search_errors)} errors")
-        # Progressive display: append only new results (no flicker)
-        snap = list(self._search_results)
-        self._sr_filtered = snap
-        tree = self._search_tree
-        existing = len(tree.get_children())
-        page_size = self._sr_page_size
-        term = getattr(self, '_search_term', '')
-        mkey = getattr(self, '_search_mode_key', 'ci')
-        # Only add items that are new and within page 0
-        for i in range(existing, min(len(snap), page_size)):
-            r = snap[i]
-            source = r.get("source", "DB")
-            tag = "odd" if i % 2 else "even"
-            # Color-code WAL results by category
-            if source.startswith("WAL"):
-                cat = r.get("category", "")
-                if cat == "committed":
-                    tag = "wal_committed"
-                elif cat == "uncommitted":
-                    tag = "wal_uncommitted"
-                elif cat == "old":
-                    tag = "wal_old"
-            val = _snippet(r["value"], term, mkey) if term else r["value"]
-            tree.insert("", "end", values=(i + 1, source, r["table"], r["column"],
-                        r["rowid"], val, r["type"]), tags=(tag,))
-        tree.tag_configure("odd", background=C["alt"])
-        tree.tag_configure("even", background=C["bg"])
-        tree.tag_configure("wal_committed", background=C["gl"])
-        tree.tag_configure("wal_uncommitted", background="#fff8e6")
-        tree.tag_configure("wal_old", background=C["rl"])
-        total_results = len(snap)
-        total_pages = max(1, (total_results + page_size - 1) // page_size)
-        showing = min(total_results, page_size)
-        self._sr_page_label.configure(
-            text=f"Page 1 of {total_pages}  |  Showing {showing} of {total_results} results (searching...)")
+        text = (f"Found {len(self._search_results):,} matches in {len(self._sr_grouper.groups):,} rows"
+                f"… ({done:,}/{total:,} tables, {elapsed:.1f}s)")
+        details = []
+        if self.case.multi:
+            # each database's progress: tables searched, then WAL / freed pages, done
+            prog = getattr(self, "_search_db_progress", {})
+            finished = []
+            for m, _t in getattr(self, "_search_work", []):
+                p = prog.get(m.uid)
+                if p is None:
+                    continue
+                if p[2] == "done":
+                    finished.append(m.name)
+                elif p[2] in ("tables", "waiting"):
+                    details.append("%s: %d/%d tables" % (m.name, p[0], p[1]))
+                else:
+                    details.append("%s: %s" % (m.name, p[2]))
+            if finished:
+                text += " · %d of %d databases done" % (len(finished), len(prog))
+                details.append("%d done: %s" % (len(finished), ", ".join(finished)))
+        self._search_status.set(text, details)
+        self._refresh_search_errors()
+        self._search_progress.configure(value=done)
+        # Progressive display: fill the first page while the search runs, then leave it alone
+        # so a row the user is looking at does not jump.
+        self._sr_filtered = self._search_results
+        self._sr_groups_filtered = self._sr_grouper.groups
+        if self._sr_page == 0 and len(self._search_tree.get_children()) < self._sr_page_size:
+            self._display_search_page(searching=True)
+        else:
+            self._update_sr_page_label(searching=True)
 
-    def _finalize_search(self, count, total):
-        elapsed = time.time() - self._search_start_time
-        status = "Cancelled" if self._search_cancel else "Complete"
-        tc = getattr(self, '_search_table_counts', {})
-        tables_hit = len(tc)
-        self._search_status.configure(
-            text=f"{status}: {count} results across {tables_hit} tables ({total} scanned, {elapsed:.1f}s)")
-        self._search_err_btn.configure(text=f"{len(self._search_errors)} errors")
+    def _finalize_search(self, total):
+        searched = sum(p[0] for p in getattr(self, "_search_db_progress", {}).values())
+        if self._search_cancel:
+            status = "Stopped after %s of %s" % (format(min(searched, total), ","),
+                                                  plural(total, "table"))
+        else:
+            status = "Complete"
+        # Results arrive in the order tables finish: show them in table order
+        tables = getattr(self, "_search_tables", [])
+        ordered = []
+        for key in tables:
+            ordered.extend(self._search_table_hits.get(key, []))
+        ordered.extend(self._search_wal_hits)
+        self._search_results = ordered
+        self._sr_grouper = ResultGrouper()
+        self._sr_grouped_upto = 0
+        self._sr_ingest()
+        groups = self._sr_grouper.groups
+
+        tc = {}            # (dbid, source or None, table) -> rows found
+        for g in groups:
+            key = (g.dbid, None if g.source == "DB" else g.source, g.table)
+            tc[key] = tc.get(key, 0) + 1
+        order = dict((m.uid, i) for i, m in enumerate(self.case))
+        labels = OrderedDict()
+        cut = set((uid, where) for uid, where, _n in getattr(self, "_search_capped", ()))
+        for key in sorted(tc, key=lambda k: (order.get(k[0], 0), k[2].lower(), k[1] or "")):
+            dbid, src, table = key
+            name = table if src is None else f"{source_name(src)}: {table}"
+            plus = "+" if src is None and (dbid, table) in cut else ""   # stopped at the limit
+            labels[f"{self.member_label(self.case.find(dbid), name)} ({tc[key]}{plus})"] = key
+        self._sr_table_labels = labels
+        self._search_table_counts = dict((label, tc[key]) for label, key in labels.items())
+        # from the click to the results being ready, as the user waited for them
+        elapsed = self._search_elapsed = time.time() - self._search_start_time
+        text = "%s: %s in %s across %s (%s)" % (
+            status, plural(len(ordered), "match", "matches"), plural(len(groups), "row"),
+            plural(len(set((g.dbid, g.table) for g in groups)), "table"),
+            ("%s searched, %.1fs" % (plural(total, "table"), elapsed))
+            if not self._search_cancel else "%.1fs" % elapsed)
+        per_db, hit_dbs = self._search_db_summary(groups)
+        if hit_dbs:
+            text += " · %s" % (plural(len(hit_dbs), "database") + " with matches"
+                               if len(hit_dbs) > 1 else "in " + hit_dbs[0])
+        details = list(per_db)
+        removed = getattr(self, "_search_removed", [])
+        if removed:                     # databases removed from the case since the search
+            details.append("The results of %s were removed with %s" % (
+                ", ".join(removed), "it" if len(removed) == 1 else "them"))
+        capped = self._search_capped_text()
+        if capped:
+            text += " · stopped at Max rows/table in %s" % plural(
+                len(getattr(self, "_search_capped", [])), "place")
+            details.append(capped)
+        self._search_status.set(text, details)
+        # the navigator's 'Has hits' filter and the scope's 'With hits' preset
+        hits = {}
+        for g in groups:
+            hits[g.dbid] = hits.get(g.dbid, 0) + 1
+        self._navigator.set_hits(hits if self.case.multi else {})
+        self._search_top.show(self._stop_btn, False)
+        self._refresh_search_errors()
         self._search_progress.configure(value=total)
-        # Update filter combos — table filter shows per-table counts
-        tbl_labels = [f"{t} ({tc[t]})" for t in sorted(tc.keys())]
-        columns = sorted(set(r["column"] for r in self._search_results))
-        types = sorted(set(r["type"] for r in self._search_results))
+        self._search_progress.pack_forget()
+        # Update filter combos — table filter shows per-table row counts
+        tbl_labels = list(labels)
+        columns = sorted(set(r["column"] for r in ordered))
+        types = sorted(set(r["type"] for r in ordered))
         self._sr_table_filter.configure(values=["All"] + tbl_labels)
         self._sr_col_filter.configure(values=["All"] + columns)
         self._sr_type_filter.configure(values=["All"] + types)
+        self._sr_db_filter.configure(values=["All"] + [m.name for m, _t in
+                                                       getattr(self, "_search_work", [])])
         # Dynamically size combobox width to fit longest entry
         max_tbl = max((len(l) for l in tbl_labels), default=5)
         self._sr_table_filter.configure(width=max(32, min(max_tbl + 2, 55)))
         max_col = max((len(c) for c in columns), default=5)
         self._sr_col_filter.configure(width=max(24, min(max_col + 2, 45)))
-        self._sr_table_filter.set("All")
-        self._sr_col_filter.set("All")
-        self._sr_type_filter.set("All")
+        for combo in (self._sr_db_filter, self._sr_source_filter, self._sr_table_filter, self._sr_col_filter,
+                      self._sr_type_filter):
+            combo.set("All")
         # Auto-resize treeview Table/Column columns to fit longest name
-        # Use tkfont to measure actual pixel width for accuracy
         if not self._measure_font:
             self._measure_font = tkfont.nametofont("TkDefaultFont")
         mf = self._measure_font
-        tbl_names = sorted(tc.keys()) if tc else []
+        tbl_names = sorted(set(g.table for g in groups))
         if tbl_names:
-            longest_tbl_px = max(mf.measure(t) for t in tbl_names)
+            longest_tbl_px = max(mf.measure(t) for t in longest(tbl_names))
             tbl_px = max(220, min(longest_tbl_px + 30, 500))
             self._search_tree.column("Table", width=tbl_px)
         if columns:
-            longest_col_px = max(mf.measure(c) for c in columns)
+            names = [g.columns_label() for g in groups[:2000]] \
+                if self._sr_group_var.get() and groups else columns
+            longest_col_px = max(mf.measure(c) for c in longest(names))
             col_px = max(170, min(longest_col_px + 30, 400))
             self._search_tree.column("Column", width=col_px)
-        # Display first page
-        self._sr_filtered = list(self._search_results)
-        self._sr_page = 0
-        self._display_search_page()
-    # ── Freelist / Deleted Page Recovery ─────────────────────────────────
-    def freelist_count(self):
-        """Return the number of freelist pages reported by PRAGMA freelist_count."""
-        if not self.ok:
-            return 0
-        try:
-            r = self._conn.execute("PRAGMA freelist_count").fetchone()
-            return r[0] if r else 0
-        except Exception:
-            return 0
+        self._filter_search_results()
 
-    def read_freelist_pages(self):
-        """Read all freelist trunk and leaf pages directly from the main DB file.
+    def _search_capped_text(self):
+        """Which tables stopped at 'Max rows/table' ('' when none did). The limit is the
+        Search tab's own choice; All has none."""
+        capped = getattr(self, "_search_capped", [])
+        limit = getattr(self, "_search_limit", None)
+        if not capped or limit is None:
+            return ""
+        names = []
+        for uid, where, _n in capped:
+            names.append(self.member_label(self.case.find(uid), where))
+        shown = ", ".join(names[:8]) + (", and %d more" % (len(names) - 8) if len(names) > 8
+                                        else "")
+        return ("%d place%s stopped at %s matching rows (Max rows/table), there may be more: "
+                "%s. Choose a larger Max rows/table, or All, to see every match."
+                % (len(names), "" if len(names) == 1 else "s", format(limit, ","), shown))
 
-        Walks the freelist chain starting from DB header bytes 32–35.
-        Returns a list of dicts:
-        {page_num, page_type_byte, page_type, page_data, is_trunk}
-        """
-        if not self.ok or not self._path:
-            return []
-        try:
-            meta = self.meta()
-            page_size = int(meta.get("page_size", 4096) or 4096)
-            if page_size == 1:
-                page_size = 65536
-        except Exception:
-            page_size = 4096
+    def _refresh_search_errors(self):
+        """'N errors' shows only when a table (or source) could not be searched."""
+        n = len(self._search_errors)
+        self._search_err_btn.configure(text="%d error%s" % (n, "" if n == 1 else "s"))
+        self._search_btn_row.show(self._search_err_btn, n > 0)
 
-        results = []
-        visited = set()
-        try:
-            with open(self._path, "rb") as f:
-                f.seek(32)
-                trunk_num = int.from_bytes(f.read(4), "big")
-                if trunk_num == 0:
-                    return []
-                while trunk_num != 0 and trunk_num not in visited:
-                    visited.add(trunk_num)
-                    offset = (trunk_num - 1) * page_size
-                    f.seek(offset)
-                    trunk_data = f.read(page_size)
-                    if len(trunk_data) < 8:
-                        break
-                    next_trunk = int.from_bytes(trunk_data[0:4], "big")
-                    leaf_count = int.from_bytes(trunk_data[4:8], "big")
-                    max_leaves = (page_size - 8) // 4
-                    leaf_count = min(leaf_count, max_leaves)
-                    for i in range(leaf_count):
-                        leaf_num = int.from_bytes(
-                            trunk_data[8 + i * 4: 12 + i * 4], "big")
-                        if leaf_num == 0 or leaf_num in visited:
-                            continue
-                        visited.add(leaf_num)
-                        f.seek((leaf_num - 1) * page_size)
-                        leaf_data = f.read(page_size)
-                        if not leaf_data:
-                            continue
-                        pt_byte = leaf_data[0]
-                        from constants import PAGE_TYPES
-                        pt_label = PAGE_TYPES.get(
-                            pt_byte, "Unknown (0x{:02X})".format(pt_byte))
-                        results.append({
-                            "page_num":       leaf_num,
-                            "page_type_byte": pt_byte,
-                            "page_type":      pt_label,
-                            "page_data":      leaf_data,
-                            "is_trunk":       False,
-                        })
-                    results.append({
-                        "page_num":       trunk_num,
-                        "page_type_byte": 0x00,
-                        "page_type":      "Freelist Trunk",
-                        "page_data":      trunk_data,
-                        "is_trunk":       True,
-                    })
-                    trunk_num = next_trunk
-        except Exception:
-            pass
-        return results
-
-    def recover_freelist_records(self):
-        """Parse freelist leaf pages for recoverable deleted records.
-
-        Reuses WALParser.parse_leaf_cells() — same B-tree binary format.
-        Returns list of dicts:
-        {page_num, table, columns, records, confidence, page_type_byte, page_data}
-        Each record dict: {rowid, values (display list), values_dict, raw_values}
-        Confidence: High / Medium / Low
-        """
-        pages = self.read_freelist_pages()
-        if not pages:
-            return []
-
-        from wal_parser import WALParser
-        _wp = WALParser()
-
-        col_map    = {}
-        pk_col_idx = {}
-        if self.ok:
-            try:
-                rows = self._conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-                for (tname,) in rows:
-                    try:
-                        safe = tname.replace('"', '""')
-                        cols = self._conn.execute(
-                            'PRAGMA table_info("{}")'.format(safe)
-                        ).fetchall()
-                        col_map[tname] = [c[1] for c in cols]
-                        for c in cols:
-                            if c[5] == 1 and c[2].upper() == "INTEGER":
-                                pk_col_idx[tname] = c[0]
-                                break
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        if self.has_wal and self._wal.col_map:
-            for k, v in self._wal.col_map.items():
-                if k not in col_map:
-                    col_map[k] = v
-
-        page_table_map = {}
-        if self.ok:
-            try:
-                rows2 = self._conn.execute(
-                    "SELECT name, rootpage FROM sqlite_master "
-                    "WHERE type='table' AND rootpage > 0"
-                ).fetchall()
-                for tname, rp in rows2:
-                    page_table_map[rp] = tname
-            except Exception:
-                pass
-        if self.has_wal and self._wal.page_map:
-            for pn, tn in self._wal.page_map.items():
-                if pn not in page_table_map:
-                    page_table_map[pn] = tn
-
-        results = []
-        for pg in pages:
-            if pg["is_trunk"]:
-                continue
-            page_data = pg["page_data"]
-            if not page_data:
-                continue
-            cells      = _wp.parse_leaf_cells(page_data)
-            table_name = page_table_map.get(pg["page_num"], "")
-            known_cols = col_map.get(table_name, []) if table_name else []
-
-            if cells and table_name and known_cols:
-                confidence = "High"
-            elif cells and table_name:
-                confidence = "Medium"
-            elif cells:
-                confidence = "Low"
+    def _search_db_summary(self, groups):
+        """In a case: ([detail lines], [names of the databases with matches]): each database
+        with matches and its rows, then one line for all those searched without a match
+        ('22 databases: nothing found') and one for those not searched (stopped); ([], [])
+        for a search of one database."""
+        work = getattr(self, "_search_work", [])
+        if not self.case.multi or not work:
+            return [], []
+        rows = {}
+        for g in groups:
+            rows[g.dbid] = rows.get(g.dbid, 0) + 1
+        done = set(getattr(self, "_search_done_dbs", ()))
+        lines, found, empty, stopped = [], [], [], []
+        for m, _tables in sorted(work, key=lambda w: -rows.get(w[0].uid, 0)):
+            n = rows.get(m.uid, 0)
+            if n:
+                lines.append("%s: %s" % (m.name, plural(n, "row")))
+                found.append(m.name)
+            elif m.uid in done:
+                empty.append(m.name)
             else:
-                continue   # nothing decodable — skip
+                stopped.append(m.name)
+        if empty:
+            lines.append("%s: searched, nothing found (%s)" % (
+                plural(len(empty), "database"), ", ".join(empty)))
+        if stopped:
+            lines.append("%s: not searched (stopped) (%s)" % (
+                plural(len(stopped), "database"), ", ".join(stopped)))
+        return lines, found
 
-            pk_idx = pk_col_idx.get(table_name, -1)
-            parsed_records = []
-            for cell in cells:
-                vals         = cell["values"]
-                row_dict     = {}
-                display_vals = []
-                for vi, v in enumerate(vals):
-                    col_key = (known_cols[vi] if vi < len(known_cols)
-                            else "col{}".format(vi))
-                    if vi == pk_idx and v is None:
-                        disp = str(cell["rowid"])
-                        row_dict[col_key] = cell["rowid"]
-                    elif v is None:
-                        disp = "NULL"
-                        row_dict[col_key] = None
-                    elif isinstance(v, bytes):
-                        from utils import blob_type, fmtb
-                        bt   = blob_type(v)
-                        disp = "[BLOB: {}, {}]".format(fmtb(len(v)), bt)
-                        row_dict[col_key] = v
-                    elif isinstance(v, float):
-                        disp = "{:.6g}".format(v)
-                        row_dict[col_key] = v
-                    else:
-                        sv   = str(v)
-                        disp = sv if len(sv) <= 200 else sv[:200] + "..."
-                        row_dict[col_key] = v
-                    display_vals.append(disp)
-                parsed_records.append({
-                    "rowid":       cell["rowid"],
-                    "values":      display_vals,
-                    "values_dict": row_dict,
-                    "raw_values":  cell["values"],
-                })
-            results.append({
-                "page_num":       pg["page_num"],
-                "page_type_byte": pg["page_type_byte"],
-                "page_type":      pg["page_type"],
-                "table":          table_name or "(unknown table)",
-                "columns":        known_cols,
-                "records":        parsed_records,
-                "confidence":     confidence,
-                "page_data":      page_data,
-            })
-        return results
-
-    @staticmethod
-    def _auto_dropdown_width(combo):
-        """Widen combobox dropdown popup to fit the longest entry."""
-        try:
-            pd = combo.tk.call('ttk::combobox::PopdownWindow', str(combo))
-            combo.tk.call(pd + '.f.l', 'configure', '-width', 0)
-        except Exception:
-            pass
-
-    def _filter_search_results(self):
-        src_f = self._sr_source_filter.get()
+    def _sr_filter_tests(self):
+        """(group test, hit test) for the Database/Source/Table/Col/Type filters."""
+        src_f = source_key(self._sr_source_filter.get())     # 'Freed pages' -> 'Freelist'
         tbl_f = self._sr_table_filter.get()
         col_f = self._sr_col_filter.get()
         type_f = self._sr_type_filter.get()
-        filtered = self._search_results
-        if src_f == "DB":
-            filtered = [r for r in filtered if r.get("source", "DB").startswith("DB")]
-        elif src_f == "WAL":
-            filtered = [r for r in filtered if r.get("source", "DB").startswith("WAL")]
-        if tbl_f != "All":
-            # Strip count suffix: "table_name (42)" -> "table_name"
-            tbl_name = tbl_f.rsplit(" (", 1)[0] if " (" in tbl_f else tbl_f
-            if tbl_name.startswith("WAL: "):
-                # WAL table filter: "WAL: notes" -> filter by table + WAL source
-                wal_tbl = tbl_name[5:]
-                filtered = [r for r in filtered
-                            if r["table"] == wal_tbl
-                            and r.get("source", "DB").startswith("WAL")]
-            else:
-                filtered = [r for r in filtered if r["table"] == tbl_name]
-        if col_f != "All":
-            filtered = [r for r in filtered if r["column"] == col_f]
-        if type_f != "All":
-            filtered = [r for r in filtered if r["type"] == type_f]
-        self._sr_filtered = filtered
+        db_f = self._sr_db_filter.get() if self._sr_db_filter.winfo_manager() else "All"
+        db_uid = next((m.uid for m in self.case if m.name == db_f), None) \
+            if db_f != "All" else None
+        # the Table filter's entries stand for (database, source, table): "t (42)", "WAL: t",
+        # "Freelist: t", and in a case "wa.db › t"
+        place = getattr(self, "_sr_table_labels", {}).get(tbl_f) if tbl_f != "All" else None
+
+        def cell_ok(r):
+            return (col_f == "All" or r["column"] == col_f) and (type_f == "All" or r["type"] == type_f)
+
+        def place_ok(table, kind, dbid):
+            if src_f != "All" and kind != src_f:
+                return False
+            if db_uid is not None and dbid != db_uid:
+                return False
+            if place is None:
+                return tbl_f == "All"
+            pdb, psrc, ptable = place
+            return table == ptable and dbid == pdb and (psrc is None or kind == psrc)
+
+        def group_ok(g):
+            return place_ok(g.table, g.source, g.dbid) and any(cell_ok(h) for h in g.hits)
+
+        def hit_ok(r):
+            return place_ok(r["table"], source_kind(r), r.get("dbid")) and cell_ok(r)
+        return group_ok, hit_ok
+
+    def result_source_label(self, g):
+        """A result line's Source text: 'DB', 'WAL current ×2'...; in a case 'wa.db · DB'."""
+        label = g.source_label()
+        if self.case.multi and getattr(g, "database", ""):
+            return "%s · %s" % (g.database, label)
+        return label
+
+    def _filter_search_results(self):
+        group_ok, hit_ok = self._sr_filter_tests()
+        self._sr_filtered = [r for r in self._search_results if hit_ok(r)]
+        self._sr_groups_filtered = [g for g in self._sr_grouper.groups if group_ok(g)]
         self._sr_page = 0
         self._display_search_page()
 
-    def _display_search_page(self):
+    def _sr_page_items(self):
+        grouped = self._sr_group_var.get()
+        items = self._sr_groups_filtered if grouped else self._sr_filtered
+        start = self._sr_page * self._sr_page_size
+        return grouped, items, start, items[start:start + self._sr_page_size]
+
+    def _display_search_page(self, searching=False):
         tree = self._search_tree
         tree.delete(*tree.get_children())
-        start = self._sr_page * self._sr_page_size
-        end = start + self._sr_page_size
-        page_data = self._sr_filtered[start:end]
+        self._sr_iid_map = {}
+        grouped, _items, start, page = self._sr_page_items()
         term = getattr(self, '_search_term', '')
         mkey = getattr(self, '_search_mode_key', 'ci')
-        for i, r in enumerate(page_data):
+        headings = (("Column", "Matched in"), ("RowID", "Row"), ("Matched Value", "Preview"),
+                    ("Type", "Match")) if grouped else \
+            (("Column", "Column"), ("RowID", "RowID"), ("Matched Value", "Matched Value"),
+             ("Type", "Type"))
+        for col, text in headings:
+            tree.heading(col, text=text)
+        for i, item in enumerate(page):
             idx = start + i + 1
-            source = r.get("source", "DB")
-            tag = "odd" if i % 2 else "even"
-            # Color-code WAL results by category
-            if source.startswith("WAL"):
-                cat = r.get("category", "")
-                if cat == "committed":
-                    tag = "wal_committed"
-                elif cat == "uncommitted":
-                    tag = "wal_uncommitted"
-                elif cat == "old":
-                    tag = "wal_old"
+            if grouped:
+                self._insert_result_group(tree, idx, i, item, term, mkey)
+                continue
+            r = item
+            tag = self._wal_row_tag(r) or ("odd" if i % 2 else "even")
             val = _snippet(r["value"], term, mkey) if term else r["value"]
-            tree.insert("", "end", values=(idx, source, r["table"], r["column"],
-                        r["rowid"], val, r["type"]), tags=(tag,))
-        tree.tag_configure("odd", background=C["alt"])
-        tree.tag_configure("even", background=C["bg"])
-        tree.tag_configure("wal_committed", background=C["gl"])
-        tree.tag_configure("wal_uncommitted", background="#fff8e6")
-        tree.tag_configure("wal_old", background=C["rl"])
-        total = len(self._sr_filtered)
+            iid = "h%d" % idx
+            src = r.get("source", "DB")
+            if self.case.multi and r.get("database"):
+                src = "%s · %s" % (r["database"], src)
+            tree.insert("", "end", iid=iid, values=(idx, src,
+                                                    self._sr_table_text(r["table"], r.get("dbid")),
+                                                    r["column"],
+                                                    r["rowid"], val, match_label(r)), tags=(tag,))
+            self._sr_iid_map[iid] = (r, None)
+        self._configure_result_tags(tree)
+        self.tags.refresh_search_markers()
+        self._update_sr_page_label(searching)
+
+    def _sr_table_text(self, name, dbid=None):
+        """A result's table as listed: views are marked (their rows repeat table rows)."""
+        if dbid is None and self.case.active is not None:
+            dbid = self.case.active.uid
+        return name + " (view)" if (dbid, name) in self._search_view_names else name
+
+    def _insert_result_group(self, tree, idx, i, g, term, mkey):
+        """One line per row; its matching cells and the WAL frames holding it underneath."""
+        first = g.first
+        tag = ("wal_" + g.category) if g.source == "WAL" and g.category in WAL_STATES else \
+            ("odd" if i % 2 else "even")
+        n = len(g.hits)
+        preview = _snippet(first["value"], term, mkey) if term else first["value"]
+        iid = "g%d" % idx
+        tree.insert("", "end", iid=iid, text="",
+                    values=(idx, self.result_source_label(g), self._sr_table_text(g.table, g.dbid),
+                            g.columns_label(), g.rowid, preview,
+                            f"{n} cells" if n > 1 else match_label(first)),
+                    tags=(tag,))
+        self._sr_iid_map[iid] = (first, g)
+        if n > 1:
+            for j, h in enumerate(g.hits):
+                cid = "%s.%d" % (iid, j)
+                val = _snippet(h["value"], term, mkey) if term else h["value"]
+                tree.insert(iid, "end", iid=cid, values=("", "", "", h["column"], "", val, match_label(h)),
+                            tags=(tag, "sr_child"))
+                self._sr_iid_map[cid] = (h, g)
+        if g.frames and (g.source == "DB" or len(g.frames) > 1):
+            fid = iid + ".frames"
+            label = "also in WAL frames" if g.source == "DB" else "WAL frames"
+            tree.insert(iid, "end", iid=fid,
+                        values=("", "", "", label, "", g.frames_label(), f"{len(g.frames)} frames"),
+                        tags=(tag, "sr_child"))
+            self._sr_iid_map[fid] = (first, g)
+
+    def _update_sr_page_label(self, searching=False):
+        grouped, items, _start, page = self._sr_page_items()
+        total = len(items)
         total_pages = max(1, (total + self._sr_page_size - 1) // self._sr_page_size)
+        what = "rows" if grouped else "matches"
+        extra = ""
+        if grouped:
+            extra = f" ({sum(len(g.hits) for g in items):,} matches)"
         self._sr_page_label.configure(
-            text=f"Page {self._sr_page + 1} of {total_pages}  |  Showing {len(page_data)} of {total} results")
+            text=f"Page {self._sr_page + 1} of {total_pages}  |  Showing {len(page)} of {total:,} "
+                 f"{what}{extra}" + ("  (searching...)" if searching else ""))
+
+    def _sr_page_hits(self):
+        """The hits shown on the current page (a grouped page: every hit of its rows)."""
+        grouped, _items, _start, page = self._sr_page_items()
+        if not grouped:
+            return list(page)
+        return [h for g in page for h in g.hits]
 
     def _sr_prev_page(self):
         if self._sr_page > 0:
@@ -1182,1352 +1792,1395 @@ class App(tk.Tk):
             self._display_search_page()
 
     def _sr_next_page(self):
-        total_pages = max(1, (len(self._sr_filtered) + self._sr_page_size - 1) // self._sr_page_size)
+        _grouped, items, _start, _page = self._sr_page_items()
+        total_pages = max(1, (len(items) + self._sr_page_size - 1) // self._sr_page_size)
         if self._sr_page < total_pages - 1:
             self._sr_page += 1
             self._display_search_page()
 
     def _stop_search(self):
         self._search_cancel = True
+        th = self._search_thread
+        if th is not None and th.is_alive():
+            # Also stop the statement it is running: a pre-filtered scan of a large table can
+            # take a long time before it yields the next row and sees the cancel flag.
+            for t in [th] + list(getattr(self, "_search_threads", ())):
+                self.case.interrupt(t)
+
+    def _search_scope_names(self, member=None):
+        """The tables of a database a search covers (the scope's, or all), then, with
+        'Include views' on, the scope's views (all views when the scope names none). The
+        views are remembered in _search_view_names as (uid, view)."""
+        m = member if member is not None else self.case.active
+        if m is None:
+            return []
+        tables, views = m.db.tables(), m.db.views()
+        scope = set(m.scope_tables or ())
+        names = [t for t in tables if not scope or t in scope]
+        if not hasattr(self, "_search_view_names") or member is None:
+            self._search_view_names = set()
+        if self._search_views_var.get() and views:
+            # the scope dialog chose among these views (else: every view)
+            decided = m.scope_views_seen == set(views)
+            picked = [v for v in views if v in scope] if decided else views
+            names += picked
+            self._search_view_names |= set((m.uid, v) for v in picked)
+        return names
 
     def _show_scope(self):
         if not self.db.ok:
             return
+        if self.case.multi:
+            # the tables of every database searched, grouped under their database
+            members = self._search_members()
+            dlg = ScopeDlg.for_case(self, members)
+            self.wait_window(dlg)
+            if dlg.result is not None:
+                for m in members:
+                    m.scope_tables = dlg.result.get(m.uid, [])
+                    m.scope_views_seen = set(m.db.views())
+                self._search_status.configure(text=self._search_scope_text().replace(
+                    "Searching", "Will search", 1).rstrip("."))
+                self._update_scope_chip()
+            return
         tables = self.db.tables()
-        dlg = ScopeDlg(self, tables, self._count_cache, self._scope_tables)
+        views = self.db.views()
+        dlg = ScopeDlg(self, tables, self._count_cache, self._scope_tables, views)
         self.wait_window(dlg)
         if dlg.result is not None:
             self._scope_tables = dlg.result
+            self.case.active.scope_views_seen = set(views)
+            self._update_scope_chip()
 
     def _reset_scope(self):
         if self.db.ok:
-            self._scope_tables = list(self.db.tables())
-            self._search_status.configure(text=f"Scope reset: {len(self._scope_tables)} tables selected")
+            for m in self.case:
+                m.scope_tables = list(m.db.tables()) + list(m.db.views())
+            n = sum(len(m.scope_tables) for m in self._search_members())
+            self._search_status.configure(text=f"Scope reset: {n} tables selected" + (
+                " in %d databases" % len(self._search_members()) if self.case.multi else ""))
+            self._update_scope_chip()
+
+    def _result_member(self, result):
+        """The database a search hit came from (the active one when it does not say)."""
+        m = self.case.find(result.get("dbid")) if result.get("dbid") is not None else None
+        return m if m is not None else self.case.active
 
     def _on_search_dblclick(self, event):
         sel = self._search_tree.selection()
         if not sel:
             return
-        vals = self._search_tree.item(sel[0], "values")
-        if not vals:
+        result, _group = self._sr_iid_map.get(sel[0], (None, None))
+        if result is None:
             return
-        # Columns: #(0), Source(1), Table(2), Column(3), RowID(4),
-        #          Matched Value(5), Type(6)
-        source = vals[1]
-        tbl = vals[2]
-        match_col = vals[3]  # The column where the match was found
-        rid = vals[4]
+        tbl, match_col = result["table"], result["column"]
         search_term = getattr(self, '_search_term', '')
-        if source.startswith("WAL"):
-            # WAL results — show complete row in a detail window
-            # Find the matching result to get row_data
-            idx = int(vals[0]) - 1  # 1-based display index
-            row_data = None
-            frame_idx = None
-            page_num = None
-            if 0 <= idx < len(self._sr_filtered):
-                result = self._sr_filtered[idx]
-                row_data = result.get("row_data", {})
-                frame_idx = result.get("frame_idx")
-                page_num = result.get("page_num")
-            self._show_wal_row_detail(source, tbl, match_col, rid, vals[5],
-                                      row_data, frame_idx=frame_idx,
-                                      page_num=page_num)
-            return
-        if rid and rid != "-":
-            try:
-                rid = int(rid)
-                RowWin.show(self, self.db, tbl, rid,
-                            search_term=search_term, match_col=match_col)
-            except (ValueError, TypeError):
-                pass
+        member = self._result_member(result)
+        if not is_wal(result) and source_kind(result) != "Freelist":
+            loc = result.get("locator")
+            if loc is not None and member is not None:
+                # the row, read from its own database (the active one or not)
+                RowWin.show(self, member.db, tbl, loc, search_term=search_term,
+                            match_col=match_col)
+            return "break"
+        if member is not None:
+            self.activate_member(member)    # WAL / freed-page records: that database's tabs
+        if is_wal(result):
+            open_wal_record(self, result, match_col, result["value"])
+        else:
+            self._show_record_detail(result, match_col)
+        return "break"      # a double-click opens the row; the arrow expands it
+
+    def _show_record_detail(self, hit, match_col=""):
+        """A recovered record that is no longer a table row (e.g. in a freed page): the same
+        recovered-record window as Forensics (values, where it was found, confidence and its
+        reasons); a record known only from its hit gets a simpler window."""
+        member = self._result_member(hit)
+        rid = hit.get("record_id")
+        if rid and member is not None:
+            r = member.db.freed_record(rid)     # recovered by the search: never again here
+            if r is not None:
+                return RecordWindow(self._forensics, r, self)
+        loc = hit.get("locator")
+        snap = getattr(loc, "snapshot", None)
+        cols, values = (list(snap[0]), list(snap[1])) if snap else ([], list(hit.get("row") or []))
+        where = "%s page %s, cell offset %s" % (source_name(hit.get("source", "")),
+                                                 hit.get("page", "?"),
+                                                 hit.get("cell_offset", "?"))
+        return ValuesWindow(self, "Row detail — recovered record, %s" % self.member_label(
+                                member, hit["table"]),
+                            "%s | table %s (confidence %s) | recorded row id %s" % (
+                                where, hit["table"], hit.get("confidence", "?"),
+                                hit.get("rowid", "-")), cols, values, match_col)
 
     def _on_search_rightclick(self, event):
-        """Right-click context menu on search results — Go to WAL Frame."""
-        iid = self._search_tree.identify_row(event.y)
+        """Right-click menu on a search result: open, copy, go to the WAL frames holding it."""
+        tree = self._search_tree
+        iid = tree.identify_row(event.y)
         if not iid:
             return
-        self._search_tree.selection_set(iid)
-        vals = self._search_tree.item(iid, "values")
-        if not vals:
+        tree.selection_set(iid)
+        result, group = self._sr_iid_map.get(iid, (None, None))
+        if result is None:
             return
-        source = vals[1]
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="Open Row Detail",
-                         command=lambda: self._on_search_dblclick(None))
-        if source.startswith("WAL"):
-            idx = int(vals[0]) - 1
-            frame_idx = None
-            page_num = None
-            if 0 <= idx < len(self._sr_filtered):
-                result = self._sr_filtered[idx]
-                frame_idx = result.get("frame_idx")
-                page_num = result.get("page_num")
-            if frame_idx is not None:
-                menu.add_command(
-                    label=f"Go to WAL Frame #{frame_idx}",
-                    command=lambda fi=frame_idx, pn=page_num:
-                        self._navigate_to_wal_frame(fi, pn))
+        member = self._result_member(result)
+        menu.add_command(label="Open row detail", command=lambda: self._on_search_dblclick(None))
+        menu.add_command(label="Copy matched value",
+                         command=lambda v=result["value"]: (self.clipboard_clear(),
+                                                            self.clipboard_append(str(v))))
+
+        def goto(fi, pn):
+            self.activate_member(member)        # the frames are in that database's WAL
+            self._navigate_to_wal_frame(fi, pn)
+        frames = sorted(group.frames) if group is not None else []
+        if not frames and result.get("frame_idx") is not None:
+            frames = [(result["frame_idx"], result.get("page_num"), result.get("category", ""))]
+        if len(frames) == 1:
+            fi, pn, st = frames[0]
+            menu.add_command(label=f"Go to WAL frame #{fi} ({st})",
+                             command=lambda fi=fi, pn=pn: goto(fi, pn))
+        elif frames:
+            sub = tk.Menu(menu, tearoff=0)
+            for fi, pn, st in frames[:40]:
+                sub.add_command(label=f"Frame #{fi}  (page {pn}, {st})",
+                                command=lambda fi=fi, pn=pn: goto(fi, pn))
+            if len(frames) > 40:
+                sub.add_command(label=f"... {len(frames) - 40} more (see the WAL tab)",
+                                state="disabled")
+            menu.add_cascade(label=f"Go to WAL frame ({len(frames)})", menu=sub)
+        loc = result.get("locator")
+        if source_kind(result) != "Freelist" and getattr(loc, "kind", None) in ("rowid", "pk") \
+                and member is not None and result["table"] in member.db.tables():
+            menu.add_command(label="Row history (every version)",
+                             command=lambda t=result["table"], l=loc: (
+                                 self.activate_member(member), self.show_row_history(t, l)))
+            self.datamap.search_menu(menu, result, member)
+        self.relations.search_menu(menu, result)
+        if self._sr_group_var.get():
+            menu.add_separator()
+            menu.add_command(label="Expand all", command=lambda: self._sr_expand_all(True))
+            menu.add_command(label="Collapse all", command=lambda: self._sr_expand_all(False))
+        self.tags.search_menu(menu, group, result)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
+    def _sr_expand_all(self, open_):
+        for iid in self._search_tree.get_children():
+            self._search_tree.item(iid, open=open_)
+
     def _show_wal_row_detail(self, source, table, match_col, rowid, match_val,
-                             row_data, frame_idx=None, page_num=None):
-        """Show WAL search result with complete row — multi-line text,
-        DB comparison, and WAL-only indicator."""
-        win = tk.Toplevel(self)
-        win.title(f"WAL Record — {table} (Row {rowid})")
-        win.geometry("920x700")
-        win.configure(bg=C["bg"])
-        win.transient(self)
+                             row_data, frame_idx=None, page_num=None,
+                             category=None, locator=None, row_values=None):
+        """The row detail of a WAL record (wal_tab.WalRecordWindow): its values beside the
+        database's current ones. row_values: the raw values (row_data holds display text)."""
+        rec = {"table": table, "rowid": rowid, "category": category, "frame_idx": frame_idx,
+               "page_num": page_num, "locator": locator, "row_data": row_data or {},
+               "raw_values": list(row_values) if row_values is not None
+               else list((row_data or {}).values())}
+        return open_wal_record(self, rec, match_col, match_val)
 
-        # ── Status banner ──
-        status_color = "#00875a" if "In DB" in source else \
-                       "#c25100" if "WAL Only" in source else "#665500"
-        status_bg = "#e3fcef" if "In DB" in source else \
-                    "#fff8e6" if "WAL Only" in source else "#faf5e6"
-        banner = tk.Frame(win, bg=status_bg, padx=10, pady=6)
-        banner.pack(fill="x")
-        tk.Label(banner, text=f"Source: {source}   |   Table: {table}   |   RowID: {rowid}",
-                 font=("Segoe UI", 10, "bold"), bg=status_bg, fg=status_color,
-                 anchor="w").pack(fill="x")
-
-        # ── Check if record exists in main DB — WAL-only detection ──
-        db_row = None
-        wal_only = False
-        try:
-            rid_int = int(rowid)
-            db_row_dict, db_cols = self.db.full_row(table, rid_int)
-            if db_row_dict and len(db_row_dict) > 1:
-                db_row = db_row_dict
-            else:
-                wal_only = True
-        except Exception:
-            wal_only = True
-
-        # Pre-compute differences for banner text
-        diff_cols_count = 0
-        if db_row and not wal_only and row_data:
-            for col_name, wal_val in row_data.items():
-                if col_name in db_row:
-                    db_val = db_row.get(col_name)
-                    db_val_str = "NULL" if db_val is None else str(db_val)
-                    wal_val_str = "NULL" if wal_val is None else str(wal_val)
-                    if db_val_str != wal_val_str:
-                        diff_cols_count += 1
-
-        if wal_only:
-            tk.Label(banner,
-                     text="Not in main DB — found only in WAL file. "
-                          "(Note: extraction timing may affect this — "
-                          "verify against your extraction timestamps.)",
-                     font=("Segoe UI", 8), bg=status_bg, fg="#5e6c84",
-                     anchor="w").pack(fill="x")
-        elif diff_cols_count > 0:
-            tk.Label(banner,
-                     text=f"Also in main DB but {diff_cols_count} column(s) differ "
-                          f"(marked \u25cf red on left). "
-                          "Differences may reflect extraction timing.",
-                     font=("Segoe UI", 8), bg=status_bg, fg="#5e6c84",
-                     anchor="w").pack(fill="x")
-        else:
-            tk.Label(banner,
-                     text="Also exists in main DB with same values.",
-                     font=("Segoe UI", 8), bg=status_bg, fg="#5e6c84",
-                     anchor="w").pack(fill="x")
-
-        # ── Matched info (only shown when coming from search) ──
-        if match_col:
-            match_display = match_val[:200] if match_val and len(match_val) > 200 else (match_val or "")
-            tk.Label(win, text=f"Matched column: {match_col}   |   Value: {match_display}",
-                     font=("Segoe UI", 9), bg=C["bg"], fg=C["text2"],
-                     anchor="w", wraplength=830).pack(fill="x", padx=10, pady=(6, 2))
-        ttk.Separator(win, orient="horizontal").pack(fill="x", padx=10, pady=4)
-
-        # ── Row data display — scrolled Text widget for multi-line support ──
-        if row_data:
-            # PanedWindow: column list (left) + value viewer (right)
-            pw = ttk.PanedWindow(win, orient="horizontal")
-            pw.pack(fill="both", expand=True, padx=10, pady=(2, 6))
-
-            # Left: column list
-            left_frame = ttk.Frame(pw)
-            pw.add(left_frame, weight=2)
-
-            tk.Label(left_frame, text="Columns",
-                     font=("Segoe UI", 9, "bold"), bg=C["bg"],
-                     anchor="w").pack(fill="x")
-            col_listbox = tk.Listbox(left_frame, font=("Consolas", 10),
-                                      selectmode="browse", bg=C["bg2"],
-                                      relief="solid", bd=1, width=30)
-            col_sb = ttk.Scrollbar(left_frame, orient="vertical",
-                                    command=col_listbox.yview)
-            col_xsb = ttk.Scrollbar(left_frame, orient="horizontal",
-                                     command=col_listbox.xview)
-            col_listbox.configure(yscrollcommand=col_sb.set,
-                                   xscrollcommand=col_xsb.set)
-            col_sb.pack(side="right", fill="y")
-            col_xsb.pack(side="bottom", fill="x")
-            col_listbox.pack(fill="both", expand=True)
-
-            # Right: value display
-            right_frame = ttk.Frame(pw)
-            pw.add(right_frame, weight=3)
-
-            val_top = tk.Frame(right_frame, bg=C["bg"])
-            val_top.pack(fill="x")
-            tk.Label(val_top, text="Value",
-                     font=("Segoe UI", 9, "bold"), bg=C["bg"],
-                     anchor="w").pack(side="left")
-
-            def _copy_current_value():
-                txt = val_text.get("1.0", "end-1c").strip()
-                if txt:
-                    win.clipboard_clear()
-                    win.clipboard_append(txt)
-            tk.Button(val_top, text="Copy Value", font=("Segoe UI", 7),
-                      relief="flat", bd=0, bg=C["bg"], fg=C["accent"],
-                      cursor="hand2", padx=4, pady=1,
-                      command=_copy_current_value).pack(side="right", padx=4)
-
-            val_text = tk.Text(right_frame, wrap="word", font=("Consolas", 10),
-                               bg=C["bg2"], fg=C["text"], relief="solid", bd=1,
-                               padx=8, pady=6)
-            val_sb = ttk.Scrollbar(right_frame, orient="vertical",
-                                    command=val_text.yview)
-            val_text.configure(yscrollcommand=val_sb.set)
-            val_sb.pack(side="right", fill="y")
-            val_text.pack(fill="both", expand=True)
-            val_text.configure(state="disabled")
-
-            # Tag for highlighting differences
-            val_text.tag_configure("diff", foreground="#de350b",
-                                    font=("Consolas", 10, "bold"))
-            val_text.tag_configure("same", foreground="#6b778c")
-
-            # Pre-compute which columns differ from DB
-            diff_cols = set()
-            if db_row and not wal_only:
-                for col_name, wal_val in row_data.items():
-                    if col_name in db_row:
-                        db_val = db_row.get(col_name)
-                        db_val_str = "NULL" if db_val is None else str(db_val)
-                        wal_val_str = "NULL" if wal_val is None else str(wal_val)
-                        if db_val_str != wal_val_str:
-                            diff_cols.add(col_name)
-
-            # Populate column list
-            col_items = list(row_data.items())
-            for i, (col_name, _) in enumerate(col_items):
-                prefix = ""
-                if col_name == match_col:
-                    prefix = "\u2192 "  # Arrow for matched column
-                elif col_name in diff_cols:
-                    prefix = "\u25cf "  # Red dot for changed column
-                col_listbox.insert("end", f"{prefix}{col_name}")
-                if col_name == match_col:
-                    col_listbox.itemconfigure(i, bg=C["hl"],
-                                               selectbackground="#ffc400")
-                elif col_name in diff_cols:
-                    col_listbox.itemconfigure(i, fg="#de350b",
-                                               selectforeground="#de350b")
-            # WAL-only indicator
-            if wal_only:
-                for i in range(col_listbox.size()):
-                    col_listbox.itemconfigure(i, fg="#c25100")
-
-            def _on_col_select(event=None):
-                sel = col_listbox.curselection()
-                if not sel:
-                    return
-                idx = sel[0]
-                col_name, col_val = col_items[idx]
-
-                val_text.configure(state="normal")
-                val_text.delete("1.0", "end")
-
-                # Show WAL value
-                val_text.insert("end", f"Column: {col_name}\n", "")
-                val_text.insert("end", f"{'─' * 40}\n\n")
-                val_text.insert("end", "WAL Value:\n", "")
-                val_text.insert("end", f"{col_val}\n")
-
-                # Show DB comparison if record exists in main DB
-                if db_row and not wal_only:
-                    db_val = db_row.get(col_name, db_row.get("_rid"))
-                    if col_name == "_rid":
-                        db_val = db_row.get("_rid")
-                    # Skip _rid for comparison
-                    if col_name in db_row:
-                        db_val_str = "NULL" if db_val is None else str(db_val)
-                        val_text.insert("end", f"\n{'─' * 40}\n\n")
-                        val_text.insert("end", "DB Value:\n", "")
-                        if db_val_str == col_val:
-                            val_text.insert("end", f"{db_val_str}\n", "same")
-                            val_text.insert("end", "\n(Same as WAL)", "same")
-                        else:
-                            val_text.insert("end", f"{db_val_str}\n", "diff")
-                            val_text.insert("end", "\n\u26a0 DIFFERENT from WAL value!", "diff")
-                elif wal_only:
-                    val_text.insert("end", "\n\n")
-                    val_text.insert("end", "\u26a0 WAL-ONLY: No matching record in main DB", "diff")
-
-                val_text.configure(state="disabled")
-
-            col_listbox.bind("<<ListboxSelect>>", _on_col_select)
-
-            # Auto-select the matched column
-            for i, (cn, _) in enumerate(col_items):
-                if cn == match_col:
-                    col_listbox.selection_set(i)
-                    col_listbox.see(i)
-                    win.after(50, _on_col_select)
-                    break
-            else:
-                # Select first column if no match
-                if col_items:
-                    col_listbox.selection_set(0)
-                    win.after(50, _on_col_select)
-        else:
-            tk.Label(win, text="Row data not available (column mapping may be incomplete)",
-                     font=("Segoe UI", 9), bg=C["bg"], fg=C["text2"],
-                     anchor="w").pack(fill="x", padx=10)
-
-        # Bottom toolbar — styled buttons like RowWin
-        bot = tk.Frame(win, bg=C["bg3"], bd=0)
-        bot.pack(side="bottom", fill="x")
-        tk.Frame(bot, bg=C["border"], height=1).pack(fill="x", side="top")
-        bot_inner = tk.Frame(bot, bg=C["bg3"])
-        bot_inner.pack(fill="x", padx=6, pady=4)
-        btn_cfg = dict(font=("Segoe UI", 8), relief="flat", bd=0, cursor="hand2", padx=8, pady=3)
-
-        # Copy group
-        grp1 = tk.Frame(bot_inner, bg=C["bg3"])
-        grp1.pack(side="left")
-        tk.Label(grp1, text="Copy:", font=("Segoe UI", 7), fg=C["text2"], bg=C["bg3"]).pack(side="left", padx=(0, 2))
-
-        source_label = source
-
-        def _copy_json():
-            import json as _json
-            d = {"table": table, "rowid": rowid, "source": source_label}
-            if row_data:
-                d["data"] = dict(row_data)
-            if frame_idx is not None:
-                d["frame"] = frame_idx
-                d["page"] = page_num
-            win.clipboard_clear()
-            win.clipboard_append(_json.dumps(d, indent=2, default=str))
-
-        def _copy_csv():
-            import io, csv as _csv
-            if row_data:
-                buf = io.StringIO()
-                w = _csv.writer(buf)
-                w.writerow(list(row_data.keys()))
-                w.writerow(list(row_data.values()))
-                win.clipboard_clear()
-                win.clipboard_append(buf.getvalue())
-
-        def _copy_text():
-            lines = [f"Table: {table}", f"RowID: {rowid}", f"Source: {source_label}"]
-            if row_data:
-                for k, v in row_data.items():
-                    lines.append(f"  {k}: {v}")
-            win.clipboard_clear()
-            win.clipboard_append("\n".join(lines))
-
-        for txt, cmd in [("JSON", _copy_json), ("CSV", _copy_csv), ("Text", _copy_text)]:
-            tk.Button(grp1, text=txt, command=cmd, bg=C["bg"], fg=C["accent"],
-                      activebackground=C["acl"], **btn_cfg).pack(side="left", padx=1)
-
-        # WAL Frame button
-        if frame_idx is not None:
-            tk.Frame(bot_inner, bg=C["border"], width=1).pack(side="left", fill="y", padx=6, pady=2)
-            tk.Button(bot_inner, text=f"Go to Frame #{frame_idx}", bg=C["bg"], fg=C["purple"],
-                      activebackground=C["bg2"],
-                      command=lambda: (win.destroy(), self._navigate_to_wal_frame(frame_idx, page_num)),
-                      **btn_cfg).pack(side="left", padx=1)
-
-        # Close
-        tk.Button(bot_inner, text="Close", command=win.destroy,
-                  bg=C["bg4"], fg=C["text"], activebackground=C["border"],
-                  **btn_cfg).pack(side="right", padx=1)
-
-    def _navigate_to_wal_frame(self, frame_idx, page_num=None):
-        """Navigate to a specific WAL frame in the WAL tab."""
+    def show_wal_frame(self, frame_idx):
+        """Show one WAL frame in the WAL tab (of the active database)."""
         if not self._wal_tab_added or not self.db.has_wal:
             return
-        # Switch to WAL tab
         self._nb.select(self._wal_frame)
-        # Ensure we are in frame view
-        self._switch_wal_view("frames")
-        # Reset filters so the frame is visible
-        self._wal_cat_var.set("All")
-        self._wal_table_var.set("All")
-        self._wal_pt_var.set("All")
-        self._wal_page_var.set("")
-        self._wal_filtered_frames = list(self._wal_all_frames)
-        self._display_wal_frames()
-        # Select the frame in the tree
-        iid = str(frame_idx)
-        try:
-            self._wal_tree.selection_set(iid)
-            self._wal_tree.focus(iid)
-            self._wal_tree.see(iid)
-            # Trigger the select event to show detail
-            self._on_wal_select()
-        except Exception:
-            pass
+        self._wal_frame.navigate(frame_idx)
+
+    def _navigate_to_wal_frame(self, frame_idx, page_num=None):
+        self.show_wal_frame(frame_idx)
 
     def _show_search_errors(self):
-        if not self._search_errors:
-            messagebox.showinfo("Errors", "No errors")
+        """Every table or source the search could not read, with why (a scrollable list)."""
+        errors = list(self._search_errors)
+        if not errors:
             return
-        messagebox.showwarning("Search Errors", "\n".join(self._search_errors[:50]))
+        TextWindow(self, "Search errors (%d)" % len(errors),
+                   "The search could not read these tables or sources; the rest were "
+                   "searched:", "\n".join(errors))
 
-    def _get_export_scope(self):
-        """Ask user which results to export: all, filtered, or current page."""
-        if not self._search_results:
-            return None
-        all_n = len(self._search_results)
-        filt_n = len(self._sr_filtered)
-        page_start = self._sr_page * self._sr_page_size
-        page_data = self._sr_filtered[page_start:page_start + self._sr_page_size]
-        page_n = len(page_data)
+    def _search_scope_choices(self):
+        """[(key, text)] of what a search export can cover: every result, the results the
+        filters keep, the page shown; each with its rows and matches."""
+        def words(hits):
+            rows = len(set(self._hit_row_key(h) for h in hits))
+            return "%s row%s, %s match%s" % (format(rows, ","), "" if rows == 1 else "s",
+                                             format(len(hits), ","),
+                                             "" if len(hits) == 1 else "es")
+        out = [("all", "All results (%s)" % words(self._search_results))]
+        if len(self._sr_filtered) != len(self._search_results):
+            out.append(("filtered", "Results the filters keep (%s)" % words(self._sr_filtered)))
+        out.append(("page", "The page shown (%s)" % words(self._sr_page_hits())))
+        return out
 
-        dlg = tk.Toplevel(self)
-        dlg.title("Export Scope")
-        dlg.configure(bg=C["bg"])
-        dlg.transient(self)
-        dlg.grab_set()
-        dlg.update_idletasks()
-        _dw, _dh = 340, 170
-        dlg.geometry(f"{_dw}x{_dh}+{self.winfo_rootx() + (self.winfo_width() - _dw) // 2}+{self.winfo_rooty() + (self.winfo_height() - _dh) // 2}")
-        result = [None]
+    @staticmethod
+    def _hit_row_key(h):
+        return (h.get("dbid"), h.get("source", "DB")[:3], h.get("table"),
+                repr(h.get("locator")), h.get("page"), h.get("cell_offset"),
+                id(h.get("frames")))
 
-        tk.Label(dlg, text="What to export?", font=("Segoe UI", 10, "bold"),
-                 bg=C["bg"], fg=C["text"]).pack(pady=(12, 8))
-        bf = tk.Frame(dlg, bg=C["bg"])
-        bf.pack(fill="x", padx=20)
-        btn_cfg = dict(font=("Segoe UI", 9), relief="flat", bd=0, padx=12, pady=5, cursor="hand2")
-        def pick(which):
-            result[0] = which
-            dlg.destroy()
-        tk.Button(bf, text=f"All Results ({all_n})", bg=C["acl"], fg=C["accent"],
-                  command=lambda: pick("all"), **btn_cfg).pack(fill="x", pady=2)
-        if filt_n != all_n:
-            tk.Button(bf, text=f"Filtered ({filt_n})", bg="#e3fcef", fg=C["green"],
-                      command=lambda: pick("filtered"), **btn_cfg).pack(fill="x", pady=2)
-        tk.Button(bf, text=f"Current Page ({page_n})", bg="#f0f0ff", fg=C["purple"],
-                  command=lambda: pick("page"), **btn_cfg).pack(fill="x", pady=2)
-        tk.Button(bf, text="Cancel", bg=C["bg3"], fg=C["text2"],
-                  command=dlg.destroy, **btn_cfg).pack(fill="x", pady=2)
-        self.wait_window(dlg)
-        if result[0] is None:
-            return None
-        if result[0] == "all":
-            return self._search_results
-        elif result[0] == "filtered":
+    def _search_scope_hits(self, key):
+        if key == "all":
+            return list(self._search_results)
+        if key == "filtered":
             return list(self._sr_filtered)
-        else:
-            return page_data
+        return self._sr_page_hits()
+
+    def _search_export(self, fmt, full=False):
+        """Export search results (every matching cell, with where it is) as CSV or JSON on a
+        worker thread, with the search's term, mode, scope and filters in the provenance.
+        full: JSON with each hit's whole row and WAL / freed-page details."""
+        if not self._search_results:
+            messagebox.showinfo("Export", "Search first: there are no results to export.",
+                                parent=self)
+            return
+        scopes = self._search_scope_choices()
+        opts = export_options(self, "Export search results", scopes,
+                              formats=(fmt,) if full else ("csv", "json"), fmt=fmt,
+                              spreadsheet_safe=True)
+        if opts is None:
+            return
+        fmt = opts["fmt"]
+        data = self._search_scope_hits(opts["scope"])
+        path = ask_path(self, fmt, "search_results")
+        if not write_allowed(path):
+            return
+        multi = self.case.multi
+        cols = (["Database"] if multi else []) + [
+            "#", "Source", "Table", "Column", "Row", "Value", "Type", "Page", "Cell offset",
+            "Frame", "WAL frames", "Confidence"]
+        if full:
+            cols += ["Row values"]
+
+        def rows_fn():
+            for i, r in enumerate(data):
+                loc = r.get("locator")
+                row = ([self._result_member(r).path] if multi else []) + [
+                    i + 1, source_name(r.get("source", "DB")), r["table"], r["column"],
+                    loc if loc is not None and getattr(loc, "kind", "") != "ordinal"
+                    else r.get("rowid"), r["value"], r["type"], r.get("page", r.get("page_num")),
+                    r.get("cell_offset"), r.get("frame_idx"),
+                    "; ".join("#%s %s" % (f[0], f[2]) for f in r.get("frames") or ()),
+                    r.get("confidence")]
+                if full:
+                    rd = r.get("row_data")
+                    row.append(dict(rd) if rd else list(r.get("row") or ()))
+                yield row
+        members = [m for m, _t in getattr(self, "_search_work", [])] or [self.case.active]
+        mode = getattr(self, "_search_mode_key", "ci")
+        filters = "; ".join("%s: %s" % (name, c.get()) for name, c in (
+            ("database", self._sr_db_filter), ("source", self._sr_source_filter),
+            ("table", self._sr_table_filter), ("column", self._sr_col_filter),
+            ("type", self._sr_type_filter)) if c.get() != "All")
+        lim = getattr(self, "_search_limit", None)
+        extra = {"term": getattr(self, "_search_term", ""), "mode": mode,
+                 "max_rows_per_table": lim if lim is not None else "all",
+                 "stopped_at_the_limit": [self.member_label(self.case.find(u), w)
+                                          for u, w, _n in getattr(self, "_search_capped", [])]}
+        export_rows(self, "Export search results", path, fmt, cols, rows_fn,
+                    "search results", members, scope=dict(scopes)[opts["scope"]],
+                    filters=filters, blob_mode=opts["blob_mode"], total=len(data), extra=extra,
+                    spreadsheet_safe=opts.get("spreadsheet_safe", True))
 
     def _search_export_csv(self):
-        data = self._get_export_scope()
-        if not data:
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                             filetypes=[("CSV", "*.csv")])
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["#", "Source", "Table", "Column", "RowID", "Value", "Type",
-                            "Page#", "Frame#"])
-                for i, r in enumerate(data):
-                    w.writerow([i + 1, r.get("source", "DB"), r["table"], r["column"],
-                                r["rowid"], r["value"], r["type"],
-                                r.get("page_num", ""), r.get("frame_idx", "")])
-            messagebox.showinfo("Exported", f"Exported {len(data)} results to:\n{os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    def _search_export_json(self):
-        data = self._get_export_scope()
-        if not data:
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".json",
-                                             filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        try:
-            out = [{"source": r.get("source", "DB"), "table": r["table"], "column": r["column"],
-                    "rowid": r["rowid"], "value": r["value"], "type": r["type"],
-                    "page_num": r.get("page_num", ""), "frame_idx": r.get("frame_idx", "")} for r in data]
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(out, f, indent=2, default=str)
-            messagebox.showinfo("Exported", f"Exported {len(out)} results to:\n{os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        self._search_export("csv")
 
     def _search_export_details(self):
-        """Export search results as forensic JSON with full metadata."""
-        data = self._get_export_scope()
-        if not data:
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            initialfile="forensic_export.json",
-            filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        try:
-            out = []
-            for i, r in enumerate(data):
-                entry = {
-                    "index": i + 1,
-                    "source": r.get("source", "DB"),
-                    "table": r["table"],
-                    "column": r["column"],
-                    "rowid": r["rowid"],
-                    "value": r["value"],
-                    "type": r["type"],
-                    "page_num": r.get("page_num", ""),
-                    "frame_idx": r.get("frame_idx", ""),
-                    "category": r.get("category", ""),
-                }
-                # Include full row_data if available (WAL results)
-                rd = r.get("row_data")
-                if rd:
-                    entry["row_data"] = {k: str(v) for k, v in rd.items()}
-                out.append(entry)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"forensic_export": True,
-                           "total_results": len(out),
-                           "results": out}, f, indent=2, default=str)
-            messagebox.showinfo("Forensic Export",
-                                f"Exported {len(out)} results with full metadata to:\n"
-                                f"{os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        self._search_export("json", full=True)
 
     def _search_copy(self):
-        data = self._get_export_scope()
-        if not data:
+        """Copy the results (the scope chosen) as tab-separated text."""
+        if not self._search_results:
             return
-        lines = ["#\tSource\tTable\tColumn\tRowID\tValue\tType"]
+        scopes = self._search_scope_choices()
+        opts = export_options(self, "Copy search results", scopes, formats=("text",),
+                              blobs=False, ok_text="Copy")
+        if opts is None:
+            return
+        data = self._search_scope_hits(opts["scope"])
+        multi = self.case.multi
+        lines = [("Database\t" if multi else "") + "#\tSource\tTable\tColumn\tRow\tValue\tType"]
         for i, r in enumerate(data):
-            lines.append(f"{i+1}\t{r.get('source', 'DB')}\t{r['table']}\t{r['column']}\t{r['rowid']}\t{r['value']}\t{r['type']}")
+            lines.append((r.get("database", "") + "\t" if multi else "") + "\t".join(
+                str(x) for x in (i + 1, source_name(r.get("source", "DB")), r["table"],
+                                 r["column"], r["rowid"], plain_text(r["value"]), r["type"])))
         self.clipboard_clear()
         self.clipboard_append("\n".join(lines))
+        self._search_status.configure(text="Copied %s results to the clipboard."
+                                      % format(len(data), ","))
 
     # ── Browse Tab ───────────────────────────────────────────────────
     def _build_browse_tab(self):
         bf = self._browse_frame
 
-        # Top controls
-        top = ttk.Frame(bf)
-        top.pack(fill="x", padx=8, pady=(8, 4))
-
-        ttk.Label(top, text="Table:").pack(side="left")
+        from breadcrumb import Breadcrumb
+        top = self._browse_top = Toolbar(bf)
+        top.pack(fill="x", padx=M, pady=(S, XS))
         self._browse_table_var = tk.StringVar()
-        self._browse_table_combo = ttk.Combobox(top, textvariable=self._browse_table_var,
-                                                  state="readonly", width=28)
-        self._browse_table_combo.pack(side="left", padx=4)
+        # '● msgstore.db ▾ › message ▾': the database (switch it in a case) and the table
+        self._browse_crumb = top.add(Breadcrumb(top, self, table_var=self._browse_table_var))
+        self._browse_table_combo = self._browse_crumb.table_combo
         self._browse_table_combo.bind("<<ComboboxSelected>>", lambda e: self._load_browse_table())
 
-        ttk.Label(top, text="Rows/page:").pack(side="left", padx=(12, 2))
-        self._browse_limit_var = tk.StringVar(value="200")
-        ttk.Combobox(top, textvariable=self._browse_limit_var,
-                     values=["50", "100", "200", "500", "1000"], state="readonly",
-                     width=6).pack(side="left")
-
-        ttk.Button(top, text="Prev", command=self._browse_prev).pack(side="left", padx=(12, 2))
-        ttk.Button(top, text="Next", command=self._browse_next).pack(side="left", padx=2)
-
-        self._browse_page_lbl = ttk.Label(top, text="", style="M.TLabel")
-        self._browse_page_lbl.pack(side="left", padx=8)
-
-        ttk.Button(top, text="Export CSV", command=self._browse_export_csv).pack(side="right", padx=3)
-        ttk.Button(top, text="Export BLOBs", command=self._browse_export_blobs).pack(side="right", padx=3)
-
-        # Filter row: Column dropdown + filter entry
-        filt_f = ttk.Frame(bf)
-        filt_f.pack(fill="x", padx=8, pady=2)
-        ttk.Label(filt_f, text="Filter:").pack(side="left")
+        # Global filter: every word must occur in some column; the per-column filters are in
+        # the grid, under the column headers
+        top.add(ttk.Label(top, text="Filter all columns:"), gap=12)
         self._browse_filter_var = tk.StringVar()
+        self._browse_filter_entry = top.add(ttk.Entry(top, textvariable=self._browse_filter_var,
+                                                      width=24), stretch=True, gap=2)
+        add_placeholder(self._browse_filter_entry, self._browse_filter_var,
+                        "words, all must match", font=F["body"])
+        ToolTip(self._browse_filter_entry, "Keeps the rows where every word occurs in some "
+                                           "column. Each column has its own filter under its "
+                                           "header (? for the syntax).")
         self._browse_filter_var.trace_add("write", self._on_browse_filter)
-        self._browse_filter_entry = ttk.Entry(filt_f, textvariable=self._browse_filter_var, width=30)
-        self._browse_filter_entry.pack(side="left", padx=4, fill="x", expand=True)
-        ttk.Label(filt_f, text="in", style="M.TLabel").pack(side="left", padx=2)
-        self._browse_col_filter_var = tk.StringVar(value="All Columns")
-        self._browse_col_combo = ttk.Combobox(filt_f, textvariable=self._browse_col_filter_var,
-                                               values=["All Columns"], state="readonly", width=20)
-        self._browse_col_combo.pack(side="left", padx=4)
-        self._browse_col_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_browse_filter())
-        self._browse_display_rows = []
+        self._browse_filter_entry.bind(
+            "<Return>", lambda e: self._browse_grid.set_global_filter(
+                self._browse_filter_var.get(), apply=True))
+        self._browse_filter_help = top.add(ttk.Button(
+            top, text="?", width=2, style="Sm.TButton",
+            command=lambda: show_filter_help(self._browse_filter_help)), gap=2)
+        ToolTip(self._browse_filter_help, "The filter syntax: >5, 1~5, /regex/, NULL, !text, "
+                                          "%like%")
+        self._browse_inspector_var = tk.BooleanVar(value=False)
+        self._browse_inspector_cb = top.add(ttk.Checkbutton(
+            top, text="Row panel", variable=self._browse_inspector_var,
+            command=lambda: self._browse_grid.set_inspector(self._browse_inspector_var.get())),
+            gap=10)
+        self._browse_columns_btn = top.add(ttk.Button(
+            top, text="Columns…", command=lambda: self._browse_grid.column_chooser()), gap=6)
+        # every named limit (rows per window, positions mapped, characters drawn, ...)
+        top.add(ttk.Button(top, text="Limits…",
+                           command=lambda: self.datamap.limits_window(self)))
+        # one Export ▾: the rows, and the BLOBs as files only for a table that holds BLOBs
+        self._browse_export_btn = top.add(ttk.Button(
+            top, text="Export ▾", command=lambda: self._post_menu(
+                self._browse_export_menu(), self._browse_export_btn)), gap=6)
+        self._browse_blob_export = False
 
-        # Per-column filter row (populated dynamically when table loads)
-        self._col_filter_frame = tk.Frame(bf, bg=C["bg"])
-        self._col_filter_frame.pack(fill="x", padx=8, pady=(0, 0))
-        self._col_filters = {}  # col_name -> StringVar
-        self._col_filter_timer = None
+        # Engine notes for the rows on screen (why a table is empty or capped, columns that
+        # could not be computed, flagged rows): packed above the grid when there is one.
+        self._browse_note_lbl = tk.Label(bf, text="", anchor="w", justify="left",
+                                         bg=K["warning_soft"], fg=C["orange"], font=F["small"],
+                                         padx=8, pady=2, wraplength=1400)
+        self._browse_status = ttk.Label(bf, text="", style="M.TLabel", anchor="w")
+        self._browse_status.pack(side="bottom", fill="x", padx=10, pady=(0, 6))
+        self._browse_grid = DataGrid(
+            bf, frozen=1, on_open_row=self._on_browse_open_row,
+            on_open_blob=self._on_browse_open_blob, on_sort=self._on_browse_sorted,
+            on_filter=self._on_browse_filtered, on_view_change=self._on_browse_view,
+            describe=self._describe_value, row_style=self.tags.browse_row_style,
+            on_context_menu=self._on_browse_menu, on_header_menu=self._on_browse_header_menu)
+        self._browse_grid.pack(fill="both", expand=True, padx=8, pady=(2, 2))
+        # the Browse bar's 'Filter all columns' is the grid's search (not a second box)
+        self._browse_grid.use_search_box(SimpleNamespace(var=self._browse_filter_var,
+                                                         entry=self._browse_filter_entry))
+        # saved filters per table name: kept in the settings, so a filter saved on one
+        # database's 'message' table applies to another database's 'message' table too
+        self._browse_grid.saved_filters = (self._load_saved_filters, self._save_saved_filter)
+        self._browse_grid.filter_key = lambda: self._browse_table_var.get()
+        self._browse_grid.context = lambda: "%s, %s" % (
+            self._browse_table_var.get(), self.case.active.name) \
+            if self.case.active is not None else ""
+        # Counts of filtered rows run here, beside the grid's own window reads
+        self._browse_counter = Runner(self, "browse-count", release=self._release_worker_connection)
 
-        # PanedWindow
-        pw = ttk.PanedWindow(bf, orient="vertical")
-        pw.pack(fill="both", expand=True, padx=8, pady=4)
+    def _load_saved_filters(self, key):
+        """{name: filters} saved for a table name (any database)."""
+        store = self.tags.settings.get("saved_filters")
+        per = store.get(str(key)) if isinstance(store, dict) else None
+        return dict(per) if isinstance(per, dict) else {}
 
-        # TOP pane: bordered treeview container
-        tree_outer = tk.Frame(pw, bg=C["border"], bd=1, relief="solid")
-        pw.add(tree_outer, weight=3)
+    def _save_saved_filter(self, key, name, filters):
+        store = self.tags.settings.get("saved_filters")
+        if not isinstance(store, dict):
+            store = self.tags.settings["saved_filters"] = {}
+        per = store.setdefault(str(key), {})
+        if filters is None:
+            per.pop(name, None)
+        else:
+            per[name] = filters
+        if not per:
+            store.pop(str(key), None)
+        self.tags.save_settings()
 
-        tree_frame = ttk.Frame(tree_outer)
-        tree_frame.pack(fill="both", expand=True)
-
-        self._browse_tree = ttk.Treeview(tree_frame, show="headings", selectmode="browse")
-        bxsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self._browse_tree.xview)
-        bysb = ttk.Scrollbar(tree_frame, orient="vertical", command=self._browse_tree.yview)
-        self._browse_tree.configure(xscrollcommand=bxsb.set, yscrollcommand=bysb.set)
-        bysb.pack(side="right", fill="y")
-        bxsb.pack(side="bottom", fill="x")
-        self._browse_tree.pack(fill="both", expand=True)
-        self._browse_tree.bind("<<TreeviewSelect>>", self._on_browse_select)
-        self._browse_tree.bind("<Double-1>", self._on_browse_dblclick)
-        self._browse_tree.bind("<Return>", self._on_browse_dblclick)
-        TreeviewTooltip(self._browse_tree)
-
-        # BOTTOM pane: preview with border
-        preview_outer = tk.Frame(pw, bg=C["border"], bd=1, relief="solid")
-        pw.add(preview_outer, weight=1)
-
-        preview_frame = ttk.Frame(preview_outer)
-        preview_frame.pack(fill="both", expand=True)
-
-        # Row Preview header with copy buttons
-        prev_header = tk.Frame(preview_frame, bg=C["bg"])
-        prev_header.pack(fill="x", padx=4, pady=(4, 0))
-        ttk.Label(prev_header, text="Row Preview", style="B.TLabel").pack(side="left")
-
-        prev_btn_cfg = dict(font=("Segoe UI", 7), relief="flat", bd=0,
-                            cursor="hand2", padx=6, pady=1, bg=C["bg"],
-                            fg=C["accent"], activebackground=C["acl"])
-        tk.Button(prev_header, text="Copy JSON",
-                  command=self._preview_copy_json, **prev_btn_cfg).pack(side="right", padx=1)
-        tk.Button(prev_header, text="Copy CSV",
-                  command=self._preview_copy_csv, **prev_btn_cfg).pack(side="right", padx=1)
-        tk.Button(prev_header, text="Copy Text",
-                  command=self._preview_copy_text, **prev_btn_cfg).pack(side="right", padx=1)
-        tk.Label(prev_header, text="Copy:", font=("Segoe UI", 7),
-                 fg=C["text2"], bg=C["bg"]).pack(side="right", padx=(0, 2))
-
-        prev_canvas = tk.Canvas(preview_frame, bg=C["bg"], highlightthickness=0)
-        prev_sb = ttk.Scrollbar(preview_frame, orient="vertical", command=prev_canvas.yview)
-        self._preview_inner = ttk.Frame(prev_canvas)
-        self._preview_inner.bind("<Configure>",
-            lambda e: prev_canvas.configure(scrollregion=prev_canvas.bbox("all")))
-        prev_canvas.create_window((0, 0), window=self._preview_inner, anchor="nw")
-        prev_canvas.configure(yscrollcommand=prev_sb.set)
-        prev_sb.pack(side="right", fill="y")
-        prev_canvas.pack(fill="both", expand=True)
-        self._preview_canvas = prev_canvas
-        def _prev_scroll(e):
-            try:
-                prev_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-            except Exception:
-                pass
-        prev_canvas.bind("<MouseWheel>", _prev_scroll)
-        self._preview_inner.bind("<MouseWheel>", _prev_scroll)
-        self._preview_tk_imgs = []
-
-    def _load_browse_table(self, reset_offset=True):
+    def _load_browse_table(self):
+        """Show the table (or view, or 'WAL: name' WAL-only table) chosen in the combo."""
         tbl = self._browse_table_var.get()
-        if not tbl or not self.db.ok:
+        if not tbl or not self.db.ok or tbl == "---WAL-Only Tables---":
             return
-        # Skip separator item
-        if tbl == "---WAL-Only Tables---":
-            return
-        if reset_offset:
-            self._browse_offset = 0
-            self._browse_sort_col = None
-            self._browse_sort_dir = "ASC"
-        lim = int(self._browse_limit_var.get())
-
-        # WAL-only table browsing
+        self.tags.remember_view()       # the table shown until now keeps its widths and sort
+        self._browse_count_gen += 1
+        self._browse_counter.cancel()
+        running = self._browse_counter.running_thread()
+        if running is not None and self._browse_counter.running_key() == "blob-check":
+            self.db.interrupt(running)          # the BLOB check of the table shown until now
+        self._browse_count_error = ""
+        self._browse_t0 = time.perf_counter()
+        self._browse_first_ms = self._browse_first_range = None
+        self._browse_table_gen += 1
+        self._browse_wal_loading = None
+        self._browse_has_blobs = False
         if tbl.startswith("WAL: "):
-            real_name = tbl[5:]
-            cols, rows, total = self.db.wal_browse(real_name, lim, self._browse_offset)
-            self._browse_cache_cols = cols
-            self._browse_cache_data = rows
-            self._browse_filter_var.set("")
-            self._browse_col_combo.configure(values=["All Columns"] + cols)
-            self._browse_col_filter_var.set("All Columns")
-            self._display_browse_data(cols, rows)
-            page = self._browse_offset // lim + 1
-            row_start = self._browse_offset + 1
-            row_end = self._browse_offset + len(rows)
-            ncols = len(cols)
-            self._browse_page_lbl.configure(
-                text=f"Page {page}  |  Rows {row_start}-{row_end} of {total}  |  {ncols} columns  (WAL-only)")
-            return
-
-        cols, rows = self.db.browse(tbl, lim, self._browse_offset,
-                                     self._browse_sort_col, self._browse_sort_dir)
-        self._browse_cache_cols = cols
-        self._browse_cache_data = rows
+            # read on a worker: an empty grid with the table's columns until the records
+            # arrive, and the status says what is being read
+            src = ListSource(self.db.wal_browse_columns(tbl[5:]), [],
+                             encoding=self.db.encoding)
+            self._start_wal_only_load(tbl)
+        else:
+            known = self._count_cache.get(tbl)
+            src = TableSource(self.db, tbl, total=known if isinstance(known, int) else None)
+        self._browse_source = src
         self._browse_filter_var.set("")
-        # Update column filter dropdown
-        self._browse_col_combo.configure(values=["All Columns"] + cols)
-        self._browse_col_filter_var.set("All Columns")
-        self._display_browse_data(cols, rows)
+        self._show_browse_blob_export(self._browse_has_blob_columns())
+        self._browse_grid.set_source(src)
+        self.tags.restore_view(tbl)
+        self.relations.refresh_marks()      # the link glyph on columns with confident links
+        self._browse_dates.apply(tbl)
+        self._browse_lookups.apply(tbl)     # 'Show value from linked table' (after dates)
+        self._show_browse_note([], "")
+        self._start_browse_blob_check(tbl)  # queued first of all: it runs last
+        self._start_browse_positions()      # queued first: the (quick) count runs before it
+        self._start_browse_count()
+        self._update_browse_status()
 
-        cnt = self._count_cache.get(tbl, "?")
-        page = self._browse_offset // lim + 1
-        ncols = len([c for c in cols if c != "_rid"])
-        row_start = self._browse_offset + 1
-        row_end = self._browse_offset + len(rows)
-        self._browse_page_lbl.configure(
-            text=f"Page {page}  |  Rows {row_start}-{row_end} of {fmt_count(cnt)}  |  {ncols} columns")
+    def _start_browse_blob_check(self, tbl):
+        """Export BLOBs… is offered when the table holds BLOB values: at once for a column
+        declared BLOB (or with no type); otherwise a worker looks for a BLOB stored in any
+        column (a TEXT or INTEGER column may hold one) and brings the button up when it finds
+        one. WAL-only tables are checked when their records arrive."""
+        if tbl.startswith("WAL: ") or self._browse_has_blob_columns():
+            return
+        db, gen = self.db, self._browse_table_gen
 
-    def _display_browse_data(self, cols, rows):
-        tree = self._browse_tree
-        tree.delete(*tree.get_children())
+        def work():
+            return db.has_blob_values(tbl, cancel=lambda: gen != self._browse_table_gen)
 
-        if not cols:
-            tree.configure(columns=())
+        def done(found, _error):
+            if gen != self._browse_table_gen or db is not self.db or not found:
+                return
+            self._browse_has_blobs = True
+            self._show_browse_blob_export(True)
+        self._browse_counter.submit("blob-check", work, done)
+
+    def _start_wal_only_load(self, tbl):
+        """Read the records of the WAL-only table `tbl` ('WAL: name') off the Tk thread, then
+        show them. A later table choice (or closing the database) drops this read."""
+        db, gen = self.db, self._browse_table_gen
+        self._browse_wal_loading = tbl
+
+        def cancel():
+            return gen != self._browse_table_gen or db is not self.db
+
+        def work():
+            return db.wal_browse(tbl[5:], cancel=cancel)
+
+        def done(result, error):
+            if cancel() or self._browse_table_var.get() != tbl:
+                return
+            if error is not None:           # the status keeps saying so (loading stays set)
+                self._browse_count_error = "WAL records could not be read: %s" % error
+                self._update_browse_status()
+                return
+            self._browse_wal_loading = None
+            cols, rows, _total = result
+            src = ListSource(cols, [(r, r.flags) for r in rows], encoding=db.encoding)
+            self._browse_source = src
+            self._browse_grid.set_source(src)
+            self.tags.restore_view(tbl)
+            self._browse_dates.apply(tbl)
+            self._browse_lookups.apply(tbl)
+            self._show_browse_blob_export(self._browse_has_blob_columns())
+            self._update_browse_status()
+        self._browse_counter.submit("wal-load", work, done)
+
+    def _release_worker_connection(self):
+        """Runs on a worker thread that has no more work: close its SQL connection to every
+        open database (a worker may have read several of a case)."""
+        self.case.release_thread_connection()
+
+    def _start_browse_count(self):
+        """Count the rows of the Browse source for its current filter, off the Tk thread."""
+        src = self._browse_source
+        self._browse_count_gen += 1
+        gen = self._browse_count_gen
+        self._browse_count_error = ""
+        running = self._browse_counter.running_thread()
+        if running is not None and self._browse_counter.running_key() == "count":
+            self.db.interrupt(running)          # a count for an older filter: stop it
+        if src is None or src.row_count() is not None:
             return
 
-        tree.configure(columns=cols)
-        ncols = len(cols)
-        for c in cols:
-            tree.heading(c, text=c, command=lambda col=c: self._browse_sort(col))
+        def cancel():
+            return gen != self._browse_count_gen
 
-        # Auto-size columns
-        if not self._measure_font:
-            self._measure_font = tkfont.Font(family="Segoe UI", size=9)
-            self._measure_bold_font = tkfont.Font(family="Segoe UI", size=9, weight="bold")
-        mf = self._measure_font
-        bf = self._measure_bold_font
+        def done(result, error):
+            if gen != self._browse_count_gen or src is not self._browse_source:
+                return
+            if error is not None:
+                self._browse_count_error = str(error)
+            else:
+                flt, n = result
+                src.set_count(flt, n)
+                if flt is None and isinstance(src, TableSource):
+                    self._count_cache[src.table] = n
+                self._browse_grid.row_count_changed()
+            self._update_browse_status()
+        self._browse_counter.submit("count", lambda: src.count_rows(cancel), done)
 
-        if ncols <= 8:
-            max_w = 500
-        elif ncols <= 15:
-            max_w = 350
-        else:
-            max_w = 200
-
-        for ci, c in enumerate(cols):
-            hw = bf.measure(c) + 30
-            data_w = 60
-            for ri in range(min(50, len(rows))):
-                if ri < len(rows) and ci < len(rows[ri]):
-                    val = vb(rows[ri][ci])
-                    cw = mf.measure(str(val)[:60]) + 20
-                    data_w = max(data_w, cw)
-            # Header width is minimum - column must at least show full header name
-            w = max(hw, min(data_w, max_w))
-            if c == "_rid":
-                w = 72
-            tree.column(c, width=w, minwidth=hw, anchor="w")
-
-        # Rebuild per-column filter entries
-        for w in self._col_filter_frame.winfo_children():
-            w.destroy()
-        self._col_filters = {}
-        display_cols = [c for c in cols if c != "_rid"]
-        for col in display_cols:
-            var = tk.StringVar()
-            var.trace_add("write", lambda *a: self._schedule_col_filter())
-            e = tk.Entry(self._col_filter_frame, textvariable=var, font=("Segoe UI", 8),
-                         relief="solid", bd=1, bg="#fffff0")
-            e.pack(side="left", fill="x", expand=True, padx=0)
-            self._col_filters[col] = var
-
-        # Insert rows with alternating colors
-        self._display_browse_rows(rows)
-        self._browse_display_rows = rows
-
-    def _display_browse_rows(self, rows):
-        """Display rows in the browse treeview (used by both load and filter)."""
-        tree = self._browse_tree
-        tree.delete(*tree.get_children())
-        for i, row in enumerate(rows):
-            vals = [vb(v) for v in row]
-            tag = "odd" if i % 2 else "even"
-            tree.insert("", "end", values=vals, tags=(tag,))
-        tree.tag_configure("odd", background=C["alt"])
-        tree.tag_configure("even", background=C["bg"])
-
-    def _schedule_col_filter(self):
-        """Debounce per-column filter to avoid rapid re-queries."""
-        if self._col_filter_timer:
-            self.after_cancel(self._col_filter_timer)
-        self._col_filter_timer = self.after(400, self._apply_col_filter)
-
-    def _apply_col_filter(self):
-        """Filter browse data using per-column filters."""
-        self._col_filter_timer = None
-        filters = {col: var.get().strip()
-                   for col, var in self._col_filters.items() if var.get().strip()}
-        if not filters:
-            # No filters -- show original data
-            self._browse_display_rows = self._browse_cache_data
-            self._display_browse_rows(self._browse_cache_data)
-            tbl = self._browse_table_var.get()
-            lim = int(self._browse_limit_var.get())
-            cnt = self._count_cache.get(tbl, "?")
-            page = self._browse_offset // lim + 1
-            self._browse_page_lbl.configure(
-                text=f"Page {page}  |  {fmt_count(cnt)} rows total")
+    def _start_browse_positions(self):
+        """Index where the rows of the Browse view are (engine.positions), off the Tk thread,
+        so windows anywhere read in milliseconds. Runs on the count worker; a build for an
+        older table, sort or filter is stopped."""
+        src = self._browse_source
+        self._browse_pos_gen += 1
+        gen = self._browse_pos_gen
+        running = self._browse_counter.running_thread()
+        if running is not None and self._browse_counter.running_key() == "positions":
+            # the database the build reads (in a case, maybe not the active one any more)
+            (self._browse_pos_db or self.db).interrupt(running)
+        self._browse_pos_busy = False
+        if src is None or not hasattr(src, "build_positions"):
             return
+        self._browse_pos_busy = True
+        self._browse_pos_db = src.db    # each database of a case keeps its own indexes
 
-        tbl = self._browse_table_var.get()
-        is_wal = tbl.startswith("WAL: ")
+        def cancel():
+            return gen != self._browse_pos_gen
 
-        if is_wal:
-            # In-memory filter for WAL tables
-            cols = self._browse_cache_cols
-            matched = []
-            for row in self._browse_cache_data:
-                match = True
-                for col, term in filters.items():
-                    if col in cols:
-                        idx = cols.index(col)
-                        val = str(row[idx]) if idx < len(row) else ""
-                        if term.lower() not in val.lower():
-                            match = False
-                            break
-                if match:
-                    matched.append(row)
-            self._browse_display_rows = matched
-            self._display_browse_rows(matched)
-            self._browse_page_lbl.configure(
-                text=f"Column filter: {len(matched)} matches")
-        else:
-            # SQL filter for DB tables
-            cols = self._browse_cache_cols
-            where_parts = []
-            params = []
-            for col, term in filters.items():
-                escaped = _le(term)
-                where_parts.append(f"CAST({_q(col)} AS TEXT) LIKE ? ESCAPE '\\'")
-                params.append(f"%{escaped}%")
-            try:
-                sql = (f"SELECT rowid AS _rid, * FROM {_q(tbl)} "
-                       f"WHERE {' AND '.join(where_parts)} LIMIT 1000")
-                rows = self.db._search_conn.execute(sql, params).fetchall()
-                self._browse_display_rows = rows
-                self._display_browse_rows(rows)
-                self._browse_page_lbl.configure(
-                    text=f"Column filter: {len(rows)} matches (max 1000)")
-            except Exception:
-                pass
+        def done(_result, error):
+            if gen != self._browse_pos_gen:
+                return
+            self._browse_pos_busy = False     # an error only leaves windows read as before
+            if error is None and self._browse_grid.waiting():
+                # a jump far into the view is still read the slow way: read it again
+                # through the index just built
+                self._browse_grid.restart_reads()
+            self._update_browse_status()
+        self._browse_counter.submit("positions", lambda: src.build_positions(cancel), done)
 
-    def _browse_sort(self, col):
-        if col == self._browse_sort_col:
-            self._browse_sort_dir = "DESC" if self._browse_sort_dir == "ASC" else "ASC"
-        else:
-            self._browse_sort_col = col
-            self._browse_sort_dir = "ASC"
-        self._load_browse_table(reset_offset=False)
+    def _show_browse_note(self, rows, note="", keep_space=False):
+        """Show the engine's note and a count of flagged rows among `rows` (objects with a
+        .flags set); hidden when there is none. keep_space: while scrolling, a note that goes
+        away leaves its line empty instead of making the grid jump."""
+        text = " | ".join(t for t in (note, flag_summary(rows)) if t)
+        lbl = self._browse_note_lbl
+        if text:
+            lbl.configure(text="⚠ " + text, bg=K["warning_soft"])
+            if not lbl.winfo_manager():
+                lbl.pack(fill="x", padx=8, pady=(0, 2), before=self._browse_grid)
+        elif lbl.winfo_manager():
+            if keep_space:
+                lbl.configure(text="", bg=C["bg"])
+            else:
+                lbl.pack_forget()
 
-    def _browse_prev(self):
-        lim = int(self._browse_limit_var.get())
-        self._browse_offset = max(0, self._browse_offset - lim)
-        self._load_browse_table(reset_offset=False)
-
-    def _browse_next(self):
-        lim = int(self._browse_limit_var.get())
-        tbl = self._browse_table_var.get()
-        cnt = _int_count(self._count_cache.get(tbl, 0))
-        if self._browse_offset + lim >= cnt:
+    def _on_browse_view(self, grid):
+        """The grid shows other rows or new data: refresh the note and the status line."""
+        src = self._browse_source
+        if src is None:
             return
-        self._browse_offset += lim
-        self._load_browse_table(reset_offset=False)
+        rows = [SimpleNamespace(flags=flags) for _values, flags in grid.visible_rows_data()]
+        note = src.note
+        if grid.load_error:
+            note = "; ".join(t for t in (note, "rows could not be read: " + grid.load_error) if t)
+        self._show_browse_note(rows, note, keep_space=True)
+        if self._browse_first_ms is None and self._browse_t0 is not None \
+                and not self._browse_wal_loading \
+                and (rows or grid.row_count_exact()) and not grid.loading():
+            self._browse_first_ms = (time.perf_counter() - self._browse_t0) * 1000
+            self._browse_first_range = grid.target_row_range()
+        elif self._browse_first_ms is not None \
+                and grid.target_row_range() != self._browse_first_range:
+            self._browse_forget_first_time()       # it timed other rows: no longer said
+        self._update_browse_status()
+
+    def _schedule_browse_status(self):
+        """While rows are being read, the status line says so again each second."""
+        if getattr(self, "_browse_status_after", None) is None:
+            def tick():
+                self._browse_status_after = None
+                self._update_browse_status()
+            self._browse_status_after = self.after(1000, tick)
+
+    def _browse_forget_first_time(self):
+        """The 'opened in N ms' time describes the first rows of the table as opened; once
+        the view scrolls, sorts or filters it is left out."""
+        self._browse_t0 = self._browse_first_ms = self._browse_first_range = None
+
+    def _on_browse_filtered(self, _col_exprs, _global_text):
+        self._browse_forget_first_time()
+        self._start_browse_positions()
+        self._start_browse_count()
+        self._update_browse_status()
+
+    def _on_browse_sorted(self, _column, _desc):
+        self._browse_forget_first_time()
+        self._start_browse_positions()
+        self._update_browse_status()
 
     def _on_browse_filter(self, *args):
-        if self._browse_filter_after:
-            self.after_cancel(self._browse_filter_after)
-        self._browse_filter_after = self.after(200, self._apply_browse_filter)
+        self._browse_grid.set_global_filter(self._browse_filter_var.get())
 
-    def _apply_browse_filter(self):
-        """Filter browse rows by text, optionally restricted to a specific column.
+    def _browse_clear_filters(self):
+        self._browse_filter_var.set("")
+        self._browse_grid.clear_filters()
 
-        For regular tables, runs a SQL query against the full table for accurate
-        results across all pages. For WAL tables, filters in-memory.
-        """
-        filt = self._browse_filter_var.get().lower().strip()
-        cols = self._browse_cache_cols
-        rows = self._browse_cache_data
-        col_sel = self._browse_col_filter_var.get()
-        if not filt:
-            self._display_browse_data(cols, rows)
+    def _update_browse_status(self):
+        src, g = self._browse_source, self._browse_grid
+        if src is None:
+            self._browse_status.configure(text="")
             return
-
-        tbl = self._browse_table_var.get()
-
-        # WAL tables: filter in-memory only
-        if tbl.startswith("WAL: "):
-            self._apply_browse_filter_inmemory(filt, cols, rows, col_sel)
-            return
-
-        # Regular tables: run SQL LIKE query against the full table
-        if self.db.ok and tbl and tbl != "---WAL-Only Tables---":
-            try:
-                real_cols = [c for c in cols if c != "_rid"]
-                escaped = _le(filt)
-                if col_sel != "All Columns" and col_sel in real_cols:
-                    where = f"CAST({_q(col_sel)} AS TEXT) LIKE ? ESCAPE '\\'"
-                    params = [f"%{escaped}%"]
-                else:
-                    clauses = [f"CAST({_q(c)} AS TEXT) LIKE ? ESCAPE '\\'"
-                               for c in real_cols]
-                    where = " OR ".join(clauses)
-                    params = [f"%{escaped}%"] * len(real_cols)
-                sql = (f"SELECT rowid AS _rid, * FROM {_q(tbl)} "
-                       f"WHERE {where} LIMIT 1000")
-                cur = self.db._conn.execute(sql, params)
-                col_descs = [d[0] for d in cur.description]
-                result_rows = [list(r) for r in cur.fetchall()]
-                if result_rows:
-                    self._display_browse_data(col_descs, result_rows)
-                    return
-            except Exception:
-                pass  # Fall back to in-memory filter
-
-        # Fallback: in-memory filter of loaded data
-        self._apply_browse_filter_inmemory(filt, cols, rows, col_sel)
-
-    def _apply_browse_filter_inmemory(self, filt, cols, rows, col_sel):
-        """Filter browse rows in-memory by text."""
-        col_idx = None
-        if col_sel != "All Columns":
-            try:
-                col_idx = cols.index(col_sel)
-            except ValueError:
-                pass
-        filtered = []
-        for row in rows:
-            if col_idx is not None:
-                if col_idx < len(row) and filt in str(vb(row[col_idx])).lower():
-                    filtered.append(row)
+        parts = []
+        if self.case.multi:             # which database the rows are read from
+            parts.append(self.member_label(self.case.active, self._browse_table_var.get()))
+        n = src.row_count()
+        if self._browse_wal_loading:
+            parts.append("reading the WAL records of %s…" % self._browse_wal_loading[5:]
+                         if not self._browse_count_error else self._browse_count_error)
+            n = -1
+        if n == -1:
+            pass
+        elif n is None:
+            approx = self._count_cache.get(getattr(src, "table", None))
+            about = (" (about %s)" % fmt_count(approx)[1:]) \
+                if isinstance(approx, str) and approx.startswith("~") and not src.filtered else ""
+            parts.append("counting rows…" + about if not self._browse_count_error
+                         else "row count failed: %s" % self._browse_count_error)
+        else:
+            text = "%s rows" % format(n, ",")
+            if src.filtered:
+                text += (" (filtered from %s)" % format(src.total, ",")) \
+                    if src.total is not None else " (filtered)"
+            parts.append(text)
+        first, end = g.target_row_range()
+        if end > first:
+            if g.waiting():
+                # rows far into a sorted or filtered view: say what is read and for how long
+                secs = g.waiting_seconds()
+                parts.append("reading rows %s–%s ⟳%s" % (
+                    format(first + 1, ","), format(end, ","),
+                    (" %d s%s" % (secs, ", faster once the rows are indexed"
+                                  if self._browse_pos_busy else "")) if secs >= 1 else ""))
+                self._schedule_browse_status()
             else:
-                for v in row:
-                    if filt in str(vb(v)).lower():
-                        filtered.append(row)
-                        break
-        self._display_browse_data(cols, filtered)
+                parts.append("showing %s–%s" % (format(first + 1, ","), format(end, ",")))
+        if self._browse_pos_busy:
+            parts.append("indexing rows for fast scrolling…")
+        if g.notice:
+            parts.append(g.notice)
+        total_cols = len(g.columns()) - 1
+        hidden = len(g.hidden_columns())
+        parts.append("%d columns%s" % (total_cols, (" (%d hidden)" % hidden) if hidden else ""))
+        name, desc = g.sort_state()
+        if name:
+            parts.append("sorted by %s %s" % ("row order" if name == "_rid" else name,
+                                              "▼" if desc else "▲"))
+        bad = g.filter_errors()
+        if bad:
+            parts.append("filter not used for %s (hover it for why)" % ", ".join(sorted(bad)))
+        if isinstance(src, ListSource):
+            parts.append("WAL-only table")
+        if self._browse_lookups.last_note:     # a saved lookup that cannot be shown now
+            parts.append("linked values not shown: " + self._browse_lookups.last_note)
+        if self._browse_first_ms is not None:     # only while the rows it timed are shown
+            parts.append("opened in %s ms" % format(int(self._browse_first_ms), ","))
+        self._browse_status.configure(text="  |  ".join(parts))
 
-    def _on_browse_select(self, event):
-        sel = self._browse_tree.selection()
-        if not sel:
-            return
-        vals = self._browse_tree.item(sel[0], "values")
-        cols = self._browse_cache_cols
-        if not vals or not cols:
-            return
+    @staticmethod
+    def _describe_value(v):
+        """Timestamp readings of a number, for the row inspector's Decoded column (the one
+        decoder, engine.decode.timestamps)."""
+        found = timestamps.readings(v)
+        return "; ".join("%s: %s" % (label, when) for _k, label, when in found[:2])
 
-        # Clear preview
-        for w in self._preview_inner.winfo_children():
-            w.destroy()
-        self._preview_tk_imgs = []
-
-        # Get actual data from display rows
-        idx = self._browse_tree.index(sel[0])
-        display_rows = getattr(self, '_browse_display_rows', self._browse_cache_data)
-        if idx >= len(display_rows):
-            return
-        actual_row = display_rows[idx]
-
-        for i, c in enumerate(cols):
-            v = actual_row[i] if i < len(actual_row) else None
-            bg = C["bg"] if i % 2 == 0 else C["alt"]
-            row_f = tk.Frame(self._preview_inner, bg=bg)
-            row_f.pack(fill="x", padx=2, pady=1)
-
-            tk.Label(row_f, text=c, font=("Segoe UI", 9, "bold"),
-                     fg=C["accent"], bg=bg, width=18, anchor="nw").pack(side="left", padx=4, pady=2)
-
-            if v is None:
-                tk.Label(row_f, text="NULL", fg=C["text2"], bg=bg,
-                         font=("Segoe UI", 9, "italic")).pack(side="left", padx=4)
-            elif isinstance(v, bytes):
-                bt = blob_type(v)
-                tk.Label(row_f, text=f"{bt} ({fmtb(len(v))})",
-                         fg=C["orange"], bg=bg, font=("Segoe UI", 9, "bold")).pack(side="left", padx=4)
-                tk.Button(row_f, text="View BLOB", font=("Segoe UI", 7),
-                          command=lambda bv=v, cn=c: BlobViewer(self, bv, cn)).pack(side="left", padx=4)
-            else:
-                sv = str(v)
-                display = sv[:500] if len(sv) > 500 else sv
-                tk.Label(row_f, text=display, fg=C["text"], bg=bg,
-                         wraplength=500, justify="left", anchor="nw").pack(side="left", padx=4)
-                # Timestamp
-                if isinstance(v, (int, float)):
-                    ts = try_decode_timestamp(v)
-                    if ts:
-                        for fmt_name, decoded in ts:
-                            tk.Label(row_f, text=f"{fmt_name}: {decoded}",
-                                     fg=C["green"], bg=bg, font=("Segoe UI", 8)).pack(side="left", padx=8)
-
-        # Store for copy
-        self._preview_row_cols = cols
-        self._preview_row_data = actual_row
-
-        # Bind scroll to all preview children
-        def _bind_prev_scroll(w):
-            w.bind("<MouseWheel>", lambda e: self._preview_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
-            for child in w.winfo_children():
-                _bind_prev_scroll(child)
-        _bind_prev_scroll(self._preview_inner)
-
-    def _preview_copy_json(self):
-        """Copy the currently previewed browse row as JSON."""
-        cols = getattr(self, '_preview_row_cols', None)
-        data = getattr(self, '_preview_row_data', None)
-        if not cols or not data:
-            return
-        d = {}
-        for i, c in enumerate(cols):
-            if c == "_rid":
-                continue
-            v = data[i] if i < len(data) else None
-            d[c] = str(v) if isinstance(v, bytes) else v
-        self.clipboard_clear()
-        self.clipboard_append(json.dumps(d, indent=2, default=str))
-
-    def _preview_copy_csv(self):
-        """Copy the currently previewed browse row as CSV."""
-        import io
-        cols = getattr(self, '_preview_row_cols', None)
-        data = getattr(self, '_preview_row_data', None)
-        if not cols or not data:
-            return
-        real_cols = [c for c in cols if c != "_rid"]
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(real_cols)
-        vals = []
-        for i, c in enumerate(cols):
-            if c == "_rid":
-                continue
-            v = data[i] if i < len(data) else None
-            vals.append(str(v) if isinstance(v, bytes) else v)
-        w.writerow(vals)
-        self.clipboard_clear()
-        self.clipboard_append(buf.getvalue())
-
-    def _preview_copy_text(self):
-        """Copy the currently previewed browse row as plain text."""
-        cols = getattr(self, '_preview_row_cols', None)
-        data = getattr(self, '_preview_row_data', None)
-        if not cols or not data:
-            return
-        lines = []
-        for i, c in enumerate(cols):
-            if c == "_rid":
-                continue
-            v = data[i] if i < len(data) else None
-            lines.append(f"{c}: {v}")
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(lines))
-
-    def _on_browse_dblclick(self, event):
-        sel = self._browse_tree.selection()
-        if not sel:
-            return
+    def _on_browse_open_row(self, _row, values):
         tbl = self._browse_table_var.get()
-        vals = self._browse_tree.item(sel[0], "values")
-        cols = self._browse_cache_cols
-        if not vals or not cols or "_rid" not in cols:
+        if not values:
             return
-        rid_idx = cols.index("_rid")
-        try:
-            rid = int(vals[rid_idx])
-        except (ValueError, TypeError, IndexError):
-            return
-        # WAL-only tables: use WAL row detail instead of SQL-based RowWin
+        loc = values[0]
+        # WAL-only tables: the record from its own frame (the row says which)
         if tbl.startswith("WAL: ") and self.db.has_wal:
-            real_name = tbl[5:]
-            for rec in self.db.wal.recover_all_records(table_filter=real_name):
-                if rec["rowid"] == rid:
-                    status_map = {"committed": "In DB", "uncommitted": "WAL Only", "old": "Older Version"}
-                    src = f"WAL ({status_map.get(rec['category'], rec['category'])})"
-                    self._show_wal_row_detail(
-                        source=src, table=real_name,
-                        match_col="", rowid=rid, match_val="",
-                        row_data=rec.get("values_dict", {}),
-                        frame_idx=rec["frame_idx"],
-                        page_num=rec["page_num"])
+            cols = self._browse_source.columns() if self._browse_source is not None else []
+            frame = values[cols.index("_wal_frame")] if "_wal_frame" in cols else None
+            for rec in (self.db.wal.records_of_frame(frame) if isinstance(frame, int) else ()):
+                if rec["locator"] == loc:
+                    open_wal_record(self, rec)
                     return
         else:
-            RowWin.show(self, self.db, tbl, rid)
+            RowWin.show(self, self.db, tbl, loc)
 
-    def _browse_export_csv(self):
+    def _on_browse_open_blob(self, row, column, value):
+        data = self._browse_grid.row_data(row)
+        where = " row %s" % data[0][0] if data and data[0] else ""
+        BlobViewer(self, value, column, "%s.%s%s" % (
+            self.member_label(self.case.active, self._browse_table_var.get()), column, where))
+
+    def _on_browse_menu(self, menu, row, col):
+        """Browse grid right-click: the row's history, then the Tag items."""
+        tbl = self._browse_table_var.get()
+        data = self._browse_grid.row_data(row)
+        loc = data[0][0] if data and data[0] else None
+        if getattr(loc, "kind", None) in ("rowid", "pk") and tbl in self.db.tables():
+            menu.add_separator()
+            menu.add_command(label="Row history (every version)",
+                             command=lambda: self.show_row_history(tbl, loc))
+            self.datamap.browse_menu(menu, tbl, row)
+        self.relations.browse_menu(menu, tbl, data, col)
+        self.tags.browse_menu(menu, row, col)
+
+    def _on_browse_header_menu(self, menu, c):
+        self._browse_dates.header_menu(menu, c)
+        self._browse_lookups.header_menu(menu, c)
+        self.relations.header_menu(menu, self._browse_table_var.get(), c)
+
+    # ── Column relationships (relations_view) ────────────────────────
+    def show_column_relations(self, table, column):
+        """Open the map of the columns related to table.column."""
+        return self.relations.column_map(table, column) if self.db.ok else None
+
+    def browse_table(self, table):
+        """Show a table of the active database in Browse."""
+        self._nb.select(self._browse_frame)
+        self._browse_table_var.set(table)
+        self._load_browse_table()
+
+    def browse_related(self, table, column, value):
+        """Show the rows of table whose column equals value in Browse (a filter on the
+        column; for the rowid, the row itself in its row detail)."""
+        self.browse_table(table)
+        if column is ROWID:
+            RowWin.show(self, self.db, table, Locator("rowid", value))
+            return
+        expr = value_expr(value)
+        cols = self._browse_grid.columns()
+        if expr is None or column not in cols:
+            return
+        c = cols.index(column)
+        if c in self._browse_grid.hidden_columns():
+            self._browse_grid.show_column(c)
+        self._browse_grid.set_filter_text(c, expr)
+
+    def open_blob(self, value, column, context=""):
+        """Open the BLOB inspector for a value from any tab."""
+        BlobViewer(self, bytes(value), column, context)
+
+    def show_row_history(self, table, key):
+        """Show every version of a row (main file, WAL frames, journal) in the Forensics tab."""
+        self._nb.select(self._forensics)
+        self._forensics.show_history(table, key)
+
+    def _browse_label(self):
+        """'table' (or 'db › table' in a case) of the Browse view, for titles and exports."""
+        return self.member_label(self.case.active, self._browse_table_var.get())
+
+    def _browse_filters_text(self):
+        """The Browse filters in words (for an export's provenance), '' when none."""
+        g = self._browse_grid
+        parts = ["%s: %s" % kv for kv in sorted(g.filter_texts().items())]
+        glob = self._browse_filter_var.get().strip()
+        if glob:
+            parts.insert(0, "words: %s" % glob)
+        name, desc = g.sort_state()
+        if name:
+            parts.append("sorted by %s %s" % ("row order" if name == "_rid" else name,
+                                              "descending" if desc else "ascending"))
+        return "; ".join(parts)
+
+    def _browse_export_menu(self):
+        """Browse › Export ▾: the rows (CSV or JSON) and, when the table holds BLOBs, the
+        BLOBs as files."""
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Rows (CSV or JSON)…", command=self._browse_export)
+        m.add_command(label="Tables (CSV)…", command=self._browse_export_tables)
+        if self._browse_blob_export:
+            m.add_command(label="BLOBs as files…", command=self._browse_export_blobs)
+        return m
+
+    def _show_browse_blob_export(self, on):
+        self._browse_blob_export = bool(on)
+
+    def _browse_has_blob_columns(self):
+        """True when the Browse table has BLOBs to export: a column declared BLOB (or with no
+        type), BLOB values found in another column (_start_browse_blob_check), or for a
+        WAL-only table, BLOB values among its records."""
         tbl = self._browse_table_var.get()
         if not tbl or not self.db.ok:
-            return
-        is_wal = tbl.startswith("WAL: ")
-        real_name = tbl[5:] if is_wal else tbl
-        loaded_rows = self._browse_cache_data
-        display_rows = getattr(self, '_browse_display_rows', loaded_rows)
-        total_count = _int_count(self._count_cache.get(tbl, 0), len(loaded_rows))
-        # Scope dialog
-        dlg = tk.Toplevel(self)
-        dlg.title("Export CSV")
-        dlg.configure(bg=C["bg"])
-        dlg.transient(self)
-        dlg.grab_set()
-        dlg.update_idletasks()
-        _dw, _dh = 340, 180
-        dlg.geometry(f"{_dw}x{_dh}+{self.winfo_rootx() + (self.winfo_width() - _dw) // 2}+{self.winfo_rooty() + (self.winfo_height() - _dh) // 2}")
-        result = [None]
-        tk.Label(dlg, text="What to export?", font=("Segoe UI", 10, "bold"),
-                 bg=C["bg"], fg=C["text"]).pack(pady=(12, 8))
-        bf = tk.Frame(dlg, bg=C["bg"])
-        bf.pack(fill="x", padx=20)
-        btn_cfg = dict(font=("Segoe UI", 9), relief="flat", bd=0, padx=12, pady=5, cursor="hand2")
-        def pick(which):
-            result[0] = which
-            dlg.destroy()
-        tk.Button(bf, text=f"All Rows ({total_count})", bg=C["acl"], fg=C["accent"],
-                  command=lambda: pick("all"), **btn_cfg).pack(fill="x", pady=2)
-        tk.Button(bf, text=f"Loaded Page ({len(loaded_rows)})", bg=C["bg2"], fg=C["text"],
-                  command=lambda: pick("loaded"), **btn_cfg).pack(fill="x", pady=2)
-        if len(display_rows) != len(loaded_rows):
-            tk.Button(bf, text=f"Filtered ({len(display_rows)})", bg="#e3fcef", fg=C["green"],
-                      command=lambda: pick("filtered"), **btn_cfg).pack(fill="x", pady=2)
-        tk.Button(bf, text="Cancel", bg=C["bg3"], fg=C["text2"],
-                  command=dlg.destroy, **btn_cfg).pack(fill="x", pady=2)
-        self.wait_window(dlg)
-        if result[0] is None:
-            return
-        fname = real_name if is_wal else tbl
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                             initialfile=f"{fname}.csv",
-                                             filetypes=[("CSV", "*.csv")])
-        if not path:
-            return
+            return False
+        if self._browse_has_blobs:
+            return True
+        if tbl.startswith("WAL: "):
+            src = self._browse_source
+            return src is not None and any(
+                isinstance(v, (bytes, bytearray)) for row in src.iter_all() for v in row[1:])
         try:
-            cols = self._browse_cache_cols
-            if result[0] == "all":
-                if is_wal:
-                    # Export all WAL records for this table
-                    all_cols, all_rows, _ = self.db.wal_browse(real_name, limit=999999, offset=0)
-                    cols = all_cols
-                    rows = all_rows
-                else:
-                    # Query full table from DB
-                    rows = []
-                    try:
-                        cur = self.db._conn.execute(f"SELECT * FROM {_q(tbl)}")
-                        db_cols = [d[0] for d in cur.description]
-                        cols = ["_rid"] + db_cols
-                        for row in cur:
-                            rows.append([row[db_cols.index(c)] if c in db_cols else "" for c in db_cols])
-                    except Exception as e2:
-                        messagebox.showerror("Error", f"Query failed: {e2}")
-                        return
-            elif result[0] == "filtered":
-                rows = display_rows
-            else:
-                rows = loaded_rows
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(cols)
-                for row in rows:
-                    w.writerow([vb(v) for v in row])
-            messagebox.showinfo("Exported", f"Exported {len(rows)} rows to:\n{os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+            types = [(t or "").upper() for _n, t in self.db.columns(tbl)]
+        except Exception:               # noqa: BLE001 - a view or odd table: offer it
+            return True
+        return any(t == "" or "BLOB" in t for t in types)
 
-    def _browse_export_blobs(self):
+    def _browse_export(self, fmt=None):
+        """Export the rows passing the Browse filters (all of them, in the grid's order, not
+        only those on screen) or the selected rows, to CSV or JSON, on a worker thread with
+        progress and Stop, with the provenance (evidence SHA-256, filters) in a manifest."""
+        src, g = self._browse_source, self._browse_grid
         tbl = self._browse_table_var.get()
-        if not tbl or not self.db.ok:
+        if src is None or not self.db.ok:
             return
-        # Scope selection dialog
-        total_rows = _int_count(self._count_cache.get(tbl, 0), len(self._browse_cache_data))
-        loaded = len(self._browse_cache_data)
-        dlg = tk.Toplevel(self)
-        dlg.title("Export BLOBs")
-        dlg.configure(bg=C["bg"])
-        dlg.transient(self)
-        dlg.grab_set()
-        # Center on parent window
-        dlg.update_idletasks()
-        pw, ph = self.winfo_width(), self.winfo_height()
-        px, py = self.winfo_rootx(), self.winfo_rooty()
-        dw, dh = 340, 200
-        x = px + (pw - dw) // 2
-        y = py + (ph - dh) // 2
-        dlg.geometry(f"{dw}x{dh}+{x}+{y}")
-        result = [None]
-        tk.Label(dlg, text="Export BLOBs from:", font=("Segoe UI", 10, "bold"),
-                 bg=C["bg"], fg=C["text"]).pack(pady=(12, 8))
-        bf = tk.Frame(dlg, bg=C["bg"])
-        bf.pack(fill="x", padx=20)
-        btn_cfg = dict(font=("Segoe UI", 9), relief="flat", bd=0, padx=12, pady=5, cursor="hand2")
-        def pick(w):
-            result[0] = w
-            dlg.destroy()
-        tk.Button(bf, text=f"All Rows in Table ({fmt_count(total_rows)})", bg=C["acl"], fg=C["accent"],
-                  command=lambda: pick("all"), **btn_cfg).pack(fill="x", pady=2)
-        tk.Button(bf, text=f"Loaded Page ({loaded})", bg="#e3fcef", fg=C["green"],
-                  command=lambda: pick("loaded"), **btn_cfg).pack(fill="x", pady=2)
-        tk.Button(bf, text="Cancel", bg=C["bg3"], fg=C["text2"],
-                  command=dlg.destroy, **btn_cfg).pack(fill="x", pady=2)
-        self.wait_window(dlg)
-        if result[0] is None:
+        n = src.row_count()
+        count = format(n, ",") if n is not None else "counting…"
+        scopes = [("rows", ("Rows the filters keep (%s)" if src.filtered else "All rows (%s)")
+                   % count)]
+        sel = g.selected_rows()
+        if sel is not None and sel[1] > sel[0]:
+            scopes.append(("selected", "Selected rows (%s)" % format(sel[1] - sel[0] + 1, ",")))
+        opts = export_options(self, "Export %s" % self._browse_label(), scopes, fmt=fmt,
+                              hidden=bool(g.hidden_columns()), spreadsheet_safe=True,
+                              note="Values are written as stored (a column shown as a date "
+                                   "or a linked value keeps its raw value; the linked value "
+                                   "gets a column of its own).")
+        if opts is None:
             return
-        folder = filedialog.askdirectory(title="Select folder for BLOBs")
+        fmt, which = opts["fmt"], opts["scope"]
+        real_name = tbl[5:] if tbl.startswith("WAL: ") else tbl
+        path = ask_path(self, fmt, safe_filename(real_name))
+        if not write_allowed(path):
+            return
+        cols = src.columns()
+        keep = [i for i in range(len(cols))
+                if not (opts["skip_hidden"] and i in g.hidden_columns())]
+        names = [cols[i] for i in keep]
+        # a column shown with a linked value keeps its raw values; the looked-up ones go in
+        # a column of their own, named '<column> → <db › table.column>'
+        extra = self._browse_lookups.export_columns(names)
+        raw_n = len(names)
+        names = names + [nm for _i, nm, _lk in extra]
+        win = limits.get("grid_window_rows")
+
+        def rows_fn():
+            if which == "selected":
+                lo, hi = sel
+
+                def gen():
+                    r = lo
+                    while r <= hi:
+                        got = src.rows(r, min(win, hi - r + 1))
+                        if not got:
+                            return
+                        for values, _flags in got:
+                            yield values
+                        r += len(got)
+                source_rows = gen()
+            else:
+                source_rows = src.iter_rows()
+            for row in source_rows:
+                vals = [row[i] if i < len(row) else None for i in keep]
+                for i, _nm, lk in extra:
+                    hit = lk.value(vals[i]) if i < raw_n else None
+                    vals.append(hit[0] if hit is not None else None)
+                yield vals
+        total = (sel[1] - sel[0] + 1) if which == "selected" else n
+        source = "Browse %s '%s' (%s)" % (
+            "WAL-only table" if tbl.startswith("WAL: ") else "table", real_name,
+            "rows from WAL frames" if tbl.startswith("WAL: ") else
+            ("DB, WAL applied" if self.db.has_wal and self.db.session.sql_sees_current_state
+             else "DB"))
+        export_rows(self, "Export %s" % self._browse_label(), path, fmt, names, rows_fn,
+                    source, [self.case.active], scope=dict(scopes).get(which, which),
+                    filters=self._browse_filters_text(), blob_mode=opts["blob_mode"],
+                    total=total, spreadsheet_safe=opts.get("spreadsheet_safe", True))
+
+    def _browse_export_tables(self):
+        """Every ticked table as its own CSV in a folder (delimiter, encoding and BLOB
+        handling chosen up front), on a worker thread with progress and Stop; each table
+        gets its own manifest next to its CSV."""
+        if not self.db.ok:
+            return
+        session = self.db.session
+        tables = session.tables()
+        if not tables:
+            self.status("No tables to export.")
+            return
+        # the quick estimate (max rowid; an exact count already made is used): a COUNT(*) of
+        # every table here would freeze the window on a big database
+        counts = []
+        for t in tables:
+            known = self._count_cache.get(t)
+            n = known if isinstance(known, int) else self.db.approx_count(t)
+            counts.append((t, n))
+        opts = multi_table_options(self, counts)
+        if opts is None:
+            return
+        from tkinter import filedialog
+        folder = filedialog.askdirectory(parent=self, title="Folder for the exported tables",
+                                         mustexist=False)
         if not folder:
             return
-        # Find BLOB-type columns
-        col_info = self.db.columns(tbl)
-        blob_col_names = [c[0] for c in col_info if c[1] and "BLOB" in c[1].upper()]
-        if not blob_col_names and result[0] == "all":
-            # Fallback: check loaded data for bytes
-            blob_col_names = []
-            cols = self._browse_cache_cols
-            for ri, row in enumerate(self._browse_cache_data[:5]):
-                for ci, v in enumerate(row):
-                    if isinstance(v, bytes) and ci < len(cols) and cols[ci] not in blob_col_names:
-                        blob_col_names.append(cols[ci])
-        # Progress dialog — centered on parent
-        prog_dlg = tk.Toplevel(self)
-        prog_dlg.title("Exporting BLOBs...")
-        prog_dlg.configure(bg=C["bg"])
-        prog_dlg.update_idletasks()
-        pdw, pdh = 350, 100
-        px2 = self.winfo_rootx() + (self.winfo_width() - pdw) // 2
-        py2 = self.winfo_rooty() + (self.winfo_height() - pdh) // 2
-        prog_dlg.geometry(f"{pdw}x{pdh}+{px2}+{py2}")
-        prog_lbl = tk.Label(prog_dlg, text="Starting export...", bg=C["bg"], font=("Segoe UI", 9))
-        prog_lbl.pack(pady=(10, 5))
-        prog_bar = ttk.Progressbar(prog_dlg, mode="determinate")
-        prog_bar.pack(fill="x", padx=20, pady=5)
-        self.update_idletasks()
-        count = 0
-        errors = 0
-        if result[0] == "loaded":
-            # Export from loaded page data
-            cols = self._browse_cache_cols
-            rows = self._browse_cache_data
-            prog_bar.configure(maximum=max(len(rows), 1))
-            for ri, row in enumerate(rows):
-                for ci, v in enumerate(row):
-                    if isinstance(v, bytes) and len(v) > 0:
-                        bt = blob_type(v)
-                        ext = _EXT_MAP.get(bt, ".bin")
-                        cn = cols[ci] if ci < len(cols) else f"col{ci}"
-                        fname = f"{tbl}_r{ri}_{cn}{ext}"
+        from utils import safe_filename
+        picked = opts["tables"]
+        delim, enc, blob_mode = opts["delimiter"], opts["encoding"], opts["blob_mode"]
+        safe = opts["spreadsheet_safe"]
+
+        def work(job):
+            job.status = "Reading the evidence hashes\u2026"
+            records = evidence_records([self.case.active], lambda: job.cancelled,
+                                            lambda t: setattr(job, "status", t))
+            if job.cancelled:
+                return None
+            written = []
+            used_paths = set()
+            for ti, t in enumerate(picked):
+                if job.cancelled:
+                    break
+                job.status = "Table %d of %d: %s\u2026" % (ti + 1, len(picked), t)
+                # read through the engine like Browse (native reads, Safe parse, WAL-merged
+                # images all work; a bare SQL query would not)
+                src = TableSource(self.db, t)
+                cols = src.columns()
+                base = safe_filename(t)
+                path = os.path.join(folder, base + ".csv")
+                n = 2
+                # Two tables can sanitize to the same file name (a/b and a_b);
+                # never let the second silently overwrite the first.
+                while path in used_paths or os.path.exists(path):
+                    path = os.path.join(folder, "%s_%d.csv" % (base, n))
+                    n += 1
+                used_paths.add(path)
+                info = ex.provenance(VERSION, records, "Browse table '%s'" % t,
+                                     "all rows", "", cols, blob_mode=blob_mode,
+                                     spreadsheet_safe=safe)
+
+                def rows_fn(src=src):
+                    for row in src.iter_all():
+                        yield list(row)
+
+                def progress(n, t=t):
+                    job.done = n
+                    job.status = "%s: %s rows" % (t, format(n, ","))
+
+                rr = ex.write_rows(path, "csv", cols, rows_fn(), info, blob_mode,
+                                   lambda: job.cancelled, progress,
+                                   export_protected(self),
+                                   delimiter=delim, encoding=enc)
+                written.append((t, rr))
+            return written
+
+        def done(result, error, cancelled):
+            if error is not None:
+                self.status("Export failed: %s" % error)
+                return
+            if result is None:
+                return
+            if cancelled:
+                # Stop was pressed: the tables finished so far are complete, but the
+                # export as a whole is not. Say so instead of reporting success.
+                self.status("STOPPED: exported %d of %d table(s) to %s" %
+                            (len(result), len(picked), folder))
+                self.activity("export_tables", tables=[t for t, _r in result], folder=folder,
+                              delimiter=delim, encoding=enc, complete=False)
+                return
+            names = ", ".join("%s.csv" % safe_filename(t) for t, _r in result)
+            self.status("Exported %d table(s) to %s: %s" % (len(result), folder, names))
+            self.activity("export_tables", tables=[t for t, _r in result], folder=folder,
+                          delimiter=delim, encoding=enc)
+
+        Job(self, "Export tables", work, done, unit="rows",
+            members=[self.case.active],
+            release=getattr(self, "_release_worker_connection", None))
+
+    BLOB_KIND_ROWS = 200        # rows looked at to decide which decoded forms to offer
+
+    def _browse_blob_kinds(self, src):
+        """({kind: count}, rows looked at) of the BLOBs in the first BLOB_KIND_ROWS rows of
+        the Browse table (engine.decode.render.blob_kind)."""
+        import itertools
+        from collections import Counter
+        from engine.decode.render import blob_kind
+        counts, looked = Counter(), 0
+        rows = None
+        try:
+            rows = src.iter_all()
+            for row in itertools.islice(rows, self.BLOB_KIND_ROWS):
+                looked += 1
+                for v in row[1:]:
+                    if isinstance(v, (bytes, bytearray)) and v:
                         try:
-                            with open(os.path.join(folder, fname), "wb") as f:
-                                f.write(v)
-                            count += 1
-                        except Exception:
-                            errors += 1
-                if ri % 50 == 0:
-                    prog_bar.configure(value=ri + 1)
-                    prog_lbl.configure(text=f"Exported {count} BLOBs ({ri+1}/{len(rows)} rows)")
-                    self.update_idletasks()
-        else:
-            # Export ALL rows from table — query in batches
-            batch_size = 500
-            offset = 0
-            total = total_rows if isinstance(total_rows, int) else 10000
-            prog_bar.configure(maximum=max(total, 1))
-            while True:
+                            counts[blob_kind(bytes(v))] += 1
+                        except Exception:       # noqa: BLE001 - counted as not decoded
+                            counts["raw"] += 1
+        except Exception:                       # noqa: BLE001 - offer the plain export
+            pass
+        finally:
+            close = getattr(rows, "close", None)
+            if close is not None:
                 try:
-                    sql = f"SELECT rowid, * FROM {_q(tbl)} LIMIT {batch_size} OFFSET {offset}"
-                    cur = self.db._conn.execute(sql)
-                    col_descs = [d[0] for d in cur.description]
-                    rows = cur.fetchall()
-                except Exception:
-                    break
-                if not rows:
-                    break
-                for row in rows:
-                    rid = row[0]
-                    for ci in range(1, len(row)):
-                        v = row[ci]
-                        if isinstance(v, bytes) and len(v) > 0:
-                            bt = blob_type(v)
-                            ext = _EXT_MAP.get(bt, ".bin")
-                            cn = col_descs[ci] if ci < len(col_descs) else f"col{ci}"
-                            fname = f"{tbl}_r{rid}_{cn}{ext}"
-                            try:
-                                with open(os.path.join(folder, fname), "wb") as f:
-                                    f.write(v)
-                                count += 1
-                            except Exception:
-                                errors += 1
-                offset += batch_size
-                prog_bar.configure(value=min(offset, total))
-                prog_lbl.configure(text=f"Exported {count} BLOBs ({offset}/{fmt_count(total)} rows)")
-                self.update_idletasks()
-        prog_dlg.destroy()
-        msg = f"Exported {count} BLOB(s) to:\n{folder}"
-        if errors:
-            msg += f"\n({errors} error(s))"
-        messagebox.showinfo("Export Complete", msg)
+                    close()
+                except Exception:               # noqa: BLE001
+                    pass
+        return counts, looked
+
+    def _browse_export_blobs(self):
+        """Every BLOB of the rows the filters keep (or of every row) as files in a folder, on
+        a worker thread with progress and Stop, with a manifest (evidence and file hashes)."""
+        src = self._browse_source
+        tbl = self._browse_table_var.get()
+        if src is None or not self.db.ok:
+            return
+        real_name = tbl[5:] if tbl.startswith("WAL: ") else tbl
+        n = src.row_count()
+        total = src.total
+        scopes = []
+        if src.filtered:
+            scopes.append(("rows", "Rows the filters keep (%s)" % (
+                format(n, ",") if n is not None else "counting…")))
+        scopes.append(("all", "All rows in the table (%s)" % (
+            format(total, ",") if total is not None else "counting…")))
+        # the decoded forms are offered only when the table holds BLOBs they apply to (the
+        # first rows are looked at, and the dialog says how many and what was found)
+        counts, looked = self._browse_blob_kinds(src)
+        formats = ["files"]
+        if any(counts.get(k) for k in ("plist", "protobuf", "json", "other")):
+            formats.append("decoded_json")
+        if counts.get("plist"):
+            formats.append("plist_xml")
+        from engine.decode.render import kinds_text
+        found = "In the first %s rows: %s." % (format(looked, ","), kinds_text(counts))
+        if len(formats) == 1:
+            found += " Nothing there decodes, so the BLOBs are saved as they are stored."
+        elif "plist_xml" not in formats:
+            found += " No plist there, so XML property lists are not offered."
+        opts = export_options(self, "Export BLOBs of %s" % self._browse_label(), scopes,
+                              formats=tuple(formats), blobs=False,
+                              extra_check=("Also save each BLOB's original bytes beside it"
+                                           if len(formats) > 1 else None),
+                              extra_for=("decoded_json", "plist_xml"),
+                              note=found + "\n\nEach BLOB becomes a file named after its "
+                                   "table, row and column, in the folder you choose; "
+                                   "existing files are never replaced. A manifest with every "
+                                   "file's SHA-256 is written in the folder.")
+        if opts is None:
+            return
+        folder = filedialog.askdirectory(title="Choose a folder for the BLOBs", parent=self)
+        if not write_allowed(folder):
+            return
+        cols = src.columns()
+        rows_all = opts["scope"] == "all"
+        expected = total if rows_all else n
+        member = self.case.active
+        mode = {"decoded_json": "json", "plist_xml": "xml"}.get(opts["fmt"], "raw")
+        keep_raw = mode != "raw" and opts.get("extra")
+        how = {"raw": "as stored", "json": "decoded as JSON",
+               "xml": "plists as XML property lists"}[mode]
+        if keep_raw:
+            how += ", with the original bytes"
+        skipped = {}
+
+        def work(job):
+            files = []
+            rows = src.iter_all() if rows_all else src.iter_rows()
+
+            def progress(scanned, written):
+                job.done = scanned
+                job.status = "%s BLOBs written (%s of %s rows scanned)" % (
+                    format(written, ","), format(scanned, ","),
+                    format(expected, ",") if expected is not None else "?")
+            count, errors, first = export_row_blobs(folder, real_name, cols, rows, progress,
+                                                    lambda: job.cancelled, files, mode=mode,
+                                                    keep_raw=keep_raw, skipped=skipped)
+            job.status = "Writing the manifest…"
+            manifest = write_export_manifest(self, folder, "BLOBs of Browse table '%s' (%s)"
+                                           % (real_name, how), [member], files,
+                                           not job.cancelled, dict(scopes).get(opts["scope"]))
+            return count, errors, first, manifest
+
+        def done(result, error, cancelled):
+            left = sum(skipped.values())
+            note = "" if not left else " (%s BLOB%s left out: not a plist)" % (
+                format(left, ","), "" if left == 1 else "s")
+            blob_export_done(self, "BLOBs of %s, %s%s" % (real_name, how, note), folder,
+                             result, error, cancelled)
+        Job(self, "Export BLOBs of %s" % self._browse_label(), work, done, total=expected,
+            release=self._release_worker_connection, members=[member])
 
     # ── Key bindings ─────────────────────────────────────────────────
-    def _toggle_sidebar(self):
+    def _on_resize(self, event):
+        if event.widget is not self:
+            return
+        if event.width < 200:
+            return                      # the window is not laid out yet
+        narrow = event.width < 1100
+        # crossing below 1000 px folds the navigator to its ▶ strip (crossing back brings it
+        # back unless it was hidden by hand); a panel opened by hand in a narrow window stays
+        wide = event.width >= NAV_BREAKPOINT
+        was = getattr(self, "_nav_wide", None)
+        self._nav_wide = wide
+        if was is not wide:
+            if not wide and self._sidebar_visible:
+                self._set_sidebar(False)
+                self._nav_auto_hidden = True
+            elif wide and not self._sidebar_visible and getattr(self, "_nav_auto_hidden", False):
+                self._nav_auto_hidden = False
+                self._set_sidebar(True)
         if self._sidebar_visible:
-            self._sidebar.pack_forget()
-            self._sb_toggle.config(text="\u25B6")
-            self._sidebar_visible = False
-        else:
-            self._sidebar.pack(side="left", fill="y", before=self._sb_toggle)
-            self._sb_toggle.config(text="\u25C0")
-            self._sidebar_visible = True
+            want = self._saved_nav_width() or self._default_nav_width(narrow)
+            try:
+                pos = int(self._body.sashpos(0))
+            except (tk.TclError, ValueError):
+                pos = 0
+            if getattr(self, "_nav_width", None) != want or pos < 40:
+                self._place_nav_sash(want)
+        if narrow and self._title_lbl.winfo_manager():
+            self._title_lbl.pack_forget()
+        elif not narrow and not self._title_lbl.winfo_manager():
+            self._title_lbl.pack(side="left", padx=(S, 0), after=self._logo)
+
+    def _saved_nav_width(self):
+        """The navigator width the user dragged the splitter to (kept in the settings)."""
+        v = self.tags.settings.get("navigator_width")
+        return v if isinstance(v, int) and 160 <= v <= 900 else None
+
+    def _nav_sash_moved(self, _e=None):
+        if not self._sidebar_visible:
+            return
+        try:
+            pos = int(self._body.sashpos(0))
+        except (tk.TclError, ValueError):
+            return
+        if 160 <= pos <= 900 and pos != self.tags.settings.get("navigator_width"):
+            self.tags.settings["navigator_width"] = pos
+            self._nav_width = pos
+            self.tags.save_settings()
+
+    def _default_nav_width(self, narrow):
+        """The navigator's width when the user never dragged it: 240 / 280 px at 100%,
+        grown with the display scaling (a 200% screen needs twice the pixels)."""
+        try:
+            f = max(1.0, float(self.tk.call("tk", "scaling")) / (96 / 72.0))
+        except (tk.TclError, ValueError):
+            f = 1.0
+        return int((240 if narrow else 280) * f)
+
+    def _place_nav_sash(self, want):
+        """Put the splitter at `want` px once the panes are laid out: a sash moved before
+        that is clamped to 0 by Tk, and the panel would stay 0 px wide (unmapped while the
+        state says shown)."""
+        self._nav_sash_want = want
+        if getattr(self, "_nav_sash_after", None) is None:
+            self._place_nav_sash_now(20)
+
+    def _place_nav_sash_now(self, tries):
+        self._nav_sash_after = None
+        want = self._nav_sash_want
+        if not self._sidebar_visible:
+            return
+        width = self._body.winfo_width()
+        if width < want + 150 and tries > 0:
+            self._nav_sash_after = self.after(50, lambda: self._place_nav_sash_now(tries - 1))
+            return
+        try:
+            self._body.sashpos(0, min(want, max(width - 150, 120)))
+        except tk.TclError:
+            return
+        self._nav_width = want
+
+    def _toggle_sidebar_by_hand(self):
+        """☰, the ◀/▶ strip and Ctrl+B: the choice is kept for the next start."""
+        self._nav_auto_hidden = False
+        self._toggle_sidebar()
+        if self.tags.settings.get("navigator_hidden") != (not self._sidebar_visible):
+            self.tags.settings["navigator_hidden"] = not self._sidebar_visible
+            self.tags.save_settings()
+
+    def _toggle_sidebar(self):
+        """Hide or show the Case navigator (Ctrl+B)."""
+        self._set_sidebar(not self._sidebar_visible)
+
+    def _set_sidebar(self, show):
+        """Show or hide the navigator; the state, the strip, ☰ and Ctrl+B always agree with
+        what the window shows."""
+        shown = str(self._navigator) in [str(p) for p in self._body.panes()]
+        if show and not shown:
+            self._body.insert(0, self._navigator, weight=0)
+        elif not show and shown:
+            self._body.forget(self._navigator)
+        self._sidebar_visible = bool(show)
+        if show:
+            self._nav_width = None
+            self._place_nav_sash(self._saved_nav_width() or self._default_nav_width(
+                self.winfo_width() < 1100))
+        self._update_nav_rail()
+
+    def _update_nav_rail(self):
+        """The strip at the navigator's edge (◀ while the panel shows, ▶ at the window's edge
+        when it is hidden) and the ☰ button say what a click does."""
+        rail = getattr(self, "_nav_rail", None)
+        if rail is None:
+            return
+        shown = self._sidebar_visible
+        tip = ("Hide the databases panel (Ctrl+B)" if shown
+               else "Show the databases panel (Ctrl+B)")
+        rail.configure(text="◀" if shown else "▶")
+        self._nav_rail_tip.text = tip
+        nav_tip = getattr(self, "_nav_btn_tip", None)
+        if nav_tip is not None:
+            nav_tip.text = tip
+
+    def open_palette(self, _event=None):
+        """Ctrl+K: the command palette over every database, table, column, tab and action."""
+        if self._palette is not None and self._palette.winfo_exists():
+            self._palette.focus_force()
+            return "break"
+        settings = self.tags.settings
+        recent = [tuple(k) for k in settings.get("palette_recent") or () if isinstance(k, list)]
+
+        def chosen(item):
+            keys = [list(item.key)] + [list(k) for k in recent if tuple(k) != item.key]
+            settings["palette_recent"] = keys[:limits.get("palette_recent")]
+            self.tags.save_settings()
+        self._palette = CommandPalette(self, self.palette_items(), recent, chosen)
+        return "break"
+
+    def palette_items(self):
+        """Everything the command palette offers."""
+        items = []
+        nav = self._navigator
+        index = nav.index if nav.index is not None else None
+        multi = self.case.multi
+        if index is not None:
+            for e in index.entries:
+                m = e.member
+                if e.kind == "database":
+                    items.append(Item("database", m.name, m.path, ("database", m.path),
+                                      lambda m=m: (self.activate_member(m),
+                                                   nav.select_member(m))))
+                elif e.kind == "table":
+                    items.append(Item("table", e.table, m.name if multi else "",
+                                      ("table", m.path, e.table),
+                                      lambda m=m, t=e.table: self.browse_member_table(m, t)))
+                else:
+                    items.append(Item("column", e.column, "%s%s" % (
+                        m.name + " \u203A " if multi else "", e.table),
+                        ("column", m.path, e.table, e.column),
+                        lambda m=m, t=e.table: self.browse_member_table(m, t)))
+        for tab in self._nb.tabs():
+            title = self._nb.tab(tab, "text").strip()
+            items.append(Item("tab", title, "", ("tab", title),
+                              lambda tab=tab: self._nb.select(tab)))
+        ok = self.db.ok
+        actions = [("Open database\u2026", self._open_file, True),
+                   ("Open folder\u2026", self._open_folder, True),
+                   ("Add database(s)\u2026", self._add_databases, ok),
+                   ("Build timeline", self._palette_build_timeline, ok),
+                   ("Find value\u2026 (search every table)", self._focus_search, ok),
+                   ("Export Database Map\u2026", lambda: self.datamap.export_map(), ok),
+                   ("Schema report (HTML)\u2026", self._schema_export_html, ok),
+                   ("Evidence and verification\u2026", self._show_evidence, ok),
+                   ("Issues\u2026", self._show_issues, ok),
+                   ("Activity log\u2026", self._show_activity, ok),
+                   ("Limits\u2026", lambda: self.datamap.limits_window(self), True),
+                   ("Toggle the navigator (Ctrl+B)", self._toggle_sidebar_by_hand, True),
+                   ("Help", lambda: HelpDialog(self), True),
+                   ("Close", self._close_db, ok)]
+        for label, fn, enabled in actions:
+            if enabled:
+                items.append(Item("action", label, "", ("action", label), fn))
+        return items
+
+    def _palette_build_timeline(self):
+        self._nb.select(self._timeline)
+        self._timeline.build_when_ready()
 
     def _bind_keys(self):
         self.bind("<Control-o>", lambda e: self._open_file())
-        self.bind("<Control-f>", lambda e: self._focus_search())
-        self.bind("<Escape>", lambda e: self._stop_search())
+        self.bind_all("<Control-k>", self.open_palette)
+        self.bind_all("<Control-K>", self.open_palette)
+        self.bind("<Control-b>", lambda e: (self._toggle_sidebar_by_hand(), "break")[1])
+        # Ctrl+F: the search field of the window or tab in view (the Search tab otherwise)
+        self.bind_all("<Control-f>", self._ctrl_f)
+        # Escape stops a search only from the Search tab's own controls (an Escape in a Browse
+        # filter clears that filter and must not stop a search running meanwhile)
+        for w in (self._search_entry, self._mode_combo, self._search_tree, self._search_btn,
+                  self._stop_btn):
+            w.bind("<Escape>", lambda e: self._stop_search(), add="+")
         self._search_entry.bind("<Return>", lambda e: self._do_search())
-        self.bind("<Control-q>", lambda e: self._focus_sql_editor())
+        self.bind("<Control-e>", lambda e: self._focus_sql_editor())
 
     def _setup_tooltips(self):
         """Add tooltips to all interactive widgets."""
         # Search tab
         ToolTip(self._search_entry, "Type your search term and press Enter")
-        ToolTip(self._mode_combo, "Choose how to match: case-insensitive, exact, regex, etc.")
-        ToolTip(self._deep_blob_cb, "Include BLOB columns in text search (slower)")
+        ToolTip(self._mode_combo, "How to match, in three groups: text (%s), binary (%s) and "
+                                  "schema (%s)." % tuple(
+                                      ", ".join(k for k, v in SEARCH_MODES.items() if v in keys)
+                                      for _g, keys in SEARCH_MODE_GROUPS))
+        ToolTip(self._search_adv_btn,
+                "Include BLOB bytes: also search inside BLOB values as bytes (the text as\n"
+                "UTF-8, UTF-16LE and UTF-16BE, and in 'Text in BLOBs' mode as a hex pattern).\n"
+                "Include decoded BLOBs: property lists, keyed archives, protobuf, typedstream,\n"
+                "JSON, base64 and compressed data (gzip, zlib...). Both are slower.\n"
+                "Include views: off by default, a view usually repeats rows of its tables.\n"
+                "Max matching rows per table: a table that reaches it is named in the status\n"
+                "('urls (100+)' in the Table filter). All: no limit.")
+        ToolTip(self._search_free_cb, "Also search deleted records still held by freed pages\n"
+                                      "(Forensics > Freed Pages shows them page by page)")
         ToolTip(self._search_wal_cb,
-               "Search the WAL (Write-Ahead Log) file for hidden data:\n"
-               "  - WAL-only drafts and crashed transactions\n"
-               "  - Deleted or edited records (older versions)\n"
-               "  - Data that normal tools cannot see\n"
-               "Results appear color-coded: green=in DB, orange=WAL-only, red=older version")
-        ToolTip(self._search_btn, "Start searching across all tables (Enter)")
-        ToolTip(self._stop_btn, "Cancel the running search (Escape)")
-        ToolTip(self._scope_btn, "Select which tables to include in the search")
-        ToolTip(self._reset_scope_btn, "Reset scope to include all tables")
+                "Also search every row version kept in the WAL (Write-Ahead Log) file:\n"
+                "older versions, deleted rows, uncommitted and stale frames.\n"
+                "Results are coloured by frame state:\n" + "\n".join(
+                    "  %s: %s" % (v[0], v[3]) for v in WAL_STATES.values()))
+        ToolTip(self._search_btn, "Search the tables in the scope (Enter); the line under the "
+                                  "results says where it looked")
+        ToolTip(self._open_btn, "Open database…, Open folder… (tick the SQLite files of a "
+                                "folder), Add database(s)… (they join the case), Recent")
+        ToolTip(self._palette_btn, "Find any database, table, column, tab or action (Ctrl+K)")
+        self._nav_btn_tip = ToolTip(self._nav_btn, "Hide the databases panel (Ctrl+B)")
+        self._update_nav_rail()
+        ToolTip(self._stop_btn, "Stop the running search (Escape)")
+        ToolTip(self._reset_scope_btn, "Search every table again")
         ToolTip(self._sr_table_filter, "Filter results by table (shows result count per table)")
         ToolTip(self._sr_col_filter, "Filter results by column name")
         ToolTip(self._search_tree, "Double-click or press Enter to open row detail")
         # Browse tab
         ToolTip(self._browse_table_combo, "Select a table to browse")
-        ToolTip(self._browse_filter_entry, "Type to filter rows in real-time")
-        ToolTip(self._browse_col_combo, "Filter by a specific column or all columns")
-        ToolTip(self._browse_tree, "Double-click or press Enter to open row detail")
-        # Sidebar
-        ToolTip(self._schema_tree, "Expand tables to see columns, types, and indexes.\nRight-click for more options.")
-        ToolTip(self._sb_toggle, "Toggle schema sidebar")
-        
+        ToolTip(self._browse_filter_entry,
+                "Keep rows where every word occurs in some column (any case);\n"
+                "\"quoted words\" count as one. Each column also has its own filter\n"
+                "under its header: >5, =x, 5~10, !text, a%b, /regex/, NULL ...")
+        ToolTip(self._browse_inspector_cb,
+                "Show every column of the current row on the right.\n"
+                "In the grid: double-click or Enter opens the row detail;\n"
+                "right-click copies rows, filters by a value or hides columns.")
+        ToolTip(self._browse_columns_btn, "Choose which columns the grid shows")
+
         if hasattr(self, "_sql_run_btn"):
             ToolTip(self._sql_run_btn,
                     "Run the SQL query (Ctrl+Enter)\n"
-                    "Only SELECT / EXPLAIN / WITH / VALUES / PRAGMA allowed")
-            ToolTip(self._sql_cancel_btn, "Cancel the running query")
+                    "Statements that read: SELECT, WITH, VALUES, EXPLAIN, read-only PRAGMA")
+            ToolTip(self._sql_cancel_btn, "Stop the running query")
             ToolTip(self._sql_editor,
-                    "Ctrl+Enter: run  |  Alt+↑/↓: history  |  Ctrl+Q: focus")
+                    "Ctrl+Enter: run  |  Alt+↑/↓: history  |  Ctrl+E: go to the editor")
+
+    def _ctrl_f(self, event=None):
+        """Ctrl+F in a window focuses its search field; in the main window the one of the tab
+        shown, or the Search tab when that tab has none."""
+        try:
+            top = event.widget.winfo_toplevel() if event is not None and \
+                hasattr(event.widget, "winfo_toplevel") else self
+        except (tk.TclError, KeyError):
+            top = self
+        if top is not self:
+            focus_search_in(top)
+            return "break"
+        try:
+            current = self.nametowidget(self._nb.select())
+        except (tk.TclError, KeyError):
+            current = None
+        if current is not None and focus_search_in(current) is not None:
+            return "break"
+        self._focus_search()
+        return "break"
 
     def _focus_search(self):
         self._nb.select(self._search_frame)
@@ -2535,44 +3188,541 @@ class App(tk.Tk):
         self._search_entry.select_range(0, "end")
 
     # ── DB operations ────────────────────────────────────────────────
-    def _open_file(self):
+    def _post_menu(self, menu, widget):
+        try:
+            menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _open_file(self, safe=False):
+        """Open a database chosen in a file dialog; safe=True: with Safe parse (only the
+        built-in parser reads the file, SQLite never opens it)."""
+        # 'All files' first: Chrome History, Cookies and many app databases have no extension
         path = filedialog.askopenfilename(
-            title="Open SQLite Database",
-            filetypes=[("SQLite files", "*.db *.sqlite *.sqlite3 *.db3"),
-                       ("All files", "*.*")]
+            title="Open SQLite Database (Safe parse)" if safe else "Open SQLite Database",
+            filetypes=[("All files", "*.*"),
+                       ("SQLite files", "*.db *.sqlite *.sqlite3 *.db3")]
         )
-        if path:
+        if not path:
+            return
+        if not self._confirm_replace("this database"):
+            return
+        self.set_safe_parse(path, safe)
+        self._open_db(path)
+
+    def set_safe_parse(self, path, on):
+        """Open `path` with Safe parse from now on (on=True) or normally; the case file keeps
+        the choice."""
+        norm = os.path.normcase(os.path.abspath(path))
+        if on:
+            self._safe_paths.add(norm)
+        else:
+            self._safe_paths.discard(norm)
+
+    def _safe_for(self, path):
+        return os.path.normcase(os.path.abspath(path)) in self._safe_paths
+
+    def _confirm_replace(self, what):
+        """Ask before a case of several databases is closed for something else (Open, a
+        Recent database or case); True to go ahead. A single database is replaced without
+        asking, as before."""
+        if not self.case.multi:
+            return True
+        return messagebox.askyesno(
+            "Open", "Replace the case of %d databases with %s? The case stays under Recent. "
+                    "(Add ▾ adds a database to the case instead.)" % (len(self.case), what),
+            parent=self)
+
+    def open_recent(self, path):
+        """Recent ▾ › a database: it replaces what is open (asking first for a case)."""
+        if self._confirm_replace(os.path.basename(path)):
             self._open_db(path)
 
-    def _open_db(self, path):
-        # If a DB with WAL is already open, confirm before switching
-        if self.db.ok and self.db.has_wal:
-            bak = self.db.wal_backup_path
-            msg = "Close the current database and open a new one?"
-            if bak:
-                msg += f"\n\nWAL data backed up at:\n{os.path.basename(bak)}"
-            if not messagebox.askokcancel("Open Database", msg):
-                return
-        t0 = time.time()
-        try:
-            self.db.open(path)
-        except Exception as e:
-            messagebox.showerror("Error", f"Cannot open database:\n{e}")
+    def open_recent_case(self, path):
+        """Recent ▾ › a case: it replaces what is open (asking first for a case)."""
+        if self._confirm_replace("the saved case"):
+            self.reopen_case(path)
+
+    def _open_db(self, path, on_done=None, wait=False):
+        """Open one database (closing whatever is open): the case of one database."""
+        return self._open_paths([path], on_done=on_done, wait=wait)
+
+    def _open_paths(self, paths, saved=None, active=None, state=None, changes_told=False,
+                    on_done=None, wait=False):
+        """Open these databases as a new case (closing what is open). saved: {normalised
+        path: the case file's record of it} to report files changed since; active: the path
+        to make active.
+
+        The databases open on a worker thread, one after the other; each joins the case (and
+        the navigator) as soon as it is open, the first one is shown at once, and a progress
+        window with Stop shows when opening takes a while. on_done(members) runs on the Tk
+        thread when all are open. wait=True (scripts, tests): returns only then, with the
+        members opened; otherwise returns [] at once."""
+        self._cancel_open()
+        # Validate before closing what is open: a bad path (a directory, a Recent entry
+        # whose file is gone) must not discard the current case for nothing.
+        good = [p for p in paths if os.path.isfile(p)]
+        if not good:
+            bad = paths[0] if paths else "(no path)"
+            messagebox.showerror("Cannot open database",
+                                  "Not a database file: %s" % bad, parent=self)
+            return []
+        paths = good
+        if self.case.members:
+            self._close_db(confirm=False)
+        self.case.clear_protected_folders()
+        self._case_path = None
+        self._case_state = dict(state or {})
+        return self._start_open(paths, saved, active=active, changes_told=changes_told,
+                                new_case=True, on_done=on_done, wait=wait)
+
+    def opening(self):
+        """True while databases are being opened (on the worker thread), until they are
+        shown everywhere."""
+        return self._open_state is not None or self._open_finishing is not None
+
+    def wait_opened(self):
+        """Block until the databases being opened have joined the case (scripts, tests)."""
+        while self._open_state is not None:
+            self._open_state["job"].wait()
+
+    def _start_open(self, paths, saved=None, active=None, changes_told=False, new_case=False,
+                    on_done=None, wait=False):
+        """Open paths into the case on a worker (see _open_paths). A request made while
+        another open runs waits for it."""
+        if self._open_state is not None:
+            self._open_waiting.append((paths, saved, active, changes_told, on_done))
+            if wait:
+                self.wait_opened()
+                want = set(os.path.normcase(os.path.abspath(p)) for p in paths)
+                return [m for m in self.case
+                        if os.path.normcase(os.path.abspath(m.path)) in want]
+            return []
+        most = limits.get("case_max_databases")
+        seen, todo, failed = set(), [], []
+        for path in paths:
+            norm = os.path.normcase(os.path.abspath(path))
+            if norm in seen or self.case.by_path(path) is not None:
+                continue                # already open (or listed twice): nothing to do
+            seen.add(norm)
+            if len(self.case) + len(todo) >= most:
+                failed.append((path, "not opened: the case already has %d databases (limit "
+                                     "case_max_databases in settings.json)" % most))
+                continue
+            if not os.path.isfile(path):
+                failed.append((path, "no such file (moved or deleted?)"))
+                continue
+            todo.append(path)
+            rec = (saved or {}).get(norm)
+            if isinstance(rec, dict) and rec.get("safe_parse") is True:
+                self._safe_paths.add(norm)
+        safe = dict((p, self._safe_for(p)) for p in todo)
+        st = {"paths": todo, "ready": [], "lock": threading.Lock(), "abandoned": False,
+              "saved": saved or {}, "active": active, "changes_told": changes_told,
+              "new_case": new_case, "members": [], "failed": failed, "on_done": on_done,
+              "shown": not new_case, "t0": time.time()}
+        self._open_state = st
+
+        def work(job):
+            for i, path in enumerate(todo):
+                if job.cancelled:
+                    break
+                job.done = i
+                job.status = "Opening %s (%d of %d)…" % (os.path.basename(path), i + 1,
+                                                         len(todo))
+                t0 = time.time()
+                db, err = DB(), None
+
+                def told(text, i=i, path=path):
+                    job.status = "Opening %s (%d of %d): %s…" % (os.path.basename(path), i + 1,
+                                                                len(todo), text)
+                try:
+                    db.open(path, safe_parse=safe[path], cancel=lambda: job.cancelled,
+                            progress=told)
+                    db.tables()
+                except Exception as e:      # noqa: BLE001 - reported as not opened
+                    e.__traceback__ = None
+                    err, db = e, None
+                if db is not None and db.session is not None:
+                    db.session.release_thread_connection()     # this thread ends soon
+                item = (path, db, time.time() - t0, err)
+                with st["lock"]:
+                    if not st["abandoned"]:
+                        st["ready"].append(item)
+                        item = None
+                if item is not None and item[1] is not None:
+                    item[1].close()         # nobody will use it: the open was abandoned
+            job.done = len(todo)
+
+        job = Job(self, "Opening %s" % plural(len(todo), "database"), work,
+                  lambda result, error, cancelled: self._open_finished(st, error, cancelled),
+                  total=max(1, len(todo)), unit="databases", members=[],
+                  on_poll=lambda j: self._open_take(st), show_after=0.5)
+        st["job"] = job
+        if wait:
+            st["wait"] = True
+            job.wait()
+            return list(st["members"])
+        return []
+
+    def _open_take(self, st):
+        """On the Tk thread: the databases opened since the last look join the case."""
+        if st["abandoned"] or self._open_state is not st:
             return
-        self._load_time = time.time() - t0
+        with st["lock"]:
+            items, st["ready"] = st["ready"], []
+        added = []
+        for path, db, secs, err in items:
+            if db is None:
+                st["failed"].append((path, err))
+                # not open, still evidence: its folder stays out of reach of every write
+                self.case.protect_folder(os.path.dirname(os.path.abspath(path)))
+                continue
+            rec = st["saved"].get(os.path.normcase(os.path.abspath(path)))
+            m = self.case.add_db(db, color=(rec or {}).get("color"))
+            m.load_time = secs
+            m.opened_utc = utc_text()
+            for text in limits.problems:    # settings that were refused: shown as Issues
+                m.db.session.issues.add("setting_invalid", text, "settings.json")
+            if rec is not None:
+                m.saved = rec
+                m.changes = case_changes(rec)
+                if rec.get("color_problem"):    # a colour the case file had wrong: Issues
+                    m.db.session.issues.add("case_file_invalid", rec["color_problem"],
+                                            "case file")
+            tables = m.db.tables()
+            m.scope_tables = list(tables)
+            m.counts = dict((t, "?") for t in tables)
+            self._start_counts(m)
+            st["members"].append(m)
+            added.append(m)
+        if not added:
+            return
+        for m in added:
+            if not st["shown"] and m is self.case.active:
+                st["shown"] = True
+                self.tags.opened(m.path, m)     # its tags and saved view state
+                self._activate_ui()
+            else:
+                self.tags.add_member(m)
+        if not st["job"].finished:
+            # the navigator and the case bar show them now; the rest when all are open
+            self._populate_schema()
+            self._refresh_case_ui()
 
-        tables = self.db.tables()
-        self._scope_tables = list(tables)
-        self._count_cache = {t: "?" for t in tables}
+    def _open_finished(self, st, error, cancelled):
+        """On the Tk thread: every database of an open has joined the case (or Stop)."""
+        if st["abandoned"] or self._open_state is not st:
+            return
+        self._open_state = None
+        members, failed = st["members"], st["failed"]
+        notes = []
+        if error is not None:
+            notes.append("Opening stopped by an error: %s" % error)
+        opened = len(members) + len([1 for p, _e in failed if p in st["paths"]])
+        if cancelled and opened < len(st["paths"]):
+            notes.append("Stopped: %d of %d databases were not opened." % (
+                len(st["paths"]) - opened, len(st["paths"])))
+        def rest():
+            if self._open_finishing is st:
+                self._open_finishing = None
+            if st["abandoned"]:
+                return
+            if st["changes_told"]:
+                for m in members:
+                    m.changes_reported = True
+            if st["new_case"] and not members:
+                if failed or notes:
+                    messagebox.showerror("Error", "Cannot open database:\n" + "\n".join(
+                        ["%s: %s" % (os.path.basename(p), e) for p, e in failed] + notes))
+            else:
+                self._report_open_problems(failed, notes)
+            if st["on_done"] is not None:
+                st["on_done"](list(members))
+            waiting, self._open_waiting = self._open_waiting, []
+            for paths, saved, active, told, done in waiting:
+                if self.case.members:
+                    self._start_open(paths, saved, active, told, on_done=done)
+                else:
+                    self._start_open(paths, saved, active, told, new_case=True, on_done=done)
+        if members:
+            active = st["active"] and self.case.by_path(st["active"])
+            if active is not None and active is not self.case.active:
+                self.activate_member(active)
+            # a step per turn of the event loop, unless a script waits for the open
+            self._open_finishing = st
+            self._case_changed(spread=not st.get("wait"), then=rest)
+        else:
+            rest()
 
-        # Update UI
-        fname = os.path.basename(path)
-        fsize = fmtb(os.path.getsize(path)) if os.path.exists(path) else "?"
-        self._db_info.configure(
-            text=f"  {fname}  |  {fsize}  |  {len(tables)} tables  |  loaded in {self._load_time:.2f}s")
+    def _cancel_open(self):
+        """Abandon an open still running (a new case or Close): the databases it opened
+        that have not joined the case are closed on a worker thread."""
+        st = self._open_state
+        self._open_waiting = []
+        if self._open_finishing is not None:
+            self._open_finishing["abandoned"] = True      # its last steps do nothing
+            self._open_finishing = None
+        if st is None:
+            return
+        self._open_state = None
+        with st["lock"]:
+            st["abandoned"] = True
+            left, st["ready"] = st["ready"], []
+        st["job"].cancel()
+        dbs = [db for _p, db, _s, _e in left if db is not None]
+        if dbs:
+            threading.Thread(target=lambda: [db.close() for db in dbs],
+                             name="close-abandoned", daemon=True).start()
 
-        # Build browse combo: main tables + WAL-only tables
-        browse_vals = list(tables)
+    def _report_open_problems(self, failed, notes=()):
+        """One message for the databases that could not be opened and those that changed
+        since the case was saved (the user just asked to open them)."""
+        lines = ["%s: cannot be opened (%s)" % (p, e) for p, e in failed] + list(notes)
+        for m in self.case:
+            if m.changes and not getattr(m, "changes_reported", False):
+                m.changes_reported = True
+                lines.append("%s changed since the case was saved: %s" % (
+                    m.path, "; ".join(m.changes)))
+        if lines:
+            messagebox.showwarning("Databases", "\n\n".join(lines))
+
+    def _add_databases(self, paths=None, on_done=None, wait=False):
+        """Add database(s)…: files from any folders join the open case (or start one)."""
+        if paths is None:
+            paths = filedialog.askopenfilenames(
+                title="Add SQLite Database(s)",
+                filetypes=[("All files", "*.*"),
+                           ("SQLite files", "*.db *.sqlite *.sqlite3 *.db3")])
+            paths = list(paths or ())
+        if not paths:
+            return []
+        if not self.case.members and not self.opening():
+            return self._open_paths(paths, on_done=on_done, wait=wait)
+        return self._add_paths(paths, on_done=on_done, wait=wait)
+
+    def _open_folder(self, folder=None, wait=False):
+        """Open folder…: pick the SQLite databases of a folder; they join the open case (or
+        start one)."""
+        dlg = OpenFolderDialog(self, folder)
+        self._folder_dialog = dlg
+        self.wait_window(dlg)
+        paths = dlg.result or []
+        if not paths:
+            return []
+        folders = list(getattr(dlg, "evidence_folders", None) or ())
+
+        def done(members):
+            # the folder opened and every folder a database was found in stay protected,
+            # also those of the databases not chosen (sibling evidence)
+            for f in folders:
+                self.case.protect_folder(f)
+            if self.case.multi and self._overview_added:
+                self._nb.select(self._overview)     # the landing page of a case
+        return self._add_databases(paths, on_done=done, wait=wait)
+
+    def _add_paths(self, paths, on_done=None, wait=False):
+        """More databases join the case (on a worker, see _open_paths): their tags load, the
+        schema, case bar and search choices show them, and their links are checked."""
+        return self._start_open(paths, on_done=on_done, wait=wait)
+
+    def activate_member(self, member):
+        """Make a database of the case the active one: Browse, Forensics, SQL, WAL and
+        Freed Pages then show it. Search results, tags and the timeline stay."""
+        if member is None or member is self.case.active or member not in self.case.members:
+            return
+        prev = self.case.active
+        # what the one-database tabs showed of the previous database: said where it was
+        forensic_lines = self._forensics.results_shown()
+        had_sql = bool(self._sql_result_rows)
+        had_wal = bool(getattr(self._wal_frame, "_records", None))
+        self._deactivate_ui()
+        self.case.set_active(member)
+        self._navigator.note_used(member)
+        self.tags.activate(member)
+        self._activate_ui()
+        self._refresh_case_ui()
+        note ="The results of %s were cleared when %s became the active database; run it "                "again to see this database's." % (prev.name if prev is not None else "?",
+                                                  member.name)
+        for lbl in forensic_lines:      # each Forensics sub-tab that showed results
+            lbl.configure(text=note)
+        if had_sql:
+            self._sql_status_label.configure(text=note)
+        if had_wal and self._wal_tab_added:
+            self._wal_frame.rec_status.configure(text=note)
+
+    def remove_member(self, member):
+        """Remove from case: close one database (its tags are saved)."""
+        if member not in self.case.members:
+            return
+        if len(self.case) == 1:
+            self._close_db(confirm=False)
+            return
+        was_active = member is self.case.active
+        if was_active:
+            self._deactivate_ui()
+        timeline_stopped = self._timeline.reads(member)
+        search_stopped = self._stop_member_workers(member)  # only what reads this database
+        self.tags.remove_member(member)
+        self.relations.forget_member(member)
+        path, old_name = member.path, member.name
+        others = [m for m in self.case if m is not member]
+        before = dict((m.uid, m.name) for m in others)
+        reports = self._verify_before_close([member])
+        report = self.case.remove(member, reports.get(member.uid))
+        renamed = dict((before[m.uid], m.name) for m in others if before[m.uid] != m.name)
+        if report is not None:
+            self.activity("close", database=path, unchanged=report.unchanged,
+                          checked=report.checked_text(), differences=list(report.differences))
+        if report is not None and not report.unchanged:
+            messagebox.showwarning("Evidence changed", report.text())
+        self._restart_counts()          # the stop above also stopped the other counts
+        self.scopes.forget(member.uid)  # no scope covers a database that left
+        self._navigator.hits.pop(member.uid, None)
+        self._navigator.dates.pop(member.uid, None)
+        # its search results go with it (the status says so)
+        if any(m is member for m, _t in getattr(self, "_search_work", [])):
+            self._search_removed = getattr(self, "_search_removed", []) + [old_name]
+        if search_stopped:
+            self._search_cancel = True
+        self._search_results = [r for r in self._search_results if r.get("dbid") != member.uid]
+        self._search_table_hits = dict((k, v) for k, v in self._search_table_hits.items()
+                                       if k[0] != member.uid)
+        self._search_wal_hits = [r for r in self._search_wal_hits
+                                 if r.get("dbid") != member.uid]
+        self._search_work = [(m, t) for m, t in getattr(self, "_search_work", [])
+                             if m is not member]
+        self._search_tables = [k for k in getattr(self, "_search_tables", [])
+                               if k[0] != member.uid]
+        if was_active:
+            self.tags.activate(self.case.active)
+            self._activate_ui()
+        elif self._browse_source is not None:
+            # the linked values were stopped (one may have been read from that database)
+            self._browse_lookups.apply(self._browse_table_var.get())
+        self._case_changed(timeline=False)
+        if timeline_stopped:
+            self._timeline.on_open()        # it was reading the database: it starts over
+        else:
+            self._timeline.forget_member(member, old_name, renamed)
+        if self._search_results or self._search_tree.get_children():
+            self._finalize_search(len(self._search_tables))
+
+    def _stop_member_workers(self, member, timeout=WORKER_STOP_WAIT):
+        """Stop only the work that reads a database leaving the case, and wait for it: jobs
+        of that database (or of databases not said), a search or timeline job still running
+        over it, the mapping of links (it starts again), the copies and maps that may read
+        it, the linked values shown in Browse, and the row counts (they start again). The
+        other databases' finished results and running jobs are left alone. (The active
+        database's tabs were stopped by _deactivate_ui when it was the active one.) Returns
+        True when a running search was stopped."""
+        db = member.db
+        running = []
+        for job in list(getattr(self, "_jobs", ())):
+            ms = job.members
+            if ms is None or any(x is member or getattr(x, "db", None) is db for x in ms):
+                job.cancel()
+                running.append(job.thread)
+        search_stopped = False
+        th = self._search_thread
+        if th is not None and th.is_alive() and \
+                any(m is member for m, _t in getattr(self, "_search_work", [])):
+            self._stop_search()
+            search_stopped = True
+            running += [th] + list(getattr(self, "_search_threads", ()))
+        if self._overview.busy():       # looking for dates, database after database
+            self._overview.stop_dates()
+            running += self._overview.worker_threads()
+        if self._timeline.reads(member):
+            self._timeline.stop()
+            running += self._timeline.worker_threads()
+        running += self.relations.stop_mapping()
+        running += self.datamap.forget_member(member)
+        lookups = getattr(self, "_browse_lookups", None)
+        if lookups is not None:
+            lookups.stop()              # a linked table may be in that database
+            running += lookups.worker_threads()
+        self._count_gen += 1            # counts start again (_restart_counts)
+        running += [t for t in [self._bg_count_thread] + list(self._count_threads)
+                    if t is not None]
+        db.interrupt()                  # every statement running on that database
+        me = threading.current_thread()
+        deadline = time.time() + timeout
+        while True:
+            running = [t for t in running if t is not None and t is not me and t.is_alive()]
+            if not running or time.time() >= deadline:
+                break
+            uiyield.beat()              # the workers waited for do not give way
+            try:
+                for _ in range(100):
+                    if not self.tk.dooneevent(WORKER_CALLS_ONLY):
+                        break
+            except tk.TclError:
+                pass
+            running[0].join(0.01)
+        return search_stopped
+
+    def show_member_evidence(self, member):
+        self.activate_member(member)
+        self._show_evidence()
+
+    def _deactivate_ui(self):
+        """The active database is about to change: stop what reads it and forget what the
+        tabs showed of it (the database stays open)."""
+        self.tags.remember_view()
+        self._sql_query_cancel = True
+        browse = self._cancel_browse_workers()
+        self._forensics.stop()
+        self._wal_frame.stop()
+        db = self.db
+        running = [t for t in browse + self._forensics.worker_threads()
+                   + self._wal_frame.worker_threads()
+                   + [self._sql_query_thread] if t is not None and t.is_alive()]
+        for t in running:
+            db.interrupt(t)
+        deadline = time.time() + WORKER_STOP_WAIT
+        while running and time.time() < deadline:
+            running = [t for t in running if t.is_alive()]
+            uiyield.beat()              # the workers waited for do not give way
+            try:
+                for _ in range(100):
+                    if not self.tk.dooneevent(WORKER_CALLS_ONLY):
+                        break
+            except tk.TclError:
+                pass
+            if running:
+                running[0].join(0.01)
+        self._forensics.reset()
+        self._browse_dates.reset()
+        self._browse_lookups.reset()
+        self._browse_source = None
+        self._browse_grid.set_source(None)
+        self._browse_filter_var.set("")
+        self._show_browse_note([])
+        self._sql_grid.set_source(None)
+        self._sql_result_rows, self._sql_result_cols = [], []
+        if hasattr(self, "_sql_status_label"):
+            self._sql_status_label.configure(text="")
+        self._wal_frame.reset()
+        if self._wal_tab_added:
+            try:
+                self._nb.forget(self._wal_frame)
+            except tk.TclError:
+                pass
+            self._wal_tab_added = False
+
+    def _activate_ui(self):
+        """Show the active database in the tabs that work on one database."""
+        db, member = self.db, self.case.active
+        last_table = self.tags.store.last_table if self.tags.store is not None else None
+        self._load_time = member.load_time
+        tables = db.tables()
+
+        self._update_db_info()
+        self._show_banners()
+
+        # Build browse combo: main tables + views + WAL-only tables
+        browse_vals = list(tables) + list(self.db.views())
         if self.db.has_wal:
             wal_only = self.db.wal_tables()
             if wal_only:
@@ -2581,186 +3731,781 @@ class App(tk.Tk):
                     browse_vals.append(f"WAL: {wt}")
         self._browse_table_combo.configure(values=browse_vals)
         if tables:
-            self._browse_table_var.set(tables[0])
+            # the table viewed last, else the first one with rows (not an empty one)
+            self._browse_table_var.set(last_table if last_table in browse_vals
+                                       and last_table != "---WAL-Only Tables---"
+                                       else self._first_table_with_rows(tables))
             self._load_browse_table()
 
-        self._populate_schema()
+        self._forensics.on_open()
+        self.relations.refresh_marks()
 
-        # WAL tab & checkbox: add/remove based on whether WAL file exists
-        if self.db.has_wal:
+        # WAL tab: for a database with a -wal file, readable or not (then it says why);
+        # always right after Browse
+        s = self.db.session
+        if self.db.has_wal or (s is not None and s.wal_problem):
             if not self._wal_tab_added:
-                self._nb.add(self._wal_frame, text="  Hidden Data (WAL)  ")
+                self._nb.insert(self._sql_frame, self._wal_frame, text="WAL")
                 self._wal_tab_added = True
-                self._build_wal_tab()
-            self._populate_wal_tab()
-            # Show WAL checkbox (insert before Max/table label to keep order)
-            self._search_wal_cb.pack(side="left", padx=4,
-                                     before=self._search_max_lbl)
-        else:
-            if self._wal_tab_added:
-                self._nb.forget(self._wal_frame)
-                self._wal_tab_added = False
-            self._search_wal_cb.pack_forget()
-            self._search_wal_var.set(False)
-            
-        # Freelist (Deleted Pages) tab
-        fl_count = self.db.freelist_count()
-        if fl_count > 0:
-            if not self._fl_tab_added:
-                self._nb.add(self._fl_frame, text="  Deleted Pages  ")
-                self._fl_tab_added = True
-                self._build_fl_tab()
-            self.after(300, self._populate_fl_tab)
-        else:
-            if self._fl_tab_added:
-                try:
-                    self._nb.forget(self._fl_frame)
-                except Exception:
-                    pass
-        self._fl_tab_added = False
+            self._wal_frame.on_open()
+        elif self._wal_tab_added:
+            self._nb.forget(self._wal_frame)
+            self._wal_tab_added = False
+        self._update_sql_notice()
+        if hasattr(self, "_sql_status_label"):
+            self._sql_status_label.configure(
+                text="Ready \u2014 %s is open. Type a query and press Run." % member.name)
 
-        # Background count using SEPARATE connection (non-blocking)
-        self._count_cancel = False
-        self._bg_count_thread = threading.Thread(
-            target=self._bg_count, args=(list(tables), self.db._path), daemon=True)
-        self._bg_count_thread.start()
+        # Search options for WAL rows and deleted records in freed pages: only when a
+        # searched database has them
+        self._update_search_options()
 
-    def _bg_count(self, tables, db_path):
-        """Count rows using a separate connection so search is never blocked.
+        self._update_tab_titles()
 
-        Two-pass approach for speed:
-          Pass 1: max(rowid) — O(1), instant approximate counts (~0.01s total)
-          Pass 2: SELECT COUNT(*) — exact counts (can take 10-15s on large DBs)
-        Approximate counts show with '~' prefix until exact count arrives.
-        """
-        try:
-            uri = "file:" + db_path.replace("\\", "/") + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-            conn.execute("PRAGMA cache_size = -2000")
-            conn.execute("PRAGMA mmap_size = 67108864")
-            conn.execute("PRAGMA query_only = ON")
-        except Exception:
+    def _update_db_info(self):
+        """The header: the case (or database) name, its summary and the evidence chips (kept
+        current as databases join or leave)."""
+        if self.case.active is None or not self.db.ok:
             return
-        # Pass 1: fast approximate counts via max(rowid) — nearly instant
-        for t in tables:
-            if self._count_cancel:
-                break
-            try:
-                r = conn.execute(f"SELECT max(rowid) FROM {_q(t)}").fetchone()
-                approx = r[0] if r and r[0] is not None else 0
-                self._count_cache[t] = f"~{approx}"  # ~ prefix = approximate
-            except Exception:
-                pass  # stays as "?", will be resolved in pass 2
-        if not self._count_cancel:
-            self.after(0, self._update_schema_counts)
-        # Pass 2: exact counts — replaces approximations
+        self._refresh_header()
+
+    def _first_table_with_rows(self, tables, look=50):
+        """The first non-internal table whose quick row estimate (max rowid) is not 0; the
+        first table when none of the first `look` says so. Internal tables (leading
+        underscore, sqlite_*) are skipped so Browse never opens on e.g. _hive_attribution."""
+        def _internal(t):
+            tl = t.lower()
+            return tl.startswith("_") or tl.startswith("sqlite_")
+        for t in tables[:look]:
+            if _internal(t):
+                continue
+            n = self.db.approx_count(t)
+            if n:
+                return t
+        for t in tables[:look]:
+            if not _internal(t):
+                return t
+        return tables[0]
+
+    def _start_counts(self, member):
+        """Count a database's rows on the row-count worker thread (the session gives it its
+        own connection); one worker serves every database of the case in turn."""
+        with self._count_lock:
+            self._count_queue.append(member)
+            th = self._count_worker
+            if th is not None and th.is_alive() and self._count_worker_gen == self._count_gen:
+                return
+            th = threading.Thread(target=self._count_loop, args=(self._count_gen,),
+                                  name="row-counts", daemon=True)
+            self._count_worker, self._count_worker_gen = th, self._count_gen
+        self._count_threads = [t for t in self._count_threads if t.is_alive()] + [th]
+        self._bg_count_thread = th
+        th.start()
+
+    def _restart_counts(self):
+        """Count again the databases whose counts a stop left unfinished."""
+        for m in self.case:
+            if any(not isinstance(v, int) for v in m.counts.values()):
+                self._start_counts(m)
+
+    def _case_changed(self, timeline=True, spread=False, then=None):
+        """Databases joined or left the case: show them everywhere and save the case.
+        timeline=False: the caller updates the Timeline itself (a database left: the others'
+        events stay). spread=True: one step per turn of the event loop (a case of dozens of
+        databases made them together one long pause); then() runs after the last step (also
+        when a newer change replaces this one before its end)."""
+        steps = [self._update_activity_log,
+                 self._populate_schema,         # the navigator: its name index and lines
+                 self._refresh_case_ui,
+                 self._update_search_options,
+                 self.relations.start_mapping,  # links checked against the values, in the background
+                 self._timeline.on_open if timeline else None,
+                 self._update_overview,
+                 lambda: self.tags.refresh_views(now=True),
+                 self._save_case]
+        steps = [s for s in steps if s is not None]
+        self._case_change_gen += 1
+        gen = self._case_change_gen
+        if not spread:
+            for step in steps:
+                step()
+            if then is not None:
+                then()
+            return
+
+        def run(i):
+            if gen != self._case_change_gen or not self.case.members:
+                if then is not None:
+                    then()              # replaced (the newer change does every step)
+                return
+            steps[i]()
+            if i + 1 < len(steps):
+                self.after(1, run, i + 1)
+            elif then is not None:
+                then()
+        run(0)
+
+    def _update_overview(self, select=False):
+        """The Overview tab: first, and only for a case of two or more databases."""
+        if self.case.multi:
+            if not self._overview_added:
+                self._nb.insert(0, self._overview, text="Overview")
+                self._overview_added = True
+            self._overview.on_open()
+            if select:
+                self._nb.select(self._overview)
+        elif self._overview_added:
+            self._overview.reset()
+            self._nb.forget(self._overview)
+            self._overview_added = False
+
+    def _refresh_case_ui(self):
+        """The header, the navigator's lines (the active database), the scope pickers, the
+        results' Database filter and the breadcrumbs of the one-database tabs."""
+        multi = self.case.multi
+        self._update_db_info()
+        self._close_btn.configure(text="Close case" if multi else "Close")
+        self._search_btn_row.show(self._search_db_picker, multi)
+        self._search_db_picker.refresh()
+        self._sr_filter_bar.show(self._sr_db_lbl, multi)
+        self._sr_filter_bar.show(self._sr_db_filter, multi)
+        if not multi:
+            self._sr_db_filter.set("All")
+        self._update_scope_chip()
+        self._navigator.apply_filter()
+        for crumb in self._crumbs:
+            crumb.refresh()
+        self._timeline.refresh_scope()
+
+    def _update_tab_titles(self):
+        """The tabs keep plain names; the breadcrumb bars say which database they show."""
+        for crumb in getattr(self, "_crumbs", ()):
+            crumb.refresh()
+
+    # ── The case file ────────────────────────────────────────────────
+    def _save_case(self):
+        """Keep a case of 2+ databases in the app-data folder (never beside the evidence):
+        its databases with size, time and SHA-256, the active one, which ones a search
+        covers. It is listed under Recent."""
+        if not self.case.multi:
+            return None
+        # the scopes (global, per feature, saved) and the navigator's pinned databases
+        self._case_state["scopes"] = self.scopes.to_state()
+        self._case_state["pinned"] = sorted(self._navigator.pinned)
+        self._case_state.pop("search_databases", None)
+        dbs = []
+        for m in self.case:
+            fp = m.db.evidence.fingerprints.get("main") if m.db.ok else None
+            dbs.append({"path": m.path, "name": m.name, "size": fp.size if fp else None,
+                        "mtime_ns": fp.mtime_ns if fp else None,
+                        "sha256": (fp.sha256 if fp else None) or (m.saved or {}).get("sha256"),
+                        "color": m.color, "safe_parse": self._safe_for(m.path)})
+        path = case_file_path([m.path for m in self.case])
+        try:
+            write_case(path, dbs, active=self.case.active.path if self.case.active else None,
+                       state=self._case_state, refuse_in=self.case.evidence_dirs())
+        except (OSError, TagError) as e:
+            self.tags.messages.append("Case not saved: %s" % e)
+            return None
+        self._case_path = path
+        add_recent_case(self.tags.settings, path, [m.name for m in self.case])
+        self.tags.save_settings()
+        if any(m.db.ok and not m.sha256() for m in self.case):
+            self._schedule_case_hash_check()
+        return path
+
+    def _schedule_case_hash_check(self):
+        if getattr(self, "_case_hash_after", None) is None:
+            self._case_hash_after = self.after(2000, self._case_hash_check)
+
+    def _case_hash_check(self):
+        """Once hashed, a database is compared with the SHA-256 its case file recorded; the
+        case file then records the hashes."""
+        self._case_hash_after = None
+        if not self.case.multi:
+            return
+        waiting, changed = False, []
+        for m in self.case:
+            sha = m.sha256()
+            if not sha:
+                waiting = waiting or (m.db.ok and not m.db.evidence.hash_error)
+                continue
+            diff = sha256_change(m.saved, sha)
+            if diff and diff not in m.changes:
+                m.changes.append(diff)
+                changed.append(m)
+        if changed:
+            self._refresh_case_ui()
+        if waiting:
+            self._schedule_case_hash_check()
+        else:
+            self._save_case()
+
+    def reopen_case(self, path, wait=False, ask=None):
+        """Open the databases of a saved case, saying first which ones changed (size, time;
+        the SHA-256 is compared once each is hashed) or are missing.
+
+        A network path (engine.evidence.is_network_path: UNC, \\\\?\\UNC\\, a mapped network
+        drive) is not checked or opened unless the examiner says so: checking it would make
+        Windows connect (and send the user's credentials) to that computer. When the case
+        lists one, every path is listed first, the network ones marked 'network path — not
+        checked', and the examiner chooses: open them too (Yes), leave them out (No), or
+        cancel. ask(title, text) -> True / False / None replaces that question (tests)."""
+        try:
+            data = read_case(path)
+        except TagError as e:
+            messagebox.showerror("Case", str(e))
+            return []
+        dbs = data["databases"]
+        network = [d for d in dbs if is_network_path(d["path"])]
+        if network:
+            ask = ask or (lambda title, text: messagebox.askyesnocancel(title, text,
+                                                                        parent=self))
+            lines = ["%s%s" % (d["path"], "   (network path — not checked)"
+                               if d in network else "") for d in dbs]
+            answer = ask("Case", "This case lists %d database%s:\n\n%s\n\n%d of them %s on "
+                                 "another computer. Checking or opening a network path makes "
+                                 "Windows connect to that computer with your sign-in.\n\n"
+                                 "Yes: open the network paths too.\nNo: leave them out.\n"
+                                 "Cancel: do not open the case." % (
+                                     len(dbs), "" if len(dbs) == 1 else "s", "\n".join(lines),
+                                     len(network), "is" if len(network) == 1 else "are"))
+            if answer is None:
+                return []
+            if not answer:
+                dbs = [d for d in dbs if d not in network]
+                if not dbs:
+                    return []
+        saved = dict((os.path.normcase(os.path.abspath(d["path"])), d) for d in dbs)
+        problems = []
+        for d in dbs:
+            diff = case_changes(d)
+            if diff:
+                problems.append("%s: %s" % (d["path"], "; ".join(diff)))
+        if problems and not messagebox.askyesno(
+                "Case", "Some databases of this case are not as they were when the case was "
+                        "saved:\n\n%s\n\nOpen the case anyway? Missing files are left out."
+                        % "\n".join(problems)):
+            return []
+        paths = [d["path"] for d in dbs if os.path.isfile(d["path"])]
+        # the changes were just shown: the chips keep them ('changed'), no second message
+        state = data.get("state") or {}
+
+        def done(members):
+            if not members:
+                return
+            pinned = state.get("pinned")
+            if isinstance(pinned, list):
+                self._navigator.pinned = set(p for p in pinned if isinstance(p, str))
+            scopes = state.get("scopes")
+            sel = state.get("search_databases")         # a case saved by an earlier version
+            if not isinstance(scopes, dict) and isinstance(sel, list):
+                scopes = {"global": sel}
+            if isinstance(scopes, dict):
+                self.scopes.load_state(scopes)
+            self._navigator.apply_filter()
+            self._update_search_options()
+        return self._open_paths(paths, saved=saved, active=data.get("active"), state=state,
+                                changes_told=bool(problems), on_done=done, wait=wait)
+
+    def _save_navigator_state(self):
+        self._save_case()
+
+    def _count_loop(self, gen):
+        """The row-count worker: the databases queued (one after the other, not one thread
+        each: a case of many large databases must not start as many full counts at once).
+        First every queued database's instant approximations, then the exact counts."""
+        try:
+            while gen == self._count_gen:
+                with self._count_lock:
+                    batch = list(self._count_queue)
+                    del self._count_queue[:]
+                    if not batch:
+                        self._count_worker = None
+                        return
+                for m in batch:
+                    if m.db.ok:
+                        self._bg_count(list(m.db.tables()), gen, m.counts, m.db, exact=False)
+                for m in batch:
+                    if m.db.ok:
+                        self._bg_count(list(m.db.tables()), gen, m.counts, m.db, approx=False)
+            with self._count_lock:
+                if self._count_worker is threading.current_thread():
+                    self._count_worker = None
+        finally:
+            self._release_worker_connection()
+
+    def _bg_count(self, tables, gen, cache, db=None, approx=True, exact=True):
+        """Row counts on a worker thread, written into `cache` (that database's count dict).
+
+        Pass 1: max(rowid) approximations for SQL-served rowid tables (instant).
+        Pass 2: exact COUNT(*) or native B-tree counts, replacing the approximations.
+
+        `gen` identifies the open this thread belongs to. Closing (or a stop) bumps
+        self._count_gen, so a thread still finishing a count stops; a database closed on its
+        own (removed from the case) stops its thread through its session.
+        """
+        db = db if db is not None else self.db
+        session = db.session
+
+        def stale():
+            return gen != self._count_gen or db.session is not session
+
+        for t in (tables if approx else ()):
+            if stale():
+                return
+            approx_n = db.approx_count(t)
+            if approx_n is not None and not isinstance(cache.get(t), int):
+                cache[t] = f"~{approx_n}"
+        if not stale():
+            self._after_safe(0, self._update_schema_counts)
+        if not exact:
+            return
         last_update = 0
         for t in tables:
-            if self._count_cancel:
-                break
+            if stale():
+                return
             try:
-                r = conn.execute(f"SELECT COUNT(*) FROM {_q(t)}").fetchone()
-                self._count_cache[t] = r[0] if r else 0
+                cache[t] = db.count(t)
             except Exception:
-                if not isinstance(self._count_cache.get(t), int):
-                    self._count_cache[t] = "?"
+                if not isinstance(cache.get(t), int):
+                    cache[t] = "?"
             now = time.time()
             if now - last_update >= 0.3:
                 last_update = now
-                self.after(0, self._update_schema_counts)
-        try:
-            conn.close()
-        except Exception:
-            pass
-        if not self._count_cancel:
-            self.after(0, self._update_schema_counts)
+                self._after_safe(0, self._update_schema_counts)
+        if not stale():
+            self._after_safe(0, self._update_schema_counts)
 
     def _update_schema_counts(self):
-        tree = self._schema_tree
-        for iid in tree.get_children():
-            text = tree.item(iid, "text")
-            if text == "Tables":
-                for child in tree.get_children(iid):
-                    vals = tree.item(child, "values")
-                    if vals and len(vals) >= 1:
-                        tbl = vals[0]
-                        cnt = self._count_cache.get(tbl, "?")
-                        tree.item(child, text=f"{tbl}  ({fmt_count(cnt)})")
+        """Row counts changed (the count worker): the navigator's and the Overview's lines."""
+        self._navigator.refresh_counts()
+        if self._overview_added:
+            if getattr(self, "_overview_counts_after", None) is None:
+                self._overview_counts_after = self.after(500, self._overview_counts)
+
+    def _overview_counts(self):
+        self._overview_counts_after = None
+        if self._overview_added:
+            self._overview.refresh_counts()
 
     def _on_app_close(self):
-        """Handle window close — confirm if DB is open with WAL data."""
-        if self.db.ok and self.db.has_wal:
-            bak = self.db.wal_backup_path
-            msg = "Close the application?"
-            if bak:
-                msg += f"\n\nWAL backup preserved at:\n{os.path.basename(bak)}"
-            if not messagebox.askokcancel("Close", msg):
-                return
-        self.db.close()
+        """Close the database (verifying the evidence) and exit."""
+        self._close_db(confirm=False, wait=True)
+        self.wait_closed()              # a verification still running from an earlier close
         self.destroy()
 
-    def _close_db(self, confirm=True):
-        if confirm and self.db.ok and self.db.has_wal:
-            bak = self.db.wal_backup_path
-            msg = "Close the current database?"
-            if bak:
-                msg += f"\n\nWAL data has been backed up to:\n{os.path.basename(bak)}\n(next to your database file)"
-            if not messagebox.askokcancel("Close Database", msg):
-                return
-        self._count_cancel = True
-        self.db.close()
-        self._count_cache = {}
-        self._scope_tables = []
+    def closing(self):
+        """True while the evidence of databases just closed is being verified."""
+        return self._close_verify is not None
+
+    def wait_closed(self):
+        """Block until the evidence of the databases closed last is verified (exit, tests)."""
+        st = self._close_verify
+        if st is not None:
+            st["thread"].join()
+            self._close_verified(st)
+
+    def _verify_after_close(self, pending, log):
+        """Verify the evidence of databases just closed [(name, path, EvidenceSet)] on a
+        worker thread: size and time, and the SHA-256 again up to the limit
+        verify_rehash_bytes (a small window with 'Skip SHA-256' shows when that takes more
+        than half a second). The results go to the case's activity log, the header and, for a
+        changed file, a warning."""
+        limit = limits.get("verify_rehash_bytes")
+        total = sum(ev.total_bytes for _n, _p, ev in pending if ev.rehash_on_close(limit))
+        st = {"skip": False, "done": 0, "name": "", "reports": [], "end": False,
+              "t0": time.time(), "win": None, "total": total, "shown": False}
+
+        def work():
+            try:
+                for name, path, ev in pending:
+                    st["name"] = name
+
+                    def progress(n):
+                        st["done"] += n
+                    try:
+                        rep = ev.verify_on_close(limit, lambda: st["skip"], progress)
+                    except Exception:   # noqa: BLE001 - the hash failed: size and time
+                        rep = ev.verify(rehash=False)
+                    st["reports"].append((name, path, rep))
+                    if log is not None:
+                        try:
+                            log.log("close", database=path, unchanged=rep.unchanged,
+                                    checked=rep.checked_text(),
+                                    differences=list(rep.differences))
+                        except Exception:       # noqa: BLE001 - the log never stops it
+                            pass
+            except Exception as e:      # noqa: BLE001 - said in the header
+                e.__traceback__ = None
+                st["error"] = e
+            finally:
+                st["end"] = True
+        th = st["thread"] = threading.Thread(target=work, name="verify-after-close",
+                                             daemon=True)
+        prev = self._close_verify
+        self._close_verify = st
+        if prev is not None:
+            self._close_verified(prev)  # an earlier close still verifying: its results too
+        th.start()
+        self.after(50, self._poll_close_verify, st)
+
+    def _poll_close_verify(self, st):
+        if st.get("reported"):
+            return
+        if not st["end"]:
+            win = st["win"]
+            if win is None and st["total"] and time.time() - st["t0"] > 0.5:
+                win = st["win"] = tk.Toplevel(self)
+                win.title("Verifying the evidence of the closed databases")
+                win.configure(bg=C["bg"])
+                win.transient(self)
+                win.resizable(False, False)
+                win.protocol("WM_DELETE_WINDOW", lambda: st.update(skip=True))
+                st["lbl"] = tk.Label(win, text="", bg=C["bg"], anchor="w", justify="left",
+                                     width=60, wraplength=420)
+                st["lbl"].pack(fill="x", padx=12, pady=(10, 4))
+                st["bar"] = ttk.Progressbar(win, mode="determinate",
+                                            maximum=max(st["total"], 1), length=420)
+                st["bar"].pack(fill="x", padx=12, pady=4)
+                ttk.Button(win, text="Skip SHA-256 (size and time only)",
+                           command=lambda: st.update(skip=True)).pack(pady=(4, 10))
+                place_over(win, self)
+            if win is not None:
+                try:
+                    st["lbl"].configure(text="Re-computing the SHA-256 of %s: %s of %s%s" % (
+                        st["name"], fmtb(st["done"]), fmtb(st["total"]),
+                        " — skipping, checking size and time…" if st["skip"] else ""))
+                    st["bar"].configure(value=min(st["done"], st["total"]))
+                except tk.TclError:
+                    st["skip"] = True
+            self.after(100, self._poll_close_verify, st)
+            return
+        self._close_verified(st)
+
+    def _close_verified(self, st):
+        """The evidence of the closed databases is verified: say what was checked, and warn
+        about a changed file."""
+        if st.get("reported"):
+            return
+        st["reported"] = True
+        if self._close_verify is st:
+            self._close_verify = None
+        if st["win"] is not None:
+            try:
+                st["win"].destroy()
+            except tk.TclError:
+                pass
+        changed, closed = [], []
+        for name, _path, rep in st["reports"]:
+            if not rep.unchanged:
+                changed.append(rep.text())
+            closed.append("%s %s (%s)" % (name, "verified unchanged" if rep.unchanged
+                                          else "CHANGED", rep.checked_text()))
+        if st.get("error") is not None:
+            closed.append("verification stopped: %s" % st["error"])
+        if not self.case.members and not self.opening():
+            self._db_info.set_text("No database loaded" + (
+                "  ·  last closed: " + "; ".join(closed) if closed else ""))
+        self.last_closed = closed
+        if changed:
+            messagebox.showwarning("Evidence changed", "\n\n".join(changed))
+
+    def destroy(self):
+        """Every timer still pending is cancelled first: it would otherwise call a command the
+        destroy deletes."""
+        uiyield.stop()                  # the workers no longer wait for this thread
+        cancel_all_afters(self)
+        tk.Tk.destroy(self)
+
+    # ── The activity log (engine.activity) ───────────────────────────
+    def activity(self, kind, **fields):
+        """Note what the examiner did (opened, searched, exported, verified...) in the case's
+        activity log in the app-data folder; never raises."""
+        log = getattr(self, "_activity_log", None)
+        if log is None:
+            return False
+        try:
+            return log.log(kind, **fields)
+        except Exception:               # noqa: BLE001 - the log never stops the work
+            return False
+
+    def activity_many(self, items):
+        """Several activity entries ((kind, fields) pairs) in one write; never raises."""
+        log = getattr(self, "_activity_log", None)
+        if log is None:
+            return False
+        try:
+            return log.log_many(items)
+        except Exception:               # noqa: BLE001 - the log never stops the work
+            return False
+
+    # ── Tags (for every tab) ─────────────────────────────────────────
+    def tag_entries(self, entries, tag):
+        """Tag rows: entries are engine.tags.TagEntry objects (entry_from_db_row,
+        entry_from_wal_record, entry_from_freelist, entry_from_record...). A tag of that name
+        is made when unknown. Returns the number of rows newly tagged (0 with no database)."""
+        return self.tags.tag_entries(entries, tag)
+
+    def tag_menu(self, parent_menu, get_entries, label="Tag"):
+        """Add the 'Tag' submenu (a check item per tag, New tag..., Edit note..., Remove all
+        tags) to a right-click menu, for the rows get_entries() returns (called at once).
+        Returns the submenu."""
+        return self.tags.tag_menu(parent_menu, get_entries, label)
+
+    def _stop_workers(self, timeout=WORKER_STOP_WAIT):
+        """Cancel the count, search and SQL-tab worker threads and wait for them to end.
+
+        Their statements are interrupted, then this waits up to `timeout` seconds, so the DB is
+        not closed under a running worker (the session never closes a connection another
+        thread still holds either). It does not block in join(): a worker may itself be waiting
+        for this Tk thread to serve an after() call or a variable read, so those calls are
+        served meanwhile. User input and timers are not processed during the wait, so no other
+        open or close can start inside this one. Returns the threads still running.
+        """
+        self._count_gen += 1            # the count thread of this open stops writing counts
+        jobs = list(getattr(self, "_jobs", ()))
+        for job in jobs:
+            job.cancel()                # exports, verification (they end at the next row)
+        wal = getattr(self, "_wal_frame", None)
+        if wal is not None:
+            wal.stop()                  # the WAL records being compared
+        self._search_cancel = True
+        self._sql_query_cancel = True
+        browse = self._cancel_browse_workers()
+        self._forensics.stop()          # carving, history, recovery, audit, reports
+        self.relations.stop()           # related rows, relation maps and value checks
+        self.datamap.stop()             # Copy with related, the Database Map
+        overview = getattr(self, "_overview", None)
+        if overview is not None and overview.busy():  # looking for dates, database after database
+            overview.stop_dates()
+        self._timeline.stop()
+        lookups = getattr(self, "_browse_lookups", None)
+        if lookups is not None:
+            lookups.stop()              # a linked table being read
+        dates = getattr(self, "_browse_dates", None)     # a sample for 'Show as date'
+        self.case.interrupt()           # stop the statements they are running now (every db)
+        me = threading.current_thread()
+        running = [t for t in [self._bg_count_thread, self._search_thread,
+                               self._sql_query_thread] + list(self._count_threads)
+                   if t is not None and t is not me]
+        running += [t for t in browse + self._forensics.worker_threads() + self.tags.worker_threads()
+                    + self.relations.worker_threads() + self._timeline.worker_threads()
+                    + (lookups.worker_threads() if lookups is not None else [])
+                    + (dates.worker_threads() if dates is not None else [])
+                    + self.datamap.worker_threads()
+                   + (overview.worker_threads() if overview is not None else [])
+                    + [j.thread for j in jobs if j.thread.is_alive()]
+                    + (wal.worker_threads() if wal is not None else [])
+                    if t is not me]
+        deadline = time.time() + timeout
+        while True:
+            running = [t for t in running if t.is_alive()]
+            if not running or time.time() >= deadline:
+                return running
+            uiyield.beat()              # the workers waited for do not give way
+            try:
+                for _ in range(100):
+                    if not self.tk.dooneevent(WORKER_CALLS_ONLY):
+                        break
+            except tk.TclError:
+                pass                    # Tk is gone: a worker's call into it fails and it ends
+            running[0].join(0.01)
+
+    def _cancel_browse_workers(self):
+        """Drop the Browse grid's queued window reads and row counts; returns the threads
+        still running one (they end once their interrupted statement returns)."""
+        self._browse_count_gen += 1
+        self._browse_pos_gen += 1
+        self._browse_pos_busy = False
+        self._browse_grid.cancel_fetches()
+        self._browse_counter.cancel()
+        return self._browse_grid.worker_threads() + self._browse_counter.threads()
+
+    def _verify_before_close(self, members):
+        """{uid: VerifyReport} of the databases about to close: size and time, and the SHA-256
+        again up to the limit verify_rehash_bytes. The re-hash runs on a worker thread; while
+        it runs a small window shows which file and how far, with 'Skip SHA-256 (size and time
+        only)'. Only that window takes input meanwhile (the close waits for it)."""
+        limit = limits.get("verify_rehash_bytes")
+        items = [(m, m.db.evidence) for m in members if m.db.ok]
+        reports = {}
+        if not any(ev.rehash_on_close(limit) for _m, ev in items):
+            for m, ev in items:         # size and time only: quick, no window
+                reports[m.uid] = ev.verify_on_close(limit)
+            return reports
+        total = sum(ev.total_bytes for _m, ev in items if ev.rehash_on_close(limit))
+        state = {"skip": False, "done": 0, "name": "", "error": None, "end": False}
+
+        def work():
+            try:
+                for m, ev in items:
+                    state["name"] = m.name
+
+                    def progress(n):
+                        state["done"] += n
+                    reports[m.uid] = ev.verify_on_close(limit, lambda: state["skip"], progress)
+            except Exception as e:      # noqa: BLE001 - reported; the close goes on
+                state["error"] = e
+            finally:
+                state["end"] = True
+        th = threading.Thread(target=work, name="verify-on-close", daemon=True)
+        th.start()
+        th.join(0.3)                    # a small case is done before any window shows
+        if th.is_alive():
+            win = tk.Toplevel(self)
+            win.title("Verifying the evidence before closing")
+            win.configure(bg=C["bg"])
+            win.transient(self)
+            win.resizable(False, False)
+            win.protocol("WM_DELETE_WINDOW", lambda: state.update(skip=True))
+            lbl = tk.Label(win, text="", bg=C["bg"], anchor="w", justify="left", width=60,
+                           wraplength=420)
+            lbl.pack(fill="x", padx=12, pady=(10, 4))
+            bar = ttk.Progressbar(win, mode="determinate", maximum=max(total, 1), length=420)
+            bar.pack(fill="x", padx=12, pady=4)
+            skip_btn = ttk.Button(win, text="Skip SHA-256 (size and time only)",
+                                  command=lambda: state.update(skip=True))
+            skip_btn.pack(pady=(4, 10))
+            place_over(win, self)
+            self._verify_close_win = win
+            # closing the main window meanwhile only skips the re-hash (the close goes on)
+            self.protocol("WM_DELETE_WINDOW", lambda: state.update(skip=True))
+            try:
+                win.grab_set()
+                win.focus_set()
+            except tk.TclError:
+                pass
+            while th.is_alive():
+                try:
+                    if not win.winfo_exists():
+                        state["skip"] = True
+                    else:
+                        lbl.configure(text="Re-computing the SHA-256 of %s: %s of %s%s" % (
+                            state["name"], fmtb(state["done"]), fmtb(total),
+                            " — skipping, checking size and time…" if state["skip"] else ""))
+                        bar.configure(value=min(state["done"], total))
+                    self.update()
+                except tk.TclError:
+                    state["skip"] = True
+                th.join(0.05)
+            self._verify_close_win = None
+            try:
+                self.protocol("WM_DELETE_WINDOW", self._on_app_close)
+                win.grab_release()
+                win.destroy()
+            except tk.TclError:
+                pass
+        th.join()
+        if state["error"] is not None:
+            for m, ev in items:         # what could not be verified with the hash: size/time
+                if m.uid not in reports:
+                    reports[m.uid] = ev.verify(rehash=False)
+        return reports
+
+    def _close_db(self, confirm=True, wait=False):
+        """Close every open database (the whole case), verifying each one's evidence (size and
+        time, and SHA-256 again up to the limit verify_rehash_bytes; the header then says what
+        was verified). confirm: ask first when a case of several databases would close.
+
+        The verification runs on a worker thread once the databases are closed (it needs only
+        their files): the header says it is verifying, then what was verified; a changed file
+        is reported as before. wait=True (exit, scripts): verify first, then close."""
+        if confirm and self.case.multi and not messagebox.askyesno(
+                "Close case", "Close the case of %d databases? It stays under Recent."
+                % len(self.case), parent=self):
+            return False
+        self._cancel_open()             # databases still opening never join
+        if self.case.multi:
+            self._save_case()           # the case as it is now (the search choice)
+        self.tags.closing()             # saves the tags and the Browse view state
+        self._stop_workers()            # nothing may be closed under a running worker
+        members = list(self.case)
+        reports = self._verify_before_close(members) if wait else None
+        pending = [(m.name, m.path, m.db.evidence) for m in members if m.db.ok]
+        closed_log = self._activity_log
+        changed, closed = [], []
+        for m in members:
+            name, path = m.name, m.path
+            if reports is None:
+                self.case.remove(m, False)      # verified below, on a worker thread
+                continue
+            # leaves a connection still in use to its thread
+            report = self.case.remove(m, reports.get(m.uid))
+            if report is None:
+                continue
+            self.activity("close", database=path, unchanged=report.unchanged,
+                          checked=report.checked_text(), differences=list(report.differences))
+            if not report.unchanged:
+                changed.append(report.text())
+            closed.append("%s %s (%s)" % (name, "verified unchanged" if report.unchanged
+                                          else "CHANGED", report.checked_text()))
+        if changed:
+            messagebox.showwarning("Evidence changed", "\n\n".join(changed))
+        self._activity_log = None
+        self._case_path, self._case_state = None, {}
+        self._count_threads = []
+        with self._count_lock:
+            del self._count_queue[:]
+        self.relations.close_all()      # their rows belong to the databases just closed
+        self.datamap.close_all()
+        self._no_counts, self._no_scope = {}, []
         self._search_results = []
         self._search_errors = []
-        self._browse_cache_data = []
-        self._browse_cache_cols = []
-        self._browse_display_rows = []
-        # Clear per-column filters
-        for w in self._col_filter_frame.winfo_children():
-            # Remove Deleted Pages tab if present
-            if self._fl_tab_added:
-                try:
-                    self._nb.forget(self._fl_frame)
-                except Exception:
-                    pass
-                self._fl_tab_added = False
-                for w in self._fl_frame.winfo_children():
-                    w.destroy()
-            self._fl_data = []
-            # Clear SQL editor state
-            if hasattr(self, '_sql_results_tree'):
-                self._sql_results_tree.delete(*self._sql_results_tree.get_children())
-            if hasattr(self, '_sql_status_label'):
-                self._sql_status_label.configure(text='Open a database to start querying.')
-            if hasattr(self, '_sql_col_info'):
-                self._sql_col_info.configure(text='')
-            self._sql_result_rows = []
-            self._sql_result_cols = []
-            w.destroy()
-        self._col_filters = {}
-        self._col_filter_timer = None
+        self._sr_reset_groups()
+        self._sr_filtered = []
+        self._forensics.reset()
+        self._timeline.reset()
+        self._browse_dates.reset()
+        self._browse_lookups.reset()
+        self._browse_source = None
+        self._browse_grid.set_source(None)
+        self._browse_filter_var.set("")
+        self._show_browse_note([])
+        self._update_browse_status()
+        self._banners = []
+        self._overview.reset()
+        self._navigator.hits, self._navigator.dates = {}, {}
+        self._navigator.pinned = set()
+        self.scopes.global_sel, self.scopes.own, self.scopes.saved = None, {}, {}
+        self._chips_issue_count = None
+        if self._issues_win is not None and self._issues_win.winfo_exists():
+            self._issues_win.destroy()
+        self._refresh_issue_btn()
+        # Clear SQL editor state
+        self._sql_grid.set_source(None)
+        if hasattr(self, '_sql_status_label'):
+            self._sql_status_label.configure(text='Open a database to start querying.')
+        if hasattr(self, '_sql_col_info'):
+            self._sql_col_info.configure(text='')
+        self._sql_result_rows = []
+        self._sql_result_cols = []
         self._search_tree.delete(*self._search_tree.get_children())
-        self._browse_tree.delete(*self._browse_tree.get_children())
-        self._schema_tree.delete(*self._schema_tree.get_children())
         self._browse_table_combo.configure(values=[])
         self._browse_table_var.set("")
-        self._db_info.configure(text="  No database loaded")
-        self._sql_preview.configure(state="normal")
-        self._sql_preview.delete("1.0", "end")
-        self._sql_preview.configure(state="disabled")
-        for w in self._preview_inner.winfo_children():
-            w.destroy()
+        self._refresh_header()
+        if reports is None and pending:
+            self._db_info.set_text("No database loaded  ·  verifying the evidence of %s "
+                                   "just closed…" % plural(len(pending), "database"))
+            self._verify_after_close(pending, closed_log)
+        else:
+            self.last_closed = closed
+            self._db_info.set_text("No database loaded" + (
+                "  ·  last closed: " + "; ".join(closed) if closed else ""))
         # Remove WAL tab if present
+        self._wal_frame.reset()
         if self._wal_tab_added:
             try:
                 self._nb.forget(self._wal_frame)
-            except Exception:
+            except tk.TclError:
                 pass
             self._wal_tab_added = False
-            # Clear WAL tab contents
-            for w in self._wal_frame.winfo_children():
-                w.destroy()
+        self._update_sql_notice()
+        self._search_work, self._search_tables = [], []
+        self._navigator.rebuild()
+        self._update_overview()
+        self._refresh_case_ui()
+        self._search_status.set("Ready")
 
     def _show_info(self):
         if not self.db.ok:
@@ -2771,10 +4516,12 @@ class App(tk.Tk):
         info = (
             f"Path: {m.get('path', '')}\n"
             f"Size: {fmtb(m.get('size', 0))}\n"
+            f"Open mode: {mode_label(m.get('mode', ''), long=True)}\n"
             f"Page size: {m.get('page_size', '')}\n"
             f"Page count: {m.get('page_count', '')}\n"
             f"Journal mode: {m.get('journal_mode', '')}\n"
             f"Encoding: {m.get('encoding', '')}\n"
+            f"Reserved bytes/page: {m.get('reserved_bytes', '')}\n"
             f"Auto vacuum: {m.get('auto_vacuum', '')}\n"
             f"User version: {m.get('user_version', '')}\n"
             f"Freelist count: {m.get('freelist_count', '')}\n"
@@ -2784,1193 +4531,425 @@ class App(tk.Tk):
             f"Indexes: {len(self.db.all_indexes())}\n"
             f"Triggers: {len(self.db.triggers())}"
         )
-        # Add WAL info if available
         if self.db.has_wal:
             ws = self.db.wal.summary()
-            info += (
-                f"\n\nWAL File:\n"
-                f"WAL size: {fmtb(ws.get('wal_size', 0))}\n"
-                f"WAL frames: {ws.get('total_frames', 0)}\n"
-                f"  Committed: {ws.get('committed', 0)}\n"
-                f"  Uncommitted: {ws.get('uncommitted', 0)}\n"
-                f"  Old/Pre-checkpoint: {ws.get('old', 0)}\n"
-                f"Unique pages: {ws.get('unique_pages', 0)}"
-            )
-        messagebox.showinfo("Database Info", info)
+            info += f"\n\nWAL File:\nWAL size: {fmtb(ws.get('wal_size', 0))}\n"
+            info += f"WAL frames: {ws.get('total_frames', 0)} ({ws.get('commits', 0)} commits)\n"
+            for state, (label, _fg, _bg, _desc) in WAL_STATES.items():
+                info += f"  {label}: {ws.get(state, 0)}\n"
+            info += f"Unique pages: {ws.get('unique_pages', 0)}"
+        messagebox.showinfo("Database info" + (" - " + self.case.active.name if self.case.multi
+                                               else ""), info, parent=self)
 
-    # ── WAL Tab ───────────────────────────────────────────────────────
-    def _build_wal_tab(self):
-        """Build the WAL forensic analysis tab with clear explanations."""
-        wf = self._wal_frame
+    def _show_banners(self):
+        """Engine status (mode, WAL, journal, collations) of the active database: kept for the
+        status window; the header shows it as one evidence chip and a warnings chip."""
+        rank = {"error": 0, "warning": 1, "info": 2}
+        self._chips_issue_count = self._issue_count()
+        self._banners = sorted(self.db.banners(), key=lambda b: rank.get(b.level, 3))
+        self._refresh_header()
+        self._refresh_issue_btn()
 
-        # Clear any existing children (rebuild on new DB)
-        for w in wf.winfo_children():
-            w.destroy()
+    def status_chips(self):
+        """(evidence chip text, warnings chip text or '') of the header (tests)."""
+        warn = self._warn_chip.text if self._warn_chip.winfo_manager() else ""
+        ev = self._evidence_chip.text if self._evidence_chip.winfo_manager() else ""
+        return ev, warn
 
-        # ── Header title ──
-        ttk.Label(wf, text="Hidden Data (WAL)", style="B.TLabel").pack(fill="x", padx=10, pady=(8, 2))
-
-        # ── Collapsible Summary stats panel ──
-        self._wal_stats_frame = tk.Frame(wf, bg="#f5f0ff", relief="groove", bd=1)
-        self._wal_stats_frame.pack(fill="x", padx=10, pady=(2, 2))
-        self._wal_stats_expanded = False
-        self._wal_stats_toggle = tk.Button(
-            self._wal_stats_frame, text="\u25b6 Summary",
-            font=("Segoe UI", 10, "bold"), bg="#f5f0ff", fg=C["purple"],
-            anchor="w", relief="flat", bd=0, cursor="hand2",
-            command=self._toggle_wal_stats)
-        self._wal_stats_toggle.pack(fill="x", padx=10, pady=(4, 0))
-        self._wal_stats_content = ttk.Frame(self._wal_stats_frame)
-        # Hidden by default (collapsed)
-
-        # ── Summary bar ──
-        self._wal_summary = ttk.Label(wf, text="", style="B.TLabel")
-        self._wal_summary.pack(fill="x", padx=10, pady=(4, 2))
-
-        # ── Filter bar (Row 1: view toggle + filters) ──
-        fbar = ttk.Frame(wf)
-        fbar.pack(fill="x", padx=10, pady=(2, 0))
-
-        # View toggle buttons
-        self._wal_view_mode = "frames"
-        self._wal_frame_view_btn = tk.Button(
-            fbar, text="Frame View", font=("Segoe UI", 8, "bold"),
-            relief="sunken", bd=1, bg=C["acl"], fg=C["accent"],
-            cursor="hand2", padx=6, pady=1,
-            command=lambda: self._switch_wal_view("frames"))
-        self._wal_frame_view_btn.pack(side="left", padx=(0, 1))
-        self._wal_all_rec_btn = tk.Button(
-            fbar, text="All Records", font=("Segoe UI", 8),
-            relief="raised", bd=1, bg=C["bg2"], fg=C["text2"],
-            cursor="hand2", padx=6, pady=1,
-            command=lambda: self._switch_wal_view("records"))
-        self._wal_all_rec_btn.pack(side="left", padx=(1, 8))
-
-        ttk.Label(fbar, text="Status:", font=("Segoe UI", 9)).pack(side="left")
-        self._wal_cat_var = tk.StringVar(value="All")
-        cat_combo = ttk.Combobox(fbar, textvariable=self._wal_cat_var,
-                                  values=["All", "committed", "uncommitted", "old"],
-                                  state="readonly", width=14)
-        cat_combo.pack(side="left", padx=(2, 8))
-        cat_combo.bind("<<ComboboxSelected>>", lambda e: self._filter_wal_frames())
-        ToolTip(cat_combo, "Filter frames by status:\n"
-                "  In DB = committed and written to DB\n"
-                "  WAL Only = not yet in main DB\n"
-                "  Older Version = replaced by newer data")
-
-        ttk.Label(fbar, text="Table:", font=("Segoe UI", 9)).pack(side="left")
-        self._wal_table_var = tk.StringVar(value="All")
-        self._wal_table_combo = ttk.Combobox(fbar, textvariable=self._wal_table_var,
-                                              values=["All"], state="readonly", width=22)
-        self._wal_table_combo.pack(side="left", padx=(2, 8))
-        self._wal_table_combo.bind("<<ComboboxSelected>>", lambda e: self._filter_wal_frames())
-        ToolTip(self._wal_table_combo, "Filter frames by table name (type to search)")
-
-        ttk.Label(fbar, text="Data Type:", font=("Segoe UI", 9)).pack(side="left")
-        self._wal_pt_var = tk.StringVar(value="All")
-        self._wal_pt_combo = ttk.Combobox(fbar, textvariable=self._wal_pt_var,
-                                           values=["All"], state="readonly", width=14)
-        self._wal_pt_combo.pack(side="left", padx=(2, 8))
-        self._wal_pt_combo.bind("<<ComboboxSelected>>", lambda e: self._filter_wal_frames())
-        ToolTip(self._wal_pt_combo, "Filter by page type:\n"
-                "  Table Leaf = contains actual row data\n"
-                "  Table Interior = internal tree structure\n"
-                "  Index Leaf/Interior = index data")
-
-        ttk.Label(fbar, text="Page#:", font=("Segoe UI", 9)).pack(side="left")
-        self._wal_page_var = tk.StringVar()
-        wal_page_entry = ttk.Entry(fbar, textvariable=self._wal_page_var, width=6)
-        wal_page_entry.pack(side="left", padx=(2, 4))
-        self._wal_page_var.trace_add("write", lambda *a: self._filter_wal_frames())
-        ToolTip(wal_page_entry, "Filter to a specific database page number")
-
-        # ── Action bar (Row 2: actions + exports + details) ──
-        abar = ttk.Frame(wf)
-        abar.pack(fill="x", padx=10, pady=(1, 2))
-
-        ttk.Button(abar, text="Refresh", command=self._populate_wal_tab).pack(side="left", padx=2)
-        ttk.Button(abar, text="Export CSV", command=self._export_wal_summary).pack(side="left", padx=2)
-        ttk.Button(abar, text="Export All Records", command=self._export_wal_all_records).pack(side="left", padx=2)
-        ttk.Button(abar, text="Export BLOBs", command=self._export_wal_blobs).pack(side="left", padx=2)
-        # Details button — always visible on right of action bar
-        details_btn = ttk.Button(abar, text="Technical Details", command=self._show_wal_header)
-        details_btn.pack(side="right", padx=2)
-        ToolTip(details_btn, "Show the raw WAL file header and technical metadata")
-
-        # ── PanedWindow: frame list (top) + detail (bottom) ──
-        self._wal_pw = ttk.PanedWindow(wf, orient="vertical")
-        self._wal_pw.pack(fill="both", expand=True, padx=10, pady=(2, 10))
-
-        # Frame list treeview
-        top_frame = ttk.Frame(self._wal_pw)
-        self._wal_pw.add(top_frame, weight=3)
-
-        border = tk.Frame(top_frame, relief="solid", bd=1, bg=C["border"])
-        border.pack(fill="both", expand=True)
-
-        wal_cols = ("Table", "Status", "Data Type", "Records")
-        self._wal_tree = ttk.Treeview(border, columns=wal_cols, show="headings", selectmode="browse")
-        for c in wal_cols:
-            self._wal_tree.heading(c, text=c, command=lambda col=c: self._sort_wal_tree(col))
-        self._wal_tree.column("Table", width=280, minwidth=150, stretch=True)
-        self._wal_tree.column("Status", width=100, minwidth=80, stretch=False)
-        self._wal_tree.column("Data Type", width=120, minwidth=90, stretch=False)
-        self._wal_tree.column("Records", width=70, minwidth=50, stretch=False)
-
-        ysb = ttk.Scrollbar(border, orient="vertical", command=self._wal_tree.yview)
-        self._wal_tree.configure(yscrollcommand=ysb.set)
-        ysb.pack(side="right", fill="y")
-        self._wal_tree.pack(fill="both", expand=True)
-        self._wal_tree.bind("<<TreeviewSelect>>", self._on_wal_select)
-
-        # Detail panel (bottom)
-        detail_frame = ttk.Frame(self._wal_pw)
-        self._wal_pw.add(detail_frame, weight=2)
-
-        # Detail notebook: Summary | Recovered Data | Raw Hex (3 tabs only)
-        self._wal_detail_nb = ttk.Notebook(detail_frame)
-        self._wal_detail_nb.pack(fill="both", expand=True)
-
-        # Summary tab (replaces "Page Info")
-        info_frame = ttk.Frame(self._wal_detail_nb)
-        self._wal_detail_nb.add(info_frame, text=" Summary ")
-        self._wal_page_info = tk.Text(info_frame, wrap="word", height=8,
-                                       bg=C["bg2"], fg=C["text"], font=("Consolas", 10))
-        self._wal_page_info.pack(fill="both", expand=True)
-        self._wal_page_info.configure(state="disabled")
-
-        # Recovered Data tab (replaces "Parsed Records")
-        rec_frame = ttk.Frame(self._wal_detail_nb)
-        self._wal_detail_nb.add(rec_frame, text=" Recovered Data ")
-        self._wal_rec_border = tk.Frame(rec_frame, relief="solid", bd=1, bg=C["border"])
-        self._wal_rec_border.pack(fill="both", expand=True)
-
-        # Raw Hex tab (replaces "Hex View")
-        hex_frame = ttk.Frame(self._wal_detail_nb)
-        self._wal_detail_nb.add(hex_frame, text=" Raw Hex ")
-        hex_btn_bar = ttk.Frame(hex_frame)
-        hex_btn_bar.pack(fill="x")
-        ttk.Button(hex_btn_bar, text="Copy Raw Hex", command=self._copy_wal_hex_raw).pack(side="left", padx=4, pady=2)
-        ttk.Button(hex_btn_bar, text="Copy Formatted", command=self._copy_wal_hex).pack(side="left", padx=4, pady=2)
-        ttk.Button(hex_btn_bar, text="Copy Base64", command=self._copy_wal_hex_b64).pack(side="left", padx=4, pady=2)
-        self._wal_hex_view = tk.Text(hex_frame, wrap="none", height=8,
-                                      bg=C["bg2"], fg=C["text"], font=("Consolas", 10))
-        hex_sb = ttk.Scrollbar(hex_frame, orient="vertical", command=self._wal_hex_view.yview)
-        hex_xsb = ttk.Scrollbar(hex_frame, orient="horizontal", command=self._wal_hex_view.xview)
-        self._wal_hex_view.configure(yscrollcommand=hex_sb.set, xscrollcommand=hex_xsb.set)
-        hex_sb.pack(side="right", fill="y")
-        hex_xsb.pack(side="bottom", fill="x")
-        self._wal_hex_view.pack(fill="both", expand=True)
-        self._wal_hex_view.configure(state="disabled")
-
-        # ── All Records view (standalone frame, hidden by default) ──
-        self._wal_ar_frame = ttk.Frame(wf)
-        # Not packed — shown only when "All Records" view is active
-
-        ar_top = ttk.Frame(self._wal_ar_frame)
-        ar_top.pack(fill="x", padx=4, pady=4)
-
-        ttk.Button(ar_top, text="Load", command=self._load_all_wal_records).pack(side="left", padx=4)
-
-        # Show filter: All / Different from DB / WAL Only (not in DB)
-        tk.Frame(ar_top, width=8).pack(side="left")
-        ttk.Label(ar_top, text="Show:", font=("Segoe UI", 8)).pack(side="left", padx=(0, 2))
-        self._ar_show_var = tk.StringVar(value="All")
-        ar_show_combo = ttk.Combobox(ar_top, textvariable=self._ar_show_var,
-                                      values=["All", "Different from DB",
-                                              "WAL Only (not in DB)",
-                                              "★ WAL-Only Tables",
-                                              "Same as DB"],
-                                      state="readonly", width=20, font=("Segoe UI", 8))
-        ar_show_combo.pack(side="left", padx=2)
-        ar_show_combo.bind("<<ComboboxSelected>>",
-                           lambda e: self._apply_ar_show_filter())
-
-        # Pagination
-        tk.Frame(ar_top, width=12).pack(side="left")
-        ttk.Button(ar_top, text="\u25c0", command=self._ar_prev_page, width=3).pack(side="left", padx=1)
-        ttk.Button(ar_top, text="\u25b6", command=self._ar_next_page, width=3).pack(side="left", padx=1)
-        self._ar_page_label = ttk.Label(ar_top, text="", font=("Segoe UI", 8))
-        self._ar_page_label.pack(side="left", padx=6)
-
-        # Copy buttons for All Records view
-        tk.Frame(ar_top, width=8).pack(side="left")
-        self._ar_copy_json_btn = ttk.Button(ar_top, text="Copy Row JSON",
-            command=self._ar_copy_row_json)
-        self._ar_copy_json_btn.pack(side="left", padx=2)
-        self._ar_copy_csv_btn = ttk.Button(ar_top, text="Copy Row CSV",
-            command=self._ar_copy_row_csv)
-        self._ar_copy_csv_btn.pack(side="left", padx=2)
-
-        self._ar_border = tk.Frame(self._wal_ar_frame, relief="solid", bd=1, bg=C["border"])
-        self._ar_border.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-
-        # Placeholder label
-        ttk.Label(self._ar_border,
-                  text="Click 'Load' to recover all records from the WAL file.",
-                  style="M.TLabel").pack(padx=10, pady=10)
-
-        self._ar_page = 0
-        self._ar_page_size = 200
-        self._ar_records = []
-        self._ar_records_all = []  # Unfiltered master list with diff status
-
-        # Store sorted state
-        self._wal_sort_col = "Table"
-        self._wal_sort_reverse = False
-        self._wal_filtered_frames = []
-
-    def _toggle_wal_stats(self):
-        """Toggle visibility of the WAL summary stats panel."""
-        if self._wal_stats_expanded:
-            self._wal_stats_content.pack_forget()
-            self._wal_stats_expanded = False
-            # Restore collapsed label (with counts if available)
-            lbl = self._wal_stats_toggle.cget("text")
-            self._wal_stats_toggle.configure(
-                text=lbl.replace("\u25bc", "\u25b6"))
-        else:
-            self._wal_stats_content.pack(fill="x", padx=10, pady=(2, 6))
-            self._wal_stats_expanded = True
-            lbl = self._wal_stats_toggle.cget("text")
-            self._wal_stats_toggle.configure(
-                text=lbl.replace("\u25b6", "\u25bc"))
-
-    def _switch_wal_view(self, mode):
-        """Switch between Frame View and All Records view in the WAL tab."""
-        if mode == self._wal_view_mode:
-            return
-        self._wal_view_mode = mode
-        if mode == "records":
-            # Hide the PanedWindow, show All Records frame
-            self._wal_pw.pack_forget()
-            self._wal_ar_frame.pack(fill="both", expand=True, padx=10, pady=(2, 10))
-            # Update button styles
-            self._wal_frame_view_btn.configure(
-                relief="raised", bg=C["bg2"], fg=C["text2"],
-                font=("Segoe UI", 8))
-            self._wal_all_rec_btn.configure(
-                relief="sunken", bg=C["acl"], fg=C["accent"],
-                font=("Segoe UI", 8, "bold"))
-        else:
-            # Hide All Records, show PanedWindow
-            self._wal_ar_frame.pack_forget()
-            self._wal_pw.pack(fill="both", expand=True, padx=10, pady=(2, 10))
-            # Update button styles
-            self._wal_frame_view_btn.configure(
-                relief="sunken", bg=C["acl"], fg=C["accent"],
-                font=("Segoe UI", 8, "bold"))
-            self._wal_all_rec_btn.configure(
-                relief="raised", bg=C["bg2"], fg=C["text2"],
-                font=("Segoe UI", 8))
-
-    def _populate_wal_tab(self):
-        """Populate the WAL tab with frame data from the parser."""
-        if not self.db.has_wal:
-            return
-
-        ws = self.db.wal.summary()
-
-        # Human-readable summary
-        parts = [f"{ws['total_frames']} frames found in WAL file"]
-        if ws['committed']:
-            parts.append(f"{ws['committed']} in DB")
-        if ws['uncommitted']:
-            parts.append(f"{ws['uncommitted']} WAL-only")
-        if ws['old']:
-            parts.append(f"{ws['old']} older versions")
-        parts.append(f"WAL size: {fmtb(ws['wal_size'])}")
-        parts.append(f"Page size: {ws['page_size']} bytes")
-        self._wal_summary.configure(text="  |  ".join(parts))
-
-        # Update page type filter values
-        pt_types = sorted(ws.get("page_types", {}).keys())
-        self._wal_pt_combo.configure(values=["All"] + pt_types)
-
-        # Update table name filter values from page_map
-        page_map = getattr(self.db.wal, 'page_map', {})
-        # Get unique table names that appear in WAL frames
-        # Filter out: system tables, unmapped pages (page_XXXX)
-        _skip_tables = {"sqlite_master", "sqlite_sequence"}
-        wal_tables_set = set()
-        for f in self.db.wal.frames:
-            tbl = page_map.get(f.page_num)
-            if tbl and tbl not in _skip_tables and not tbl.startswith("page_"):
-                wal_tables_set.add(tbl)
-        # Mark WAL-only tables with ★ prefix in dropdown
-        try:
-            wal_only_set = set(self.db.wal_tables())
-        except Exception:
-            wal_only_set = set()
-        wal_table_list = []
-        for t in sorted(wal_tables_set):
-            if t in wal_only_set:
-                wal_table_list.append(f"★ {t}  (WAL-only)")
-            else:
-                wal_table_list.append(t)
-        self._wal_table_combo.configure(values=["All"] + wal_table_list)
-
-        # Store all frames and display
-        self._wal_all_frames = list(self.db.wal.frames)
-        self._wal_filtered_frames = list(self._wal_all_frames)
-        self._display_wal_frames()
-
-        # Populate forensic summary stats
-        self._populate_wal_stats()
-
-    def _populate_wal_stats(self):
-        """Populate the Summary panel with per-table WAL statistics."""
-        # Clear previous content
-        for w in self._wal_stats_content.winfo_children():
-            w.destroy()
-
-        if not self.db.has_wal:
-            return
-
-        try:
-            stats = self.db.wal.table_stats()
-        except Exception:
-            stats = {}
-        if not stats:
-            ttk.Label(self._wal_stats_content,
-                      text="No table leaf data found in WAL.").pack(anchor="w")
-            return
-
-        # Identify WAL-only tables
-        try:
-            wal_only_tables = set(self.db.wal_tables())
-        except Exception:
-            wal_only_tables = set()
-
-        # Summary line
-        total_recs = sum(s["total_records"] for s in stats.values())
-        total_saved = sum(s["committed"] for s in stats.values())
-        total_unsaved = sum(s["uncommitted"] for s in stats.values())
-        total_old = sum(s["old"] for s in stats.values())
-        total_frames = sum(s["frames"] for s in stats.values())
-
-        # Update toggle label with key numbers
-        arrow = "\u25bc" if self._wal_stats_expanded else "\u25b6"
-        toggle_text = (f"{arrow} Summary \u2014 {total_recs} records across "
-                       f"{len(stats)} tables | {total_unsaved} WAL-only")
-        self._wal_stats_toggle.configure(text=toggle_text)
-
-        summary_text = (
-            f"Total: {total_recs} records across {len(stats)} tables  |  "
-            f"In DB: {total_saved}  |  WAL Only: {total_unsaved}  |  "
-            f"Older: {total_old}  |  Frames: {total_frames}")
-        tk.Label(self._wal_stats_content, text=summary_text,
-                 font=("Segoe UI", 9), bg="#f5f0ff", fg=C["text"],
-                 anchor="w").pack(fill="x", pady=(0, 4))
-
-        # Per-table treeview with scrollbar
-        stat_cols = ("Table", "Records", "In DB", "WAL Only", "Older",
-                     "Frames", "Pages", "Notes")
-        tree_frame = ttk.Frame(self._wal_stats_content)
-        tree_frame.pack(fill="x")
-        stat_tree = ttk.Treeview(tree_frame, columns=stat_cols,
-                                  show="headings", height=min(len(stats) + 1, 10))
-        for c in stat_cols:
-            stat_tree.heading(c, text=c)
-        stat_tree.column("Table", width=180, minwidth=120, stretch=True)
-        stat_tree.column("Records", width=70, minwidth=50, stretch=False)
-        stat_tree.column("In DB", width=60, minwidth=45, stretch=False)
-        stat_tree.column("WAL Only", width=75, minwidth=55, stretch=False)
-        stat_tree.column("Older", width=60, minwidth=45, stretch=False)
-        stat_tree.column("Frames", width=60, minwidth=45, stretch=False)
-        stat_tree.column("Pages", width=60, minwidth=45, stretch=False)
-        stat_tree.column("Notes", width=160, minwidth=100, stretch=True)
-        # Scrollbar — needed when table count exceeds visible height
-        stat_sb = ttk.Scrollbar(tree_frame, orient="vertical",
-                                command=stat_tree.yview)
-        stat_tree.configure(yscrollcommand=stat_sb.set)
-        stat_sb.pack(side="right", fill="y")
-        stat_tree.pack(side="left", fill="x", expand=True)
-
-        for i, (tbl_name, s) in enumerate(sorted(stats.items())):
-            notes = []
-            if tbl_name in wal_only_tables:
-                notes.append("WAL-only")
-            if s["uncommitted"] > 0:
-                notes.append("has WAL-only data")
-            if s["old"] > 0:
-                notes.append("has older versions")
-            tag = "odd" if i % 2 else "even"
-            stat_tree.insert("", "end", values=(
-                tbl_name, s["total_records"], s["committed"],
-                s["uncommitted"], s["old"], s["frames"],
-                len(s["pages"]), "; ".join(notes)
-            ), tags=(tag,))
-        stat_tree.tag_configure("odd", background=C["alt"])
-        stat_tree.tag_configure("even", background=C["bg"])
-
-    def _load_all_wal_records(self):
-        """Load all WAL records using main filter bar's Table/Status values.
-
-        Pre-computes diff status for each record by comparing against the
-        main database.  Stores ``_diff_status`` in each record dict:
-            "same"       – values identical to current DB row
-            "different"  – row exists in DB but some columns differ
-            "not_in_db"  – row not found in the main DB at all
-            "wal_table"  – entire table exists only in WAL (no DB table)
-        Also stores ``_diff_cols`` (set of column names that differ).
-        """
-        if not self.db.has_wal:
-            return
-        tbl_filter = self._wal_table_var.get()
-        status_filter = self._wal_cat_var.get()
-        # Strip ★ prefix and "(WAL-only)" suffix from WAL-only table names
-        tf_raw = tbl_filter
-        if tf_raw.startswith("★ "):
-            tf_raw = tf_raw[2:].split("  (WAL-only)")[0].strip()
-        tf = None if tbl_filter == "All" else tf_raw
-        sf = None if status_filter == "All" else status_filter
-        records = list(
-            self.db.wal.recover_all_records(table_filter=tf,
-                                             category_filter=sf))
-
-        # Pre-compute diff status by comparing each record to main DB
-        db_tables = set(self.db.tables())
-        try:
-            wal_only_tables = set(self.db.wal_tables())
-        except Exception:
-            wal_only_tables = set()
-        # Cache full_row lookups: (table, rowid) -> db_row_dict
-        _row_cache = {}
-        for rec in records:
-            tbl = rec["table"]
-            rid = rec["rowid"]
-            vals = rec.get("values_dict", {})
-
-            if tbl not in db_tables:
-                # Distinguish WAL-only tables from individual missing rows
-                rec["_diff_status"] = "wal_table" if tbl in wal_only_tables else "not_in_db"
-                rec["_diff_cols"] = set(vals.keys())
+    def status_detail_text(self):
+        """The status of every open database: those with warnings or errors first, each
+        with its notes; the rest in one line per open mode."""
+        rank = {"error": 0, "warning": 1, "info": 2}
+        warned, quiet = [], OrderedDict()
+        for m in self.case:
+            if not m.db.ok:
                 continue
-
-            cache_key = (tbl, rid)
-            if cache_key not in _row_cache:
-                db_row, _ = self.db.full_row(tbl, rid)
-                _row_cache[cache_key] = db_row
-            db_row = _row_cache[cache_key]
-
-            if not db_row:
-                rec["_diff_status"] = "not_in_db"
-                rec["_diff_cols"] = set(vals.keys())
-                continue
-
-            # Compare column values
-            diff_cols = set()
-            for col_name, wal_val in vals.items():
-                if col_name in db_row:
-                    db_v = db_row[col_name]
-                    # Normalize for comparison
-                    db_str = "NULL" if db_v is None else str(db_v)
-                    wal_str = "NULL" if wal_val is None else str(wal_val)
-                    if db_str != wal_str:
-                        diff_cols.add(col_name)
-                else:
-                    # Column not in DB row — treat as different
-                    diff_cols.add(col_name)
-
-            rec["_diff_cols"] = diff_cols
-            rec["_diff_status"] = "different" if diff_cols else "same"
-
-        self._ar_records_all = records  # Unfiltered master list
-        self._ar_page = 0
-        self._apply_ar_show_filter()
-
-    def _apply_ar_show_filter(self):
-        """Apply the Show filter (All / Different / WAL Only / WAL-Only Tables / Same)."""
-        show = self._ar_show_var.get()
-        records = getattr(self, '_ar_records_all', [])
-        if show == "Different from DB":
-            self._ar_records = [r for r in records if r.get("_diff_status") == "different"]
-        elif show == "WAL Only (not in DB)":
-            # Include both individual missing rows AND WAL-only table rows
-            self._ar_records = [r for r in records
-                                if r.get("_diff_status") in ("not_in_db", "wal_table")]
-        elif show == "★ WAL-Only Tables":
-            # Only records from tables that exist ONLY in WAL
-            self._ar_records = [r for r in records if r.get("_diff_status") == "wal_table"]
-        elif show == "Same as DB":
-            self._ar_records = [r for r in records if r.get("_diff_status") == "same"]
-        else:
-            self._ar_records = list(records)
-        self._ar_page = 0
-        self._display_all_wal_records()
-
-    def _display_all_wal_records(self):
-        """Display a page of all WAL records with diff indicators."""
-        for w in self._ar_border.winfo_children():
-            w.destroy()
-
-        total = len(self._ar_records)
-        if total == 0:
-            show = self._ar_show_var.get()
-            if show != "All":
-                msg = f"No records matching '{show}' with current filters."
+            bs = sorted(m.db.banners(), key=lambda b: rank.get(b.level, 3))
+            if any(b.level in ("warning", "error") for b in bs):
+                warned.append((m, bs))
             else:
-                msg = "No records found matching the current filters."
-            ttk.Label(self._ar_border,
-                      text=msg,
-                      style="M.TLabel").pack(padx=10, pady=10)
-            self._ar_page_label.configure(text="0 records")
-            return
-
-        start = self._ar_page * self._ar_page_size
-        end = start + self._ar_page_size
-        page_data = self._ar_records[start:end]
-        total_pages = max(1, (total + self._ar_page_size - 1) // self._ar_page_size)
-        self._ar_page_label.configure(
-            text=f"Page {self._ar_page + 1}/{total_pages}  ({total} records)")
-
-        status_map = {"committed": "In DB", "uncommitted": "WAL Only",
-                      "old": "Older Version"}
-
-        # Diff status display labels
-        diff_labels = {
-            "same": "\u2713",        # ✓ checkmark
-            "different": "\u2260",   # ≠ not-equal
-            "not_in_db": "\u2205",   # ∅ empty set (WAL only row)
-            "wal_table": "\u2605",   # ★ entire table WAL-only (NEW table)
-        }
-
-        # Determine data columns from first record
-        if page_data:
-            sample_cols = list(page_data[0]["values_dict"].keys())
-        else:
-            sample_cols = []
-
-        # Column layout: Diff | RowID | Table | Status | data columns...
-        ar_cols = ["Diff", "RowID", "Table", "Status"] + sample_cols
-
-        ar_tree = ttk.Treeview(self._ar_border, columns=ar_cols,
-                                show="headings", selectmode="browse")
-
-        # Compute sensible column widths for data columns
-        n_data = len(sample_cols)
-        if n_data <= 5:
-            data_w = 200
-        elif n_data <= 10:
-            data_w = 160
-        elif n_data <= 20:
-            data_w = 140
-        else:
-            data_w = 120
-
-        for c in ar_cols:
-            ar_tree.heading(c, text=c)
-            if c == "Diff":
-                ar_tree.column(c, width=40, minwidth=35, stretch=False, anchor="center")
-            elif c == "RowID":
-                ar_tree.column(c, width=70, minwidth=50, stretch=False)
-            elif c == "Status":
-                ar_tree.column(c, width=90, minwidth=70, stretch=False)
-            elif c == "Table":
-                ar_tree.column(c, width=140, minwidth=80, stretch=False)
+                quiet.setdefault(mode_label(m.db.mode, long=True), []).append((m, bs))
+        lines = []
+        for m, bs in warned:
+            lines.append("%s  (%s)" % (m.name, m.path))
+            for b in bs:
+                lines.append("  %s %s: %s" % ("⚠" if b.level != "info" else "·", b.short, b.text))
+            lines.append("")
+        for mode, ms in quiet.items():
+            if len(ms) == 1 and not warned and len(quiet) == 1:
+                m, bs = ms[0]
+                lines.append("%s  (%s)" % (m.name, m.path))
+                for b in bs:
+                    lines.append("  · %s: %s" % (b.short, b.text))
             else:
-                ar_tree.column(c, width=data_w, minwidth=60, stretch=True)
+                lines.append("%s: %s, no warnings (%s)" % (
+                    plural(len(ms), "database"), mode, ", ".join(m.name for m, _b in ms)))
+        return "\n".join(lines).strip()
 
-        ar_sb = ttk.Scrollbar(self._ar_border, orient="vertical",
-                               command=ar_tree.yview)
-        ar_xsb = ttk.Scrollbar(self._ar_border, orient="horizontal",
-                                command=ar_tree.xview)
-        ar_tree.configure(yscrollcommand=ar_sb.set, xscrollcommand=ar_xsb.set)
-        ar_sb.pack(side="right", fill="y")
-        ar_xsb.pack(side="bottom", fill="x")
-        ar_tree.pack(fill="both", expand=True)
-        # Double-click to open record detail
-        ar_tree.bind("<Double-1>", lambda e: self._ar_dblclick(ar_tree, page_data, sample_cols))
-        self._ar_tree_ref = ar_tree
-        self._ar_page_data_ref = page_data
-        self._ar_sample_cols_ref = sample_cols
+    def _show_status_detail(self):
+        """The status of every open database, in a window (never a cut message box)."""
+        if not any(m.db.ok for m in self.case):
+            return None
+        warned = sum(1 for m in self.case if member_warnings(m))
+        intro = "Every database is opened read-only; nothing is written next to the " \
+                "evidence." + (" %s with warnings, listed first." % plural(warned, "database")
+                               if warned else "")
+        return TextWindow(self, "Evidence status", intro, self.status_detail_text())
 
-        for i, rec in enumerate(page_data):
-            diff_status = rec.get("_diff_status", "same")
-            diff_icon = diff_labels.get(diff_status, "?")
-            diff_cols = rec.get("_diff_cols", set())
-            # For "different" records, show count of changed columns
-            if diff_status == "different" and diff_cols:
-                diff_icon = f"\u2260 {len(diff_cols)}"
+    def _issue_logs(self):
+        """[(label, IssueLog)] of the active database: what reading it met, then what the
+        forensic scans met (label 'Forensics'), once they have run."""
+        if not self.db.ok:
+            return []
+        s = self.db.session
+        logs = [("", s.issues)]
+        fx = s.__dict__.get("_forensics")          # created by the first forensic scan
+        if fx is not None:
+            logs += [("Forensics", log) for log in fx.issue_logs()]
+        return logs
 
-            tbl_display = rec["table"]
-            if diff_status == "wal_table":
-                tbl_display = f"★ {tbl_display}"
-            vals = [diff_icon, rec["rowid"], tbl_display,
-                    status_map.get(rec["category"], rec["category"])]
-            for cn in sample_cols:
-                v = rec["values_dict"].get(cn, "")
-                vals.append(v[:200] if isinstance(v, str) and len(v) > 200 else v)
+    def _issue_count(self):
+        """Distinct issues of the active database (the Issues window lists each once)."""
+        logs = self._issue_logs()
+        if len(logs) == 1:
+            return logs[0][1].distinct_count()
+        seen = set()
+        for label, log in logs:
+            seen.update((label,) + key for key in list(log._distinct))
+        return len(seen)
 
-            # Tag based on diff status for coloring
-            tag = f"diff_{diff_status}"
-            ar_tree.insert("", "end", values=vals, tags=(tag,))
+    def _refresh_issue_btn(self):
+        """'Issues (N)' in the header only while there are issues (the Database menu always
+        lists them)."""
+        n = self._issue_count()
+        text = "Issues (%d)" % n if n else "Issues"
+        if self._issues_btn.cget("text") != text:
+            self._issues_btn.configure(text=text)
+        if n and not self._issues_btn.winfo_manager():
+            self._issues_btn.pack(side="right", padx=3, before=self._db_btn)
+        elif not n and self._issues_btn.winfo_manager():
+            self._issues_btn.pack_forget()
 
-        # Color by diff status
-        ar_tree.tag_configure("diff_different", foreground="#c45200",
-                              background="#fff4e6")
-        ar_tree.tag_configure("diff_not_in_db", foreground="#6b2fa0",
-                              background="#f5f0ff")
-        ar_tree.tag_configure("diff_wal_table", foreground="#0060a8",
-                              background="#e8f4fd")  # Blue tint for WAL-only tables
-        ar_tree.tag_configure("diff_same", foreground=C["text2"],
-                              background=C["bg"])
-
-    def _ar_prev_page(self):
-        if self._ar_page > 0:
-            self._ar_page -= 1
-            self._display_all_wal_records()
-
-    def _ar_next_page(self):
-        total_pages = max(1, (len(self._ar_records) + self._ar_page_size - 1) // self._ar_page_size)
-        if self._ar_page < total_pages - 1:
-            self._ar_page += 1
-            self._display_all_wal_records()
-
-    def _ar_dblclick(self, tree, page_data, sample_cols):
-        """Double-click on All Records row opens WAL record detail."""
-        sel = tree.selection()
-        if not sel:
-            return
-        idx = tree.index(sel[0])
-        if idx >= len(page_data):
-            return
-        rec = page_data[idx]
-        status_map = {"committed": "In DB", "uncommitted": "WAL Only",
-                      "old": "Older Version"}
-        src = f"WAL ({status_map.get(rec['category'], rec['category'])})"
-        self._show_wal_row_detail(
-            source=src, table=rec["table"],
-            match_col="", rowid=rec["rowid"], match_val="",
-            row_data=rec.get("values_dict", {}),
-            frame_idx=rec["frame_idx"], page_num=rec["page_num"])
-
-    def _ar_get_selected_record(self):
-        """Get the selected record from All Records view."""
-        tree = getattr(self, '_ar_tree_ref', None)
-        page_data = getattr(self, '_ar_page_data_ref', [])
-        if not tree or not page_data:
-            return None, None, None
-        sel = tree.selection()
-        if not sel:
-            return None, None, None
-        idx = tree.index(sel[0])
-        if idx >= len(page_data):
-            return None, None, None
-        sample_cols = getattr(self, '_ar_sample_cols_ref', [])
-        return page_data[idx], sample_cols, tree.item(sel[0], "values")
-
-    def _ar_copy_row_json(self):
-        """Copy selected All Records row as JSON."""
-        rec, sample_cols, _ = self._ar_get_selected_record()
-        if not rec:
-            return
-        d = {"table": rec["table"], "rowid": rec["rowid"],
-             "status": rec["category"], "frame": rec["frame_idx"],
-             "page": rec["page_num"],
-             "diff_status": rec.get("_diff_status", "unknown"),
-             "changed_columns": sorted(rec.get("_diff_cols", set()))}
-        d["data"] = dict(rec.get("values_dict", {}))
-        self.clipboard_clear()
-        self.clipboard_append(json.dumps(d, indent=2, default=str))
-
-    def _ar_copy_row_csv(self):
-        """Copy selected All Records row as CSV."""
-        import io
-        rec, sample_cols, vals = self._ar_get_selected_record()
-        if not rec or not vals:
-            return
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        cols = ["Diff", "RowID", "Table", "Status"] + sample_cols
-        w.writerow(cols)
-        w.writerow(list(vals))
-        self.clipboard_clear()
-        self.clipboard_append(buf.getvalue())
-
-    def _copy_wal_hex(self):
-        """Copy the formatted hex dump (with offsets and ASCII)."""
-        try:
-            txt = self._wal_hex_view.get("1.0", "end-1c")
-            if txt.strip():
-                self.clipboard_clear()
-                self.clipboard_append(txt)
-        except Exception:
-            pass
-
-    def _copy_wal_hex_raw(self):
-        """Copy raw hex bytes only (e.g. 0D098C000D01A4000A5C...)."""
-        try:
-            data = getattr(self, '_wal_selected_page_data', None)
-            if data:
-                self.clipboard_clear()
-                self.clipboard_append(data.hex().upper())
-        except Exception:
-            pass
-
-    def _copy_wal_hex_b64(self):
-        """Copy page data as Base64."""
-        import base64
-        try:
-            data = getattr(self, '_wal_selected_page_data', None)
-            if data:
-                self.clipboard_clear()
-                self.clipboard_append(base64.b64encode(data).decode("ascii"))
-        except Exception:
-            pass
-
-    def _filter_wal_frames(self):
-        """Filter WAL frames by table, category, page type, and page number.
-        Also triggers All Records reload when in that view mode."""
-        if self._wal_view_mode == "records":
-            self._load_all_wal_records()
-            return
-        cat = self._wal_cat_var.get()
-        pt = self._wal_pt_var.get()
-        tbl = self._wal_table_var.get()
-        # Strip ★ prefix and "(WAL-only)" suffix for filtering
-        if tbl.startswith("★ "):
-            tbl = tbl[2:].split("  (WAL-only)")[0].strip()
-        page_filter = self._wal_page_var.get().strip()
-
-        page_map = getattr(self.db.wal, 'page_map', {})
-        frames = self._wal_all_frames
-        if tbl != "All":
-            frames = [f for f in frames
-                      if page_map.get(f.page_num, f"page_{f.page_num}") == tbl]
-        if cat != "All":
-            frames = [f for f in frames if f.category == cat]
-        if pt != "All":
-            frames = [f for f in frames if f.page_type == pt]
-        if page_filter:
-            try:
-                pn = int(page_filter)
-                frames = [f for f in frames if f.page_num == pn]
-            except ValueError:
-                pass
-
-        self._wal_filtered_frames = frames
-        self._display_wal_frames()
-
-    def _wal_status_label(self, category):
-        """Convert internal category to user-friendly status label.
-        Note: In forensic extraction scenarios, the committed/uncommitted
-        distinction depends on extraction timing and may not be reliable."""
-        return {"committed": "In DB", "uncommitted": "WAL Only",
-                "old": "Older Version"}.get(category, category)
-
-    def _display_wal_frames(self):
-        """Render filtered WAL frames into the treeview with table names."""
-        tree = self._wal_tree
-        tree.delete(*tree.get_children())
-
-        wp = self.db.wal
-        page_map = getattr(wp, 'page_map', {})
-
-        for i, f in enumerate(self._wal_filtered_frames):
-            tag = f.category
-            status = self._wal_status_label(f.category)
-            table_name = page_map.get(f.page_num, f"page_{f.page_num}")
-
-            # Count records for table leaf pages
-            rec_count = ""
-            if f.page_type_byte == 0x0D:
-                try:
-                    pd = wp.get_page_data(f.index)
-                    info = wp.parse_btree_page(pd)
-                    if info:
-                        rec_count = str(info['cell_count'])
-                except Exception:
-                    pass
-
-            tree.insert("", "end", iid=str(f.index),
-                        values=(table_name, status, f.page_type,
-                                rec_count),
-                        tags=(tag,))
-
-        tree.tag_configure("committed", foreground=C["wal_committed"],
-                          background="#f0faf5")
-        tree.tag_configure("uncommitted", foreground="#7a4100",
-                          background="#fff8e6")
-        tree.tag_configure("old", foreground=C["wal_old"],
-                          background="#fff0ed")
-
-    def _sort_wal_tree(self, col):
-        """Sort WAL frame list by clicked column."""
-        reverse = (self._wal_sort_col == col and not self._wal_sort_reverse)
-        self._wal_sort_col = col
-        self._wal_sort_reverse = reverse
-
-        page_map = getattr(self.db.wal, 'page_map', {})
-        key_map = {
-            "Table": lambda f: page_map.get(f.page_num, ""),
-            "Status": lambda f: f.category,
-            "Data Type": lambda f: f.page_type,
-            "Records": lambda f: f.page_num,  # approx sort
-        }
-        key_fn = key_map.get(col, lambda f: f.index)
-        self._wal_filtered_frames.sort(key=key_fn, reverse=reverse)
-        self._display_wal_frames()
-
-    def _on_wal_select(self, event=None):
-        """Handle selection of a WAL frame — show summary, recovered data, hex."""
-        sel = self._wal_tree.selection()
-        if not sel:
-            return
-        try:
-            frame_idx = int(sel[0])
-        except (ValueError, IndexError):
-            return
-
-        if not self.db.has_wal:
-            return
-        wp = self.db.wal
-        page_data = wp.get_page_data(frame_idx)
-        self._wal_selected_page_data = page_data  # Store for copy operations
-        frame = wp.frames[frame_idx]
-        status = self._wal_status_label(frame.category)
-        page_map = getattr(wp, 'page_map', {})
-        col_map = getattr(wp, 'col_map', {})
-        table_name = page_map.get(frame.page_num, f"page_{frame.page_num}")
-
-        # ── Summary tab ──
-        info = wp.parse_btree_page(page_data)
-        self._wal_page_info.configure(state="normal")
-        self._wal_page_info.delete("1.0", "end")
-
-        lines = [
-            f"FRAME #{frame.index}  —  Table: {table_name}",
-            f"{'='*50}",
-            f"",
-            f"Table:       {table_name}",
-            f"Status:      {status}",
-        ]
-
-        if frame.category == "committed":
-            lines.append("             This data was saved to the database.")
-        elif frame.category == "uncommitted":
-            lines.append("             This data was NEVER saved! It may contain")
-            lines.append("             drafts, crashed transactions, or deleted data.")
+    def _refresh_status(self):
+        """Keep the 'Issues (N)' button and the chips current: workers (counts, searches) add
+        issues too, and a table SQLite fails on mid-session gets its own chip."""
+        if self.db.ok and self._issue_count() != getattr(self, "_chips_issue_count", None):
+            m = self.case.active
+            if m is not None:
+                m._warn_cache = None        # a new issue may be a new banner: ask again
+            self._show_banners()
         else:
-            lines.append("             This is an older version that was overwritten.")
-            lines.append("             The current data may be different.")
+            self._refresh_issue_btn()
 
-        # Show column names if known
-        known_cols = col_map.get(table_name, [])
-        if known_cols:
-            lines.extend([
-                f"",
-                f"Columns:     {', '.join(known_cols[:15])}{'...' if len(known_cols) > 15 else ''}",
-            ])
+    def _poll_issue_count(self):
+        self._refresh_status()
+        self._log_new_hashes()
+        self.after(1000, self._poll_issue_count)
 
-        lines.extend([
-            f"",
-            f"Page Number: {frame.page_num}",
-            f"Data Type:   {frame.page_type}",
-            f"Page Size:   {len(page_data):,} bytes",
-            f"Transaction: {'Final frame (commit marker)' if frame.commit_size > 0 else 'Mid-transaction or uncommitted'}",
-        ])
-
-        if info:
-            type_desc = {
-                0x0D: "Contains actual row data — check 'Recovered Data' tab",
-                0x05: "Internal tree node — points to child pages with actual data",
-                0x0A: "Index data — used for fast lookups, no row content",
-                0x02: "Internal index node — points to child index pages",
-            }.get(frame.page_type_byte, "Cannot determine page structure")
-            lines.extend([
-                f"",
-                f"Page Structure:",
-                f"  Type:  {frame.page_type} (0x{frame.page_type_byte:02X})",
-                f"  Info:  {type_desc}",
-                f"  Cells: {info['cell_count']} data entries on this page",
-            ])
-            if info.get("right_child"):
-                lines.append(f"  Child: Points to page {info['right_child']}")
-        else:
-            lines.extend([
-                f"",
-                f"This page does not have a standard B-tree structure.",
-                f"It may be an overflow page (continuation of a large value)",
-                f"or a free/empty page.",
-            ])
-
-        self._wal_page_info.insert("1.0", "\n".join(lines))
-        self._wal_page_info.configure(state="disabled")
-
-        # ── Raw Hex tab ──
-        self._wal_hex_view.configure(state="normal")
-        self._wal_hex_view.delete("1.0", "end")
-        hex_lines = [
-            f"Raw hex dump of page data ({len(page_data):,} bytes)",
-            f"Showing first {min(len(page_data), 4096):,} bytes:",
-            f"{'='*72}",
-            f"Offset    Hexadecimal                                       ASCII",
-            f"{'─'*72}",
-        ]
-        show_bytes = min(len(page_data), 4096)
-        for off in range(0, show_bytes, 16):
-            chunk = page_data[off:off + 16]
-            hex_part = " ".join(f"{b:02X}" for b in chunk)
-            ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-            hex_lines.append(f"{off:08X}  {hex_part:<48s}  {ascii_part}")
-        if len(page_data) > 4096:
-            hex_lines.append(f"\n... ({len(page_data) - 4096:,} more bytes not shown)")
-        self._wal_hex_view.insert("1.0", "\n".join(hex_lines))
-        self._wal_hex_view.configure(state="disabled")
-
-        # ── Recovered Data tab ──
-        for w in self._wal_rec_border.winfo_children():
-            w.destroy()
-
-        if frame.page_type_byte == 0x0D:
-            cells = wp.parse_leaf_cells(page_data)
-            if cells:
-                # Header with status, table name, and count
-                header = tk.Frame(self._wal_rec_border, bg="#e8e0f0")
-                header.pack(fill="x")
-                cat_colors = {"committed": "#00875a", "uncommitted": "#c25100", "old": "#de350b"}
-                tk.Label(header,
-                         text=f"  Table: {table_name}  |  {len(cells)} records recovered  |  "
-                              f"Status: {status}  |  Frame #{frame.index}",
-                         font=("Segoe UI", 9, "bold"),
-                         fg=cat_colors.get(frame.category, "#1a1a2e"),
-                         bg="#e8e0f0", anchor="w").pack(fill="x", padx=4, pady=3)
-
-                # Determine max column count and use real column names
-                max_cols = max(len(c["values"]) for c in cells)
-                # Use real column names from col_map if available
-                if known_cols and len(known_cols) >= max_cols:
-                    rec_cols = ["RowID"] + known_cols[:max_cols]
-                else:
-                    # Fallback: use col_map names where available, col{i} for rest
-                    rec_cols = ["RowID"] + [
-                        known_cols[i] if i < len(known_cols) else f"col{i}"
-                        for i in range(max_cols)
-                    ]
-                rec_tree = ttk.Treeview(self._wal_rec_border, columns=rec_cols,
-                                         show="headings", selectmode="browse")
-                for c in rec_cols:
-                    rec_tree.heading(c, text=c)
-                    rec_tree.column(c, width=120, minwidth=60, stretch=True)
-                rec_tree.column("RowID", width=70, minwidth=50, stretch=False)
-
-                rsb = ttk.Scrollbar(self._wal_rec_border, orient="vertical",
-                                     command=rec_tree.yview)
-                rec_tree.configure(yscrollcommand=rsb.set)
-                rsb.pack(side="right", fill="y")
-                rec_tree.pack(fill="both", expand=True)
-
-                pk_idx = getattr(wp, 'pk_col_idx', {}).get(table_name, -1)
-                for ci, cell in enumerate(cells):
-                    vals = []
-                    for vi, v in enumerate(cell["values"]):
-                        # INTEGER PRIMARY KEY: use rowid
-                        if vi == pk_idx and v is None:
-                            vals.append(str(cell["rowid"]))
-                        elif v is None:
-                            vals.append("NULL")
-                        elif isinstance(v, bytes):
-                            bt = blob_type(v)
-                            vals.append(f"[BLOB: {fmtb(len(v))}, {bt}]")
-                        elif isinstance(v, float):
-                            vals.append(f"{v:.6g}")
-                        else:
-                            sv = str(v)
-                            vals.append(sv if len(sv) <= 200 else sv[:200] + "...")
-                    # Pad if fewer values than max
-                    while len(vals) < max_cols:
-                        vals.append("")
-                    tag = "odd" if ci % 2 else "even"
-                    rec_tree.insert("", "end",
-                                    values=(cell["rowid"], *vals),
-                                    tags=(tag,))
-                rec_tree.tag_configure("odd", background=C["alt"])
-                rec_tree.tag_configure("even", background=C["bg"])
-            else:
-                ttk.Label(self._wal_rec_border,
-                          text="This is a Table Leaf page but no cell data could be parsed.\n"
-                               "The page may be empty or contain only overflow pointers.",
-                          style="M.TLabel", wraplength=600).pack(padx=10, pady=10)
-        else:
-            type_help = {
-                "Table Interior": "This page is an internal tree node. It contains pointers to "
-                                  "child pages but no actual row data. The real data is on Table Leaf pages.",
-                "Index Leaf": "This page contains index entries (used for fast lookups). "
-                              "To see actual row data, filter by 'Table Leaf' data type.",
-                "Index Interior": "This page is an internal index node. It helps SQLite navigate "
-                                  "the index tree but doesn't contain user data.",
-                "Overflow / Free": "This page stores the continuation of a large value that didn't "
-                                   "fit on a single page, or it's a free/unused page.",
-            }
-            help_text = type_help.get(frame.page_type,
-                                       "This page type doesn't contain directly readable row data.")
-            msg_frame = tk.Frame(self._wal_rec_border, bg=C["bg2"])
-            msg_frame.pack(fill="both", expand=True)
-            tk.Label(msg_frame,
-                     text=f"Page Type: {frame.page_type}",
-                     font=("Segoe UI", 10, "bold"), bg=C["bg2"], fg=C["text"],
-                     anchor="w").pack(fill="x", padx=15, pady=(15, 4))
-            tk.Label(msg_frame,
-                     text=help_text,
-                     font=("Segoe UI", 9), bg=C["bg2"], fg=C["text2"],
-                     wraplength=600, justify="left", anchor="w").pack(fill="x", padx=15, pady=(0, 4))
-            tk.Label(msg_frame,
-                     text="Tip: Use the 'Data Type' filter above and select 'Table Leaf' "
-                          "to see only pages with recoverable row data.",
-                     font=("Segoe UI", 8, "italic"), bg=C["bg2"], fg="#0052cc",
-                     wraplength=600, justify="left", anchor="w").pack(fill="x", padx=15, pady=(0, 15))
-
-    def _export_wal_all_records(self):
-        """Export all recovered WAL records to JSON."""
-        if not self.db.has_wal:
+    def _show_issues(self):
+        """List every Issue the engine recorded: what it skipped, substituted or guessed."""
+        if not self.db.ok:
+            messagebox.showinfo("Issues", "No database loaded")
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            initialfile="wal_all_records.json",
-            filetypes=[("JSON", "*.json"), ("CSV", "*.csv")])
-        if not path:
-            return
-        try:
-            records = list(self.db.wal.recover_all_records())
-            status_map = {"committed": "In DB", "uncommitted": "WAL Only",
-                          "old": "Older Version"}
-            if path.lower().endswith(".csv"):
-                with open(path, "w", newline="", encoding="utf-8") as f:
-                    w = csv.writer(f)
-                    w.writerow(["Table", "RowID", "Frame#", "Page#", "Status",
-                                "Data"])
-                    for rec in records:
-                        w.writerow([rec["table"], rec["rowid"],
-                                    rec["frame_idx"], rec["page_num"],
-                                    status_map.get(rec["category"], rec["category"]),
-                                    json.dumps(rec["values_dict"], default=str)])
-            else:
-                out = []
-                for rec in records:
-                    out.append({
-                        "table": rec["table"],
-                        "rowid": rec["rowid"],
-                        "frame_idx": rec["frame_idx"],
-                        "page_num": rec["page_num"],
-                        "status": status_map.get(rec["category"], rec["category"]),
-                        "category": rec["category"],
-                        "data": rec["values_dict"],
-                    })
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump({"wal_records": out, "total": len(out)},
-                              f, indent=2, default=str)
-            messagebox.showinfo("Export Complete",
-                                f"Exported {len(records)} WAL records to:\n"
-                                f"{os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    def _export_wal_blobs(self):
-        """Export all BLOB data found in WAL records to individual files."""
-        if not self.db.has_wal:
-            return
-        folder = filedialog.askdirectory(title="Select folder for WAL BLOBs")
-        if not folder:
-            return
-        try:
-            count = 0
-            errors = 0
-            for rec in self.db.wal.recover_all_records():
-                for vi, v in enumerate(rec["raw_values"]):
-                    if isinstance(v, bytes) and len(v) > 0:
-                        bt = blob_type(v)
-                        ext = _EXT_MAP.get(bt, ".bin")
-                        col_names = self.db.wal.col_map.get(rec["table"], [])
-                        cn = col_names[vi] if vi < len(col_names) else f"col{vi}"
-                        fname = f"{rec['table']}_r{rec['rowid']}_f{rec['frame_idx']}_{cn}{ext}"
-                        try:
-                            with open(os.path.join(folder, fname), "wb") as f:
-                                f.write(v)
-                            count += 1
-                        except Exception:
-                            errors += 1
-            msg = f"Exported {count} BLOB(s) from WAL to:\n{folder}"
-            if errors:
-                msg += f"\n({errors} error(s))"
-            messagebox.showinfo("Export Complete", msg)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    def _show_wal_header(self):
-        """Show WAL header technical details in a proper window."""
-        if not self.db.has_wal:
-            messagebox.showinfo("WAL Details", "No WAL file loaded.")
-            return
-        h = self.db.wal.header
-        s = self.db.wal.summary()
-        info = (
-            f"WAL File Technical Details\n{'='*45}\n\n"
-            f"File Header:\n"
-            f"  Magic Number: 0x{h.magic:08X} ({'Big-endian' if h.magic == 0x377f0682 else 'Little-endian'})\n"
-            f"  Format Version: {h.version}\n"
-            f"  Page Size: {h.page_size:,} bytes\n"
-            f"  Checkpoint Sequence: {h.checkpoint_seq}\n"
-            f"  Salt-1: 0x{h.salt1:08X} ({h.salt1})\n"
-            f"  Salt-2: 0x{h.salt2:08X} ({h.salt2})\n"
-            f"  Checksum-1: 0x{h.checksum1:08X}\n"
-            f"  Checksum-2: 0x{h.checksum2:08X}\n"
-            f"\nFrame Summary:\n"
-            f"  Total Frames: {s['total_frames']}\n"
-            f"  In DB (committed): {s['committed']}\n"
-            f"  WAL Only (uncommitted): {s['uncommitted']}\n"
-            f"  Older Version (old): {s['old']}\n"
-            f"  Unique Pages Modified: {s['unique_pages']}\n"
-            f"  WAL File Size: {fmtb(s['wal_size'])}\n"
-            f"\nPage Types:\n"
-        )
-        for pt, count in sorted(s.get("page_types", {}).items()):
-            info += f"  {pt}: {count} frames\n"
-        # Show in a proper window
-        win = tk.Toplevel(self)
-        win.title("WAL Technical Details")
-        win.geometry("520x460")
+        if self._issues_win is not None and self._issues_win.winfo_exists():
+            self._issues_win.destroy()
+        logs = self._issue_logs()
+        items = [(label, it) for label, log in logs for it in log.items]
+        total = self._issue_count()
+        dropped = sum(log.dropped for _l, log in logs)
+        win = self._issues_win = tk.Toplevel(self)
+        win.title("Issues (%d)" % total)
+        fit_geometry(win, 980, 420)
         win.configure(bg=C["bg"])
-        win.transient(self)
-        txt = tk.Text(win, wrap="word", bg=C["bg2"], fg=C["text"],
-                      font=("Consolas", 10), relief="flat", padx=10, pady=8)
-        txt.pack(fill="both", expand=True, padx=8, pady=(8, 0))
-        txt.insert("1.0", info)
-        txt.configure(state="disabled")
-        bot = tk.Frame(win, bg=C["bg"])
-        bot.pack(fill="x", padx=8, pady=6)
-        btn_cfg = dict(font=("Segoe UI", 9), relief="flat", bd=0, padx=10, pady=4, cursor="hand2")
-        def _copy():
+        head = ("%s recorded while reading %s (Times: how often each was met; 'Forensics: ' "
+                "marks what the Forensics scans met). Nothing is hidden: rows are shown from a "
+                "fallback where possible, and each entry says what happened and where."
+                % (plural(total, "issue"), self.member_label(self.case.active, None)
+                   or "this database"))
+        if dropped:
+            head += ("  (%s more were not kept: a log keeps %s, limit issues_kept.)"
+                     % (format(dropped, ","), format(limits.get("issues_kept"), ",")))
+        tk.Label(win, text=head, bg=C["bg"], fg=C["text"], anchor="w", justify="left",
+                 wraplength=940, font=F["body"]).pack(fill="x", padx=8, pady=(8, 4))
+        bar = tk.Frame(win, bg=C["bg"])
+        bar.pack(fill="x", padx=8, pady=8, side="bottom")
+        search = SearchBox(win, placeholder="Find an issue…", delay=0, find_button=False,
+                           primary=True, width=30)
+        search.pack(fill="x", padx=8, pady=(0, 4))
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=8)
+        cols = ("Severity", "Kind", "Where", "Detail", "Times")
+        tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for c, w in zip(cols, (70, 170, 220, 470, 50)):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, stretch=(c == "Detail"))
+        ysb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=ysb.set)
+        ysb.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+        grouped = {}        # the same row read again (browse, search, detail) logs the same issue
+        def where_of(label, it):
+            return ("%s: %s" % (label, it.where)) if label else it.where
+        for label, it in items:
+            key = (it.severity, it.kind, where_of(label, it), it.detail)
+            grouped[key] = grouped.get(key, 0) + 1
+        for (severity, kind, where, detail), times in grouped.items():
+            tree.insert("", "end", values=(severity, kind, where, detail, times),
+                        tags=(severity,))
+        tree.tag_configure("error", foreground=C["red"])
+        tree.tag_configure("warning", foreground=C["orange"])
+        TreeviewTooltip(tree)
+        self._issues_tree = tree
+        self._issues_filter = TreeFilter(tree, search, "issue", "issues")
+
+        def copy():
             win.clipboard_clear()
-            win.clipboard_append(info)
-        tk.Button(bot, text="Copy", command=_copy, bg=C["acl"], fg=C["accent"], **btn_cfg).pack(side="left", padx=2)
-        tk.Button(bot, text="Close", command=win.destroy, bg=C["bg3"], fg=C["text2"], **btn_cfg).pack(side="right", padx=2)
+            win.clipboard_append("\n".join("%s\t%s\t%s\t%s" % (
+                it.severity, it.kind, where_of(label, it), it.detail) for label, it in items))
+        ttk.Button(bar, text="Copy as text", command=copy).pack(side="left")
+        ttk.Button(bar, text="Refresh", command=self._show_issues).pack(side="left", padx=6)
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
 
-    def _export_wal_summary(self):
-        """Export WAL frame summary to CSV."""
-        if not self.db.has_wal:
+    def _evidence_text(self, member):
+        """What the Evidence window says about one database: how it was opened, every file
+        with size, modification time (UTC) and SHA-256, the files next to it the tool does not
+        use, and the tool and versions."""
+        db = member.db
+        ev = db.evidence
+        lines = ["%s  —  opened read-only (%s) at %s" % (
+                     member.path, mode_label(db.mode, long=True),
+                     getattr(member, "opened_utc", "?")),
+                 "Nothing is written to: %s" % ev.directory, ""]
+        for fp in ev.summary():
+            sha = fp["sha256"]
+            if not sha:
+                sha = ("not hashed: %s" % ev.hash_error) if ev.hash_error else \
+                    "hashing… %d%%" % (100 * ev.hashed_bytes // max(ev.total_bytes, 1))
+            lines += ["%-8s %s" % (fp["role"], fp["path"]),
+                      "         size %s bytes   modified %s (mtime_ns %s)" % (
+                          format(fp["size"], ","), mtime_text(fp["mtime_ns"]), fp["mtime_ns"]),
+                      "         SHA-256 %s" % sha]
+            if fp.get("sha256_note"):
+                lines.append("         (%s)" % fp["sha256_note"])
+            lines.append("")
+        others = ev.other_files()
+        if others:
+            lines.append("Other files next to the database (NOT used by the tool, listed so "
+                         "nothing is missed):")
+            for o in others:
+                lines.append("  %s  (%s, %s bytes, modified %s)" % (
+                    o["name"], o["kind"], format(o["size"], ","), mtime_text(o["mtime_ns"])))
+            more = getattr(ev, "other_files_more", 0)
+            if more:
+                lines.append("  … and %d more" % more)
+            lines.append("")
+        lines.append("SQLite GUI Analyzer %s, Python %s, SQLite %s" % (
+            VERSION, sys.version.split()[0], sqlite3.sqlite_version))
+        return "\n".join(lines)
+
+    def _show_evidence(self):
+        """Evidence window: the original files with size, time and SHA-256, the files next to
+        them the tool does not use, verification on a worker thread (Verify now), and a check
+        against an expected hash (e.g. from the acquisition)."""
+        member = self.case.active
+        if member is None or not self.db.ok:
+            messagebox.showinfo("Evidence", "No database loaded", parent=self)
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-            title="Export WAL Summary")
-        if not path:
+        ev = self.db.evidence
+        win = tk.Toplevel(self)
+        win.title("Evidence and verification" + (" - " + member.name if self.case.multi
+                                                 else ""))
+        fit_geometry(win, 820, 460)
+        win.configure(bg=C["bg"])
+        txt = tk.Text(win, font=F["mono"], wrap="word", bg=C["bg2"], relief="flat")
+        sb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        bar = FlowFrame(win)
+        bar.pack(side="bottom", fill="x", padx=8, pady=8)
+        search = SearchBox(win, placeholder="Find a file, hash or word…", primary=True,
+                           width=30)
+        search.pack(fill="x", padx=8, pady=(8, 0))
+        sb.pack(side="right", fill="y", pady=8)
+        txt.pack(fill="both", expand=True, padx=(8, 0), pady=8)
+        win.finder = TextFind(txt, search)
+        self._evidence_win = win
+
+        def render():
+            if not win.winfo_exists():
+                return
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.insert("end", self._evidence_text(member))
+            txt.configure(state="disabled")
+            if not ev.hashing_done and not ev.hash_error:
+                win.after(500, render)
+
+        def verify():
+            rehash = ev.hashing_done
+
+            def work(job):
+                job.status = "Verifying %s: size, time%s…" % (
+                    member.name, " and SHA-256" if rehash else "")
+
+                def progress(n):
+                    job.done += n
+                return ev.verify(rehash=rehash, cancel=lambda: job.cancelled,
+                                 progress=progress)
+
+            def done(report, error, cancelled):
+                if error is not None:
+                    messagebox.showerror("Verification", str(error), parent=win)
+                    return
+                self.activity("verify", database=member.path, unchanged=report.unchanged,
+                              checked=report.checked_text(),
+                              differences=list(report.differences), stopped=cancelled)
+                text = report.text()
+                if cancelled:
+                    text = ("STOPPED: the SHA-256 was not re-computed for every file.\n\n"
+                            + text)
+                (messagebox.showinfo if report.unchanged and not cancelled
+                 else messagebox.showwarning)("Verification", text, parent=win)
+            Job(self, "Verifying the evidence", work, done, members=[member],
+                total=ev.total_bytes if rehash else None, unit="bytes")
+
+        def expected():
+            self._compare_expected_hash(member, win)
+
+        def copy():
+            win.clipboard_clear()
+            win.clipboard_append(json.dumps(ev.summary(), indent=2))
+        bar.add(ttk.Button(bar, text="Verify now", command=verify))
+        bar.add(ttk.Button(bar, text="Compare with expected hash…", command=expected))
+        bar.add(ttk.Button(bar, text="Copy as JSON", command=copy))
+        bar.add(ttk.Button(bar, text="Close", command=win.destroy), gap=24)
+        render()
+        return win
+
+    def _compare_expected_hash(self, member, parent):
+        """Paste the SHA-256 recorded at acquisition (a hash, sha256sum or BSD lines): each
+        evidence file says match, MISMATCH or not hashed yet."""
+        dlg = tk.Toplevel(parent)
+        dlg.title("Compare with expected hash")
+        dlg.configure(bg=C["bg"])
+        dlg.transient(parent)
+        ttk.Label(dlg, text="Paste the expected SHA-256: one hash (compared with the database "
+                            "file), or lines like '<hash>  <file name>' (sha256sum) or 'SHA256 "
+                            "(<file name>) = <hash>'.", wraplength=520,
+                  justify="left").pack(fill="x", padx=10, pady=(10, 4))
+        box = tk.Text(dlg, width=72, height=7, font=F["mono"])
+        box.pack(fill="both", expand=True, padx=10)
+        out = ttk.Label(dlg, text="", wraplength=520, justify="left")
+        out.pack(fill="x", padx=10, pady=4)
+
+        def check():
+            result = member.db.evidence.compare_expected(box.get("1.0", "end"))
+            lines = ["%s: %s" % (os.path.basename(r["path"]), r["result"]) for r in result]
+            lines += ["listed but not an evidence file: %s" % n for n in result.unmatched]
+            lines += ["not read: %r (%s)" % (ln[:40], why) for ln, why in result.unparsed]
+            out.configure(text="\n".join(lines) or "Nothing to compare.")
+            self.activity("verify", database=member.path, expected_hash=[
+                (r["path"], r["result"]) for r in result])
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bar, text="Compare", style="P.TButton", command=check).pack(side="left")
+        ttk.Button(bar, text="Close", command=dlg.destroy).pack(side="right")
+        return dlg
+
+    # ── The activity log window ──────────────────────────────────────
+    def _show_activity(self):
+        """What was done with this case (opened with hashes, searches, exports with their
+        paths, verification), kept in the app-data folder; viewable and exportable."""
+        log = self._activity_log
+        if log is None:
+            messagebox.showinfo("Activity log", "No database loaded.", parent=self)
             return
+        from engine.activity import entry_text
+        # The log is append-only and unbounded over the tool's lifetime; never read
+        # the whole file into the window.
+        entries = log.entries(limit=2000)
+        win = tk.Toplevel(self)
+        win.title("Activity log (last %d entries)" % len(entries))
+        fit_geometry(win, 900, 460)
+        win.configure(bg=C["bg"])
+        head = ttk.Label(win, text="Kept in %s%s" % (log.path, (" — NOT written: %s" % log.error)
+                                                    if log.error else ""),
+                         style="M.TLabel", wraplength=860, justify="left")
+        head.pack(fill="x", padx=8, pady=(8, 2))
+        search = SearchBox(win, placeholder="Find in the log…", primary=True, width=30)
+        search.pack(fill="x", padx=8, pady=(0, 4))
+        txt = tk.Text(win, font=F["mono"], wrap="none", bg=C["bg2"], relief="flat")
+        sb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        bar = ttk.Frame(win)
+        bar.pack(side="bottom", fill="x", padx=8, pady=8)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True, padx=(8, 0))
+        txt.insert("1.0", "\n".join(entry_text(e) for e in entries) or "Nothing yet.")
+        txt.configure(state="disabled")
+        win.finder = TextFind(txt, search)
+
+        def export():
+            opts = export_options(win, "Export the activity log", [],
+                                  formats=("csv", "json", "txt"), blobs=False)
+            if opts is None:
+                return
+            path = ask_path(win, opts["fmt"], "activity_log")
+            if not write_allowed(path):
+                return
+            try:
+                n = log.export(path, opts["fmt"])
+            except Exception as e:      # noqa: BLE001 - shown to the user
+                messagebox.showerror("Activity log", str(e), parent=win)
+                return
+            messagebox.showinfo("Activity log", "%d entries written to:\n%s" % (n, path),
+                                parent=win)
+        ttk.Button(bar, text="Export…", command=export).pack(side="left")
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        return win
+
+    def _update_activity_log(self):
+        """The case changed: its activity log (same databases, same file in app data); the
+        databases now in it are noted as opened, with what is known of their evidence."""
+        paths = [m.path for m in self.case]
+        if not paths:
+            self._activity_log = None
+            return
+        from engine.activity import ActivityLog
         try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["Frame#", "Page#", "Status", "Category", "Data Type",
-                            "Transaction", "Salt1", "Salt2"])
-                for frame in self.db.wal.frames:
-                    w.writerow([frame.index, frame.page_num,
-                                self._wal_status_label(frame.category),
-                                frame.category, frame.page_type, frame.commit_size,
-                                f"0x{frame.salt1:08X}", f"0x{frame.salt2:08X}"])
-            messagebox.showinfo("Export Complete",
-                                f"WAL summary exported to:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Export Error", str(e))
+            log = ActivityLog(paths, refuse_in=self.case.evidence_dirs())
+        except Exception:               # noqa: BLE001 - the log never stops the work
+            self._activity_log = None
+            return
+        old = self._activity_log
+        self._activity_log = log
+        if old is not None and old.path == log.path:
+            return
+        self._activity_hashes = set()
+        items = []
+        for m in self.case:
+            if not m.db.ok:
+                continue
+            files = [dict((k, fp[k]) for k in ("role", "path", "size", "mtime_ns", "sha256"))
+                     for fp in m.db.evidence.summary()]
+            items.append(("open", dict(database=m.path, mode=m.db.mode, files=files,
+                                       tool="SQLite GUI Analyzer %s" % VERSION)))
+        self.activity_many(items)
 
+    def _log_new_hashes(self):
+        """Note each database's SHA-256 in the activity log once its hashing finished."""
+        if self._activity_log is None:
+            return
+        seen = getattr(self, "_activity_hashes", None)
+        if seen is None:
+            seen = self._activity_hashes = set()
+        items = []
+        for m in self.case:
+            if m.path in seen or not m.db.ok or not m.db.evidence.hashing_done:
+                continue
+            seen.add(m.path)
+            items.append(("hash", dict(database=m.path, files=[
+                (fp["role"], fp["path"], fp["sha256"]) for fp in m.db.evidence.summary()])))
+        self.activity_many(items)
 
     # ═══════════════════════════════════════════════════════════════════════
     # ── SQL QUERY EDITOR TAB ─────────────────────────────────────────────
@@ -3982,16 +4961,31 @@ class App(tk.Tk):
         hdr = ttk.Frame(sf)
         hdr.pack(fill="x", padx=10, pady=(8, 2))
         ttk.Label(hdr, text="SQL Query Editor", style="B.TLabel").pack(side="left")
-        ttk.Label(hdr, text="  (read-only • SELECT / EXPLAIN only)",
-                style="M.TLabel").pack(side="left", padx=(4, 0))
+        self._sql_rules = wrap_to_width(ttk.Label(
+            sf, text="Read-only: SELECT, WITH, VALUES, EXPLAIN and read-only PRAGMA statements "
+                     "run (comments first are fine); a statement that would change the database "
+                     "is refused.", style="M.TLabel"))
+        self._sql_rules.pack(fill="x", padx=10)
+        # what SQL cannot see (committed WAL frames in main-only mode, or no SQL at all)
+        self._sql_notice = ttk.Frame(sf)
+        # one line (the reason in its Details), never a paragraph above the editor
+        self._sql_notice_lbl = StatusLine(self._sql_notice, style="Warning.TLabel")
+        self._sql_notice_lbl.pack(side="left", fill="x", expand=True, padx=(4, 4), pady=3)
+        ttk.Button(self._sql_notice, text="Limits…",
+                   command=lambda: self.datamap.limits_window(self)).pack(side="right", padx=4)
+        ttk.Button(self._sql_notice, text="Browse (WAL applied)",
+                   command=lambda: self._nb.select(self._browse_frame)).pack(side="right",
+                                                                              padx=4)
 
         editor_outer = tk.Frame(sf, relief="solid", bd=1, bg=C["border"])
         editor_outer.pack(fill="x", padx=10, pady=(2, 0))
 
         self._sql_editor = tk.Text(
-            editor_outer, height=8, font=("Consolas", 10),
+            editor_outer, height=8, font=F["mono_large"],
             bg=C["bg2"], fg=C["text"], insertbackground=C["text"],
             wrap="none", undo=True, relief="flat", padx=6, pady=4,
+            highlightthickness=1, highlightbackground=C["border"],
+            highlightcolor=K["ring"],
         )
         sql_xsb = ttk.Scrollbar(editor_outer, orient="horizontal",
                                 command=self._sql_editor.xview)
@@ -3999,12 +4993,10 @@ class App(tk.Tk):
         sql_xsb.pack(side="bottom", fill="x")
         self._sql_editor.pack(fill="both", expand=True)
 
-        self._sql_editor.tag_configure("kw",  foreground="#0052cc",
-                                        font=("Consolas", 10, "bold"))
-        self._sql_editor.tag_configure("str", foreground="#00875a")
-        self._sql_editor.tag_configure("cmt", foreground="#8993a4",
-                                        font=("Consolas", 10, "italic"))
-        self._sql_editor.tag_configure("num", foreground="#c25100")
+        self._sql_editor.tag_configure("kw", foreground=K["primary"], font=F["mono_bold"])
+        self._sql_editor.tag_configure("str", foreground=K["success_text"])
+        self._sql_editor.tag_configure("cmt", foreground=K["placeholder"], font=F["mono_italic"])
+        self._sql_editor.tag_configure("num", foreground=K["warning"])
 
         self._sql_editor.bind("<KeyRelease>",     self._sql_on_key)
         self._sql_editor.bind("<Control-Return>",
@@ -4016,76 +5008,50 @@ class App(tk.Tk):
         self._sql_editor.bind("<Alt-Down>",
             lambda e: (self._sql_history_next(), "break")[1])
 
-        tbar = ttk.Frame(sf)
-        tbar.pack(fill="x", padx=10, pady=(4, 2))
+        tbar = Toolbar(sf)
+        tbar.pack(fill="x", padx=M, pady=(XS, XS))
 
-        self._sql_run_btn = tk.Button(
-            tbar, text="▶  Run (Ctrl+Enter)",
-            font=("Segoe UI", 9, "bold"),
-            bg=C["accent"], fg="#ffffff",
-            activebackground="#003d99", activeforeground="#ffffff",
-            relief="flat", bd=0, padx=10, pady=4, cursor="hand2",
-            command=self._sql_run,
-        )
-        self._sql_run_btn.pack(side="left", padx=(0, 4))
-
-        self._sql_cancel_btn = tk.Button(
-            tbar, text="■  Cancel",
-            font=("Segoe UI", 9),
-            bg=C["red"], fg="#ffffff",
-            activebackground="#b02900", activeforeground="#ffffff",
-            relief="flat", bd=0, padx=10, pady=4, cursor="hand2",
-            command=self._sql_cancel, state="disabled",
-        )
-        self._sql_cancel_btn.pack(side="left", padx=(0, 6))
-
+        # one primary action (Run), then the editor's own actions, then the results'
+        self._sql_run_btn = ttk.Button(tbar, text="▶  Run", style="Primary.TButton",
+                                       command=self._sql_run)
+        tbar.add(self._sql_run_btn)
+        self._sql_cancel_btn = ttk.Button(tbar, text="■  Stop", command=self._sql_cancel)
+        tbar.add(self._sql_cancel_btn, visible=False)
+        self._sql_tbar = tbar
+        tbar.group()
         for label, cmd in [
             ("Clear",    lambda: self._sql_editor.delete("1.0", "end")),
             ("Copy SQL", self._sql_copy_query),
         ]:
-            tk.Button(
-                tbar, text=label, font=("Segoe UI", 9),
-                bg=C["bg3"], fg=C["text2"],
-                activebackground=C["bg4"], relief="flat", bd=0,
-                padx=8, pady=4, cursor="hand2", command=cmd,
-            ).pack(side="left", padx=2)
+            tbar.add(ttk.Button(tbar, text=label, style="Subtle.TButton", command=cmd))
+        tbar.group()
+        # one Export ▾, as on the other tabs (enabled once a query returned rows)
+        self._sql_export_menu = tk.Menu(self, tearoff=0)
+        self._sql_export_menu.add_command(label="Export CSV…", command=self._sql_export_csv)
+        self._sql_export_menu.add_command(label="Export JSON…", command=self._sql_export_json)
+        self._sql_export_btn = ttk.Button(
+            tbar, text="Export ▾", state="disabled",
+            command=lambda: self._post_menu(self._sql_export_menu, self._sql_export_btn))
+        tbar.add(self._sql_export_btn)
+        self._sql_export_json_btn = self._sql_export_btn    # one button for both formats
 
-        self._sql_export_btn = tk.Button(
-            tbar, text="Export CSV", font=("Segoe UI", 9),
-            bg=C["bg3"], fg=C["text2"],
-            activebackground=C["bg4"], relief="flat", bd=0,
-            padx=8, pady=4, cursor="hand2",
-            command=self._sql_export_csv, state="disabled",
-        )
-        self._sql_export_btn.pack(side="left", padx=2)
-
-        self._sql_export_json_btn = tk.Button(
-            tbar, text="Export JSON", font=("Segoe UI", 9),
-            bg=C["bg3"], fg=C["text2"],
-            activebackground=C["bg4"], relief="flat", bd=0,
-            padx=8, pady=4, cursor="hand2",
-            command=self._sql_export_json, state="disabled",
-        )
-        self._sql_export_json_btn.pack(side="left", padx=2)
-
-        ttk.Label(tbar, text="Limit:", font=("Segoe UI", 9)).pack(
-            side="left", padx=(10, 2))
+        tbar.add(ttk.Label(tbar, text="Limit", style="Muted.TLabel"), gap=M)
         self._sql_limit_var = tk.StringVar(value="1000")
-        sql_lim_cb = ttk.Combobox(
+        sql_lim_cb = SearchableCombobox(
             tbar, textvariable=self._sql_limit_var,
             values=["100", "500", "1000", "5000", "All"],
             state="readonly", width=7,
         )
-        sql_lim_cb.pack(side="left")
+        tbar.add(sql_lim_cb, gap=2)
         ToolTip(sql_lim_cb, "Maximum rows to return")
 
         sbar = ttk.Frame(sf)
         sbar.pack(fill="x", padx=10, pady=(0, 2))
-        self._sql_status_label = ttk.Label(
-            sbar, text="Open a database to start querying.", style="M.TLabel")
-        self._sql_status_label.pack(side="left")
         self._sql_col_info = ttk.Label(sbar, text="", style="M.TLabel")
         self._sql_col_info.pack(side="right")
+        self._sql_status_label = wrap_to_width(ttk.Label(
+            sbar, text="Open a database to start querying.", style="M.TLabel"), pad=90)
+        self._sql_status_label.pack(side="left", fill="x", expand=True)
 
         self._sql_pw = ttk.PanedWindow(sf, orient="vertical")
         self._sql_pw.pack(fill="both", expand=True, padx=10, pady=(0, 8))
@@ -4095,32 +5061,37 @@ class App(tk.Tk):
         res_border = tk.Frame(res_outer, relief="solid", bd=1, bg=C["border"])
         res_border.pack(fill="both", expand=True)
 
-        self._sql_results_tree = ttk.Treeview(
-            res_border, show="headings", selectmode="browse")
-        sql_ysb  = ttk.Scrollbar(res_border, orient="vertical",
-                                command=self._sql_results_tree.yview)
-        sql_xsb2 = ttk.Scrollbar(res_border, orient="horizontal",
-                                command=self._sql_results_tree.xview)
-        self._sql_results_tree.configure(
-            yscrollcommand=sql_ysb.set, xscrollcommand=sql_xsb2.set)
-        sql_ysb.pack(side="right", fill="y")
-        sql_xsb2.pack(side="bottom", fill="x")
-        self._sql_results_tree.pack(fill="both", expand=True)
-        self._sql_results_tree.bind("<Double-1>", self._sql_on_row_dblclick)
-        TreeviewTooltip(self._sql_results_tree)
+        # Results in the same virtual grid as Browse (rows held in memory: sorting and the
+        # column filters apply to the rows the query returned)
+        self._sql_grid = DataGrid(res_border, frozen=0, on_open_row=self._sql_open_row,
+                                  on_open_blob=lambda row, column, value: BlobViewer(
+                                      self, value, column, "%s.%s — row %s" % (
+                                          self._sql_grid.context(), column,
+                                          format(row + 1, ","))),
+                                  on_filter=lambda _e, _g: self._sql_update_count(),
+                                  describe=self._describe_value)
+        self._sql_grid.context = lambda: "query result, %s" % self.case.active.name \
+            if self.case.active is not None else "query result"
+        self._sql_search = grid_search(res_outer, self._sql_grid,
+                                       placeholder="Find in the results (words, all must "
+                                                   "match)…")
+        self._sql_search.pack(fill="x", before=res_border, pady=(0, 2))
+        self._sql_grid.pack(fill="both", expand=True)
 
         hist_outer = ttk.Frame(self._sql_pw)
         self._sql_pw.add(hist_outer, weight=1)
 
         hist_hdr = ttk.Frame(hist_outer)
         hist_hdr.pack(fill="x")
-        ttk.Label(hist_hdr, text="Query History", style="B.TLabel").pack(
+        ttk.Label(hist_hdr, text="Query history", style="B.TLabel").pack(
             side="left", padx=4, pady=(4, 2))
-        ttk.Label(hist_hdr, text="(Alt+↑/↓ in editor to navigate)",
-                style="M.TLabel").pack(side="left")
+        self._sql_hist_note = ttk.Label(
+            hist_hdr, text="(Alt+↑/↓ in the editor; the last %d queries are kept: limit "
+                           "sql_history)" % limits.get("sql_history"), style="M.TLabel")
+        self._sql_hist_note.pack(side="left")
         tk.Button(
-            hist_hdr, text="Clear History",
-            font=("Segoe UI", 8), bg=C["bg3"], fg=C["text2"],
+            hist_hdr, text="Clear history",
+            font=F["small"], bg=C["bg3"], fg=C["text2"],
             activebackground=C["bg4"], relief="flat", bd=0,
             padx=6, pady=2, cursor="hand2",
             command=self._sql_clear_history,
@@ -4130,7 +5101,7 @@ class App(tk.Tk):
         hist_border.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
         self._sql_hist_listbox = tk.Listbox(
-            hist_border, font=("Consolas", 9),
+            hist_border, font=F["mono"],
             bg=C["bg2"], fg=C["text"],
             selectbackground=C["tsel"], selectforeground=C["text"],
             relief="flat", activestyle="none",
@@ -4230,594 +5201,237 @@ class App(tk.Tk):
             self._sql_editor.focus_set()
 
     def _sql_is_safe(self, sql):
-        stripped = sql.strip().lstrip("(")
-        parts = stripped.split()
-        first = parts[0].upper() if parts else ""
-        return first in ("SELECT", "EXPLAIN", "WITH", "VALUES", "PRAGMA")
+        """A statement that reads (after any comments): the connection refuses writes anyway."""
+        return sql_reads_only(sql)
+
+    def _update_sql_notice(self):
+        """Say above the results what SQL cannot see: committed WAL frames when the database is
+        read in main-only mode (the RAM limit or the Python version), or everything when SQLite
+        cannot read the file. Hidden when SQL sees the current state."""
+        text, details = "", []
+        s = self.db.session if self.db.ok else None
+        if s is not None and s.sql is None:
+            text = "⚠ SQL is unavailable: SQLite cannot read this file"
+            details = ["SQLite: %s" % (s.sql_error or "unknown error"),
+                       "Browse and Search show the rows the tool parsed itself."]
+        elif s is not None and not s.sql_sees_current_state and s.wal is not None:
+            n = s.wal.last_commit + 1
+            text = ("⚠ SQL sees the main file only: %s committed WAL frame%s are NOT in these "
+                    "results" % (format(n, ","), "" if n == 1 else "s"))
+            details = ["Browse, Search and the Timeline include them.", s.main_only_reason()]
+        self._sql_notice_lbl.set(text, details)
+        if text and not self._sql_notice.winfo_manager():
+            self._sql_notice.pack(fill="x", padx=10, pady=(2, 0), after=self._sql_rules)
+        elif not text and self._sql_notice.winfo_manager():
+            self._sql_notice.pack_forget()
+
+    def _sql_clear_results(self):
+        """No rows under a statement that was not run (the previous results go)."""
+        self._sql_grid.set_source(None)
+        self._sql_result_rows, self._sql_result_cols = [], []
+        self._sql_col_info.configure(text="")
+        self._sql_export_btn.configure(state="disabled")
+        self._sql_export_json_btn.configure(state="disabled")
 
     def _sql_run(self):
         if not self.db.ok:
-            messagebox.showwarning("No Database",
+            messagebox.showwarning("No database",
                                 "Please open a database first.")
             return
         sql = self._sql_editor.get("1.0", "end-1c").strip()
         if not sql:
+            self._sql_clear_results()
+            self._sql_status_label.configure(text="Nothing to run: the editor is empty.")
             return
         if not self._sql_is_safe(sql):
-            messagebox.showerror(
-                "Read-Only Mode",
-                "Only SELECT, EXPLAIN, WITH, VALUES, and PRAGMA are allowed.\n"
-                "This tool is read-only to protect your data.",
-            )
+            word = sql_first_keyword(sql) or "(nothing)"
+            self._sql_clear_results()   # never leave an earlier query's rows under this
+            self._sql_status_label.configure(
+                text="✖  Not run: %s changes or is not a statement that reads. Allowed: SELECT, "
+                     "WITH, VALUES, EXPLAIN and read-only PRAGMA (the database is only read)."
+                     % word)
             return
+        self._sql_last = sql
         if not self._sql_query_history or self._sql_query_history[-1] != sql:
             self._sql_query_history.append(sql)
             self._sql_query_history_idx = len(self._sql_query_history) - 1
             display = sql[:90].replace("\n", " ")
             self._sql_hist_listbox.insert(0, display)
-            if self._sql_hist_listbox.size() > 100:
+            keep = limits.get("sql_history")
+            while self._sql_hist_listbox.size() > keep:
                 self._sql_hist_listbox.delete("end")
                 self._sql_query_history.pop(0)
 
         lim_str = self._sql_limit_var.get()
         limit = None if lim_str == "All" else int(lim_str)
 
-        self._sql_results_tree["columns"] = []
-        self._sql_results_tree.delete(*self._sql_results_tree.get_children())
+        self._sql_grid.set_source(None)
         self._sql_result_rows = []
         self._sql_result_cols = []
         self._sql_status_label.configure(text="Running…")
         self._sql_col_info.configure(text="")
         self._sql_run_btn.configure(state="disabled")
-        self._sql_cancel_btn.configure(state="normal")
+        self._sql_tbar.show(self._sql_cancel_btn, True)
         self._sql_export_btn.configure(state="disabled")
         self._sql_export_json_btn.configure(state="disabled")
         self._sql_query_cancel = False
 
         def _worker():
+            conn = self.db.new_sql_conn()
+            self._sql_conn = conn            # _sql_cancel interrupts it
             try:
-                conn = self.db._search_conn or self.db._conn
+                if conn is None:
+                    raise RuntimeError("SQL is unavailable: SQLite cannot read this file "
+                                       "(the tool is showing natively parsed data).")
                 cur  = conn.execute(sql)
                 cols = [d[0] for d in (cur.description or [])]
                 rows = []
-                for i, row in enumerate(cur):
+                more = False
+                for row in cur:
                     if self._sql_query_cancel:
                         break
-                    rows.append(tuple(row))
-                    if limit and i + 1 >= limit:
+                    if limit and len(rows) >= limit:
+                        more = True          # one row past the limit: there are more
                         break
-                self.after(0, lambda: self._sql_show_results(cols, rows, limit))
+                    rows.append(tuple(row))
+                if self._sql_query_cancel:
+                    return                   # the status already says "Stopped."
+                self._after_safe(0, lambda: self._sql_show_results(cols, rows, limit if more else None))
             except Exception as exc:
+                if self._sql_query_cancel:
+                    return                   # interrupted by Cancel (or by closing the DB)
                 err = str(exc)
-                self.after(0, lambda: self._sql_show_error(err))
+                self._after_safe(0, lambda: self._sql_show_error(err))
+            finally:
+                if self._sql_conn is conn:
+                    self._sql_conn = None
+                if conn is not None:
+                    self.db.release_sql_conn(conn)
 
         self._sql_query_thread = threading.Thread(target=_worker, daemon=True)
         self._sql_query_thread.start()
 
     def _sql_cancel(self):
         self._sql_query_cancel = True
+        conn = self._sql_conn
+        if conn is not None:
+            try:
+                conn.interrupt()             # stop the statement now, not at the next row
+            except sqlite3.Error:
+                pass                         # it already finished and was closed
         self._sql_run_btn.configure(state="normal")
-        self._sql_cancel_btn.configure(state="disabled")
-        self._sql_status_label.configure(text="Cancelled.")
+        self._sql_tbar.show(self._sql_cancel_btn, False)
+        self._sql_status_label.configure(text="Stopped.")
 
     def _sql_show_results(self, cols, rows, limit):
         self._sql_run_btn.configure(state="normal")
-        self._sql_cancel_btn.configure(state="disabled")
+        self._sql_tbar.show(self._sql_cancel_btn, False)
         self._sql_result_cols = cols
         self._sql_result_rows = rows
-        tree = self._sql_results_tree
-
         if not cols:
-            tree["columns"] = ["(no columns)"]
-            tree.heading("(no columns)", text="(no columns)")
-            tree.column("(no columns)", width=300)
+            self._sql_grid.set_source(None)
             self._sql_status_label.configure(
                 text="Statement executed. No rows returned.")
             return
-
-        tree["columns"] = cols
-        tree.delete(*tree.get_children())
-        for col in cols:
-            tree.heading(col, text=col)
-            tree.column(col, width=120, minwidth=60, stretch=True)
-
-        for i, row in enumerate(rows):
-            display = []
-            for v in row:
-                if v is None:
-                    display.append("NULL")
-                elif isinstance(v, bytes):
-                    bt = blob_type(v)
-                    display.append("[BLOB {}: {}]".format(bt, fmtb(len(v))))
-                else:
-                    sv = str(v)
-                    display.append(sv if len(sv) <= 300 else sv[:300] + "…")
-            tag = "odd" if i % 2 else "even"
-            tree.insert("", "end", values=display, tags=(tag,))
-
-        tree.tag_configure("odd",  background=C["alt"])
-        tree.tag_configure("even", background=C["bg"])
-
-        limited = limit and len(rows) >= limit
-        status = "{:,} row{} returned".format(
-            len(rows), "s" if len(rows) != 1 else "")
-        if limited:
-            status += "  (limit reached — increase Limit to see more)"
-        self._sql_status_label.configure(text=status)
+        self._sql_limited = bool(limit)          # a row past the limit was there
+        self._sql_grid.set_source(ListSource(cols, [(row, ()) for row in rows],
+                                             encoding=self.db.encoding))
+        self._sql_update_count()
         self._sql_col_info.configure(text="{} column{}".format(
             len(cols), "s" if len(cols) != 1 else ""))
         if rows:
             self._sql_export_btn.configure(state="normal")
             self._sql_export_json_btn.configure(state="normal")
 
+    def _sql_update_count(self):
+        """Status line of the SQL tab: rows returned, and how many the column filters keep."""
+        src = self._sql_grid.source
+        if src is None:
+            return
+        status = "{:,} row{} returned".format(src.total, "s" if src.total != 1 else "")
+        if src.filtered:
+            status += "  ({:,} kept by the column filters)".format(src.row_count())
+        if self._sql_limited:
+            status += "  (stopped at the Limit: the query has more rows; choose a larger " \
+                      "Limit or All)"
+        self._sql_status_label.configure(text=status)
+
+    def _sql_view_rows(self):
+        """The result rows as the grid shows them (column filters and sort applied)."""
+        src = self._sql_grid.source
+        return list(src.iter_rows()) if src is not None else list(self._sql_result_rows)
+
     def _sql_show_error(self, err):
         self._sql_run_btn.configure(state="normal")
-        self._sql_cancel_btn.configure(state="disabled")
+        self._sql_tbar.show(self._sql_cancel_btn, False)
         self._sql_status_label.configure(
             text="✖  Error: {}".format(err[:300]))
         self._sql_col_info.configure(text="")
 
-    def _sql_on_row_dblclick(self, event=None):
-        sel = self._sql_results_tree.selection()
-        if not sel:
-            return
-        vals = self._sql_results_tree.item(sel[0], "values")
-        cols = self._sql_result_cols
+    def _sql_open_row(self, _row, vals):
+        """Row detail of a query result (double-click or Enter in the results grid): each
+        column's value and storage class, BLOBs in the BLOB Inspector, lossless copies."""
         if not vals:
+            return None
+        s = self.db.session
+        seen = "" if s is None or s.sql_sees_current_state else \
+            " (SQL sees the main file only: committed WAL frames not included)"
+        return ValuesWindow(self, "Row detail — query result",
+                            "Query result of %s%s:\n%s" % (
+                                self.member_label(self.case.active, None) or "the database",
+                                seen, getattr(self, "_sql_last", "")[:300]),
+                            self._sql_result_cols, list(vals))
+
+    def _sql_export(self, fmt):
+        """Export the query's rows (as the grid shows them: column filters and sort applied)
+        on a worker thread, with the query, and what SQL could see, in the provenance."""
+        if not self._sql_result_rows:
             return
-        win = tk.Toplevel(self)
-        win.title("Row Detail")
-        win.geometry("540x420")
-        win.configure(bg=C["bg"])
-        win.transient(self)
-        txt = tk.Text(win, wrap="word", bg=C["bg2"], fg=C["text"],
-                    font=("Consolas", 10), relief="flat", padx=8, pady=6)
-        vsb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        txt.pack(fill="both", expand=True, padx=(8, 0), pady=8)
-        lines = ["{}: {}".format(
-            cols[i] if i < len(cols) else "col{}".format(i), v)
-            for i, v in enumerate(vals)]
-        txt.insert("1.0", "\n".join(lines))
-        txt.configure(state="disabled")
-        btn_f = tk.Frame(win, bg=C["bg"])
-        btn_f.pack(fill="x", padx=8, pady=(0, 8))
-        tk.Button(btn_f, text="Copy",
-            command=lambda: (win.clipboard_clear(),
-                            win.clipboard_append("\n".join(lines))),
-            bg=C["acl"], fg=C["accent"],
-            font=("Segoe UI", 9), relief="flat", bd=0,
-            padx=10, pady=4, cursor="hand2").pack(side="left")
-        tk.Button(btn_f, text="Close", command=win.destroy,
-            bg=C["bg3"], fg=C["text2"],
-            font=("Segoe UI", 9), relief="flat", bd=0,
-            padx=10, pady=4, cursor="hand2").pack(side="right")
+        src = self._sql_grid.source
+        n = src.row_count() if src is not None else len(self._sql_result_rows)
+        opts = export_options(self, "Export query results",
+                              [("rows", "The %s shown%s" % (
+                                  plural(n, "row"), " (column filters applied)"
+                                  if src is not None and src.filtered else ""))], fmt=fmt,
+                              spreadsheet_safe=True)
+        if opts is None:
+            return
+        fmt = opts["fmt"]
+        path = ask_path(self, fmt, "query_results")
+        if not write_allowed(path):
+            return
+        rows = self._sql_view_rows()
+        cols = list(self._sql_result_cols)
+        s = self.db.session
+        seen = ("the current state (WAL applied)" if s.sql_sees_current_state
+                else "the main file only: committed WAL frames NOT included")
+        extra = {"sql": getattr(self, "_sql_last", ""), "sql_sees": seen,
+                 "stopped_at_limit": bool(self._sql_limited)}
+        export_rows(self, "Export query results", path, fmt, cols, lambda: iter(rows),
+                    "SQL query results", [self.case.active], scope=plural(n, "row"),
+                    filters="; ".join("%s: %s" % kv for kv in sorted(
+                        self._sql_grid.filter_texts().items())),
+                    blob_mode=opts["blob_mode"], total=len(rows), extra=extra,
+                    spreadsheet_safe=opts.get("spreadsheet_safe", True))
 
     def _sql_export_csv(self):
-        if not self._sql_result_rows:
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv", initialfile="query_results.csv",
-            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(self._sql_result_cols)
-                for row in self._sql_result_rows:
-                    w.writerow([
-                        v.decode("utf-8", errors="replace")
-                        if isinstance(v, bytes)
-                        else ("" if v is None else v)
-                        for v in row
-                    ])
-            messagebox.showinfo("Export Complete",
-                                "Exported {:,} rows to:\n{}".format(
-                                    len(self._sql_result_rows),
-                                    os.path.basename(path)))
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        self._sql_export("csv")
 
     def _sql_export_json(self):
-        if not self._sql_result_rows:
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json", initialfile="query_results.json",
-            filetypes=[("JSON", "*.json"), ("All", "*.*")])
-        if not path:
-            return
-        try:
-            out = []
-            for row in self._sql_result_rows:
-                rec = {}
-                for i, v in enumerate(row):
-                    k = (self._sql_result_cols[i]
-                        if i < len(self._sql_result_cols) else "col{}".format(i))
-                    rec[k] = (v.decode("utf-8", errors="replace")
-                            if isinstance(v, bytes) else v)
-                out.append(rec)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(out, f, indent=2, default=str)
-            messagebox.showinfo("Export Complete",
-                                "Exported {:,} rows to:\n{}".format(
-                                    len(out), os.path.basename(path)))
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+        self._sql_export("json")
 
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # ── DELETED PAGES (FREELIST) TAB ─────────────────────────────────────
-    # ═══════════════════════════════════════════════════════════════════════
+    def _wal_row_tag(self, result):
+        """Treeview tag for a search result row (WAL results are coloured by frame state)."""
+        if result.get("source", "DB").startswith("WAL"):
+            state = result.get("category", "")
+            if state in WAL_STATES:
+                return "wal_" + state
+        return None
 
-    def _build_fl_tab(self):
-        ff = self._fl_frame
-        for w in ff.winfo_children():
-            w.destroy()
-
-        hdr = ttk.Frame(ff)
-        hdr.pack(fill="x", padx=10, pady=(8, 2))
-        ttk.Label(hdr, text="Deleted Pages  (Freelist Recovery)",
-                style="B.TLabel").pack(side="left")
-        legend = tk.Frame(hdr, bg=C["bg"])
-        legend.pack(side="right")
-        tk.Label(legend, text="Confidence:", bg=C["bg"], fg=C["text2"],
-                font=("Segoe UI", 8)).pack(side="left", padx=(8, 2))
-        for lbl, col in [("High", C["green"]),
-                        ("Medium", C["yellow"]),
-                        ("Low", C["red"])]:
-            tk.Label(legend, text="● " + lbl, fg=col, bg=C["bg"],
-                    font=("Segoe UI", 8)).pack(side="left", padx=3)
-
-        self._fl_summary = ttk.Label(ff, text="", style="M.TLabel")
-        self._fl_summary.pack(fill="x", padx=10, pady=(2, 0))
-
-        fbar = ttk.Frame(ff)
-        fbar.pack(fill="x", padx=10, pady=(4, 2))
-        ttk.Label(fbar, text="Table:", font=("Segoe UI", 9)).pack(side="left")
-        self._fl_table_var = tk.StringVar(value="All")
-        self._fl_table_combo = ttk.Combobox(
-            fbar, textvariable=self._fl_table_var,
-            values=["All"], state="readonly", width=22)
-        self._fl_table_combo.pack(side="left", padx=(2, 8))
-        self._fl_table_combo.bind("<<ComboboxSelected>>",
-                                lambda e: self._fl_display())
-        ToolTip(self._fl_table_combo, "Filter by table")
-
-        ttk.Label(fbar, text="Confidence:", font=("Segoe UI", 9)).pack(side="left")
-        self._fl_conf_var = tk.StringVar(value="All")
-        fl_conf_cb = ttk.Combobox(
-            fbar, textvariable=self._fl_conf_var,
-            values=["All", "High", "Medium", "Low"],
-            state="readonly", width=10)
-        fl_conf_cb.pack(side="left", padx=(2, 8))
-        fl_conf_cb.bind("<<ComboboxSelected>>", lambda e: self._fl_display())
-        ToolTip(fl_conf_cb,
-                "High: table + columns known\n"
-                "Medium: table known, partial columns\n"
-                "Low: page decoded but table unknown")
-
-        ttk.Button(fbar, text="Refresh",
-                command=self._populate_fl_tab).pack(side="left", padx=4)
-        ttk.Button(fbar, text="Export CSV",
-                command=self._fl_export_csv).pack(side="left", padx=2)
-        ttk.Button(fbar, text="Export JSON",
-                command=self._fl_export_json).pack(side="left", padx=2)
-
-        self._fl_pw = ttk.PanedWindow(ff, orient="vertical")
-        self._fl_pw.pack(fill="both", expand=True, padx=10, pady=(2, 10))
-
-        top_f = ttk.Frame(self._fl_pw)
-        self._fl_pw.add(top_f, weight=2)
-        top_border = tk.Frame(top_f, relief="solid", bd=1, bg=C["border"])
-        top_border.pack(fill="both", expand=True)
-
-        fl_cols = ("Page #", "Table", "Confidence", "Records", "Page Type")
-        self._fl_tree = ttk.Treeview(
-            top_border, columns=fl_cols,
-            show="headings", selectmode="browse")
-        for col in fl_cols:
-            self._fl_tree.heading(col, text=col,
-                                command=lambda c=col: self._fl_sort(c))
-        self._fl_tree.column("Page #",     width=70,  minwidth=50,  stretch=False)
-        self._fl_tree.column("Table",      width=250, minwidth=120, stretch=True)
-        self._fl_tree.column("Confidence", width=90,  minwidth=70,  stretch=False)
-        self._fl_tree.column("Records",    width=80,  minwidth=50,  stretch=False)
-        self._fl_tree.column("Page Type",  width=140, minwidth=90,  stretch=False)
-        fl_ysb = ttk.Scrollbar(top_border, orient="vertical",
-                                command=self._fl_tree.yview)
-        self._fl_tree.configure(yscrollcommand=fl_ysb.set)
-        fl_ysb.pack(side="right", fill="y")
-        self._fl_tree.pack(fill="both", expand=True)
-        self._fl_tree.bind("<<TreeviewSelect>>", self._fl_on_select)
-        self._fl_tree.tag_configure("High",
-            foreground=C["green"],  background=C["gl"])
-        self._fl_tree.tag_configure("Medium",
-            foreground=C["orange"], background="#fff8e6")
-        self._fl_tree.tag_configure("Low",
-            foreground=C["red"],    background=C["rl"])
-        TreeviewTooltip(self._fl_tree)
-        self._fl_sort_col = None
-        self._fl_sort_rev = False
-
-        bot_f = ttk.Frame(self._fl_pw)
-        self._fl_pw.add(bot_f, weight=3)
-        self._fl_detail_nb = ttk.Notebook(bot_f)
-        self._fl_detail_nb.pack(fill="both", expand=True)
-
-        rec_tab = ttk.Frame(self._fl_detail_nb)
-        self._fl_detail_nb.add(rec_tab, text=" Recovered Records ")
-        self._fl_rec_border = tk.Frame(
-            rec_tab, relief="solid", bd=1, bg=C["border"])
-        self._fl_rec_border.pack(fill="both", expand=True)
-
-        hex_tab = ttk.Frame(self._fl_detail_nb)
-        self._fl_detail_nb.add(hex_tab, text=" Raw Hex ")
-        hex_btn_bar = ttk.Frame(hex_tab)
-        hex_btn_bar.pack(fill="x")
-        ttk.Button(hex_btn_bar, text="Copy Hex",
-                command=self._fl_copy_hex).pack(side="left", padx=4, pady=2)
-        self._fl_hex_view = tk.Text(
-            hex_tab, wrap="none", height=8,
-            bg=C["bg2"], fg=C["text"], font=("Consolas", 10))
-        fl_hex_ysb = ttk.Scrollbar(hex_tab, orient="vertical",
-                                    command=self._fl_hex_view.yview)
-        fl_hex_xsb = ttk.Scrollbar(hex_tab, orient="horizontal",
-                                    command=self._fl_hex_view.xview)
-        self._fl_hex_view.configure(yscrollcommand=fl_hex_ysb.set,
-                                    xscrollcommand=fl_hex_xsb.set)
-        fl_hex_ysb.pack(side="right", fill="y")
-        fl_hex_xsb.pack(side="bottom", fill="x")
-        self._fl_hex_view.pack(fill="both", expand=True)
-        self._fl_hex_view.configure(state="disabled")
-
-        info_tab = ttk.Frame(self._fl_detail_nb)
-        self._fl_detail_nb.add(info_tab, text=" Page Info ")
-        self._fl_info_text = tk.Text(
-            info_tab, wrap="word", height=8,
-            bg=C["bg2"], fg=C["text"], font=("Consolas", 10))
-        self._fl_info_text.pack(fill="both", expand=True)
-        self._fl_info_text.configure(state="disabled")
-
-    def _populate_fl_tab(self):
-        if not self.db.ok:
-            return
-        self._fl_summary.configure(text="Scanning freelist pages…")
-        self._fl_data = []
-        def _load():
-            try:
-                data = self.db.recover_freelist_records()
-            except Exception:
-                data = []
-            self.after(0, lambda: self._fl_loaded(data))
-        threading.Thread(target=_load, daemon=True).start()
-
-    def _fl_loaded(self, data):
-        self._fl_data = data
-        tables = sorted({pg["table"] for pg in data})
-        if hasattr(self, "_fl_table_combo"):
-            self._fl_table_combo.configure(values=["All"] + tables)
-            self._fl_table_var.set("All")
-        self._fl_display()
-
-    def _fl_display(self):
-        if not hasattr(self, "_fl_tree"):
-            return
-        tree = self._fl_tree
-        tree.delete(*tree.get_children())
-        tbl_f  = self._fl_table_var.get()
-        conf_f = self._fl_conf_var.get()
-        total_recs = 0
-        shown = 0
-        for pg in self._fl_data:
-            if tbl_f  != "All" and pg["table"]      != tbl_f:
-                continue
-            if conf_f != "All" and pg["confidence"] != conf_f:
-                continue
-            rc = len(pg["records"])
-            total_recs += rc
-            tree.insert("", "end", iid=str(pg["page_num"]),
-                        values=(pg["page_num"], pg["table"],
-                                pg["confidence"], rc, pg["page_type"]),
-                        tags=(pg["confidence"],))
-            shown += 1
-        fc = self.db.freelist_count() if self.db.ok else 0
-        self._fl_summary.configure(text=(
-            "Freelist pages in DB: {:,}  •  "
-            "{:,} pages with recoverable data  •  "
-            "{:,} deleted records  •  Showing {:,}".format(
-                fc, len(self._fl_data), total_recs, shown)))
-
-    def _fl_on_select(self, event=None):
-        sel = self._fl_tree.selection()
-        if not sel:
-            return
-        page_num = int(sel[0])
-        pg = next((p for p in self._fl_data if p["page_num"] == page_num), None)
-        if not pg:
-            return
-
-        for w in self._fl_rec_border.winfo_children():
-            w.destroy()
-
-        records    = pg["records"]
-        known_cols = pg["columns"]
-        conf_colors = {"High": C["green"], "Medium": C["orange"], "Low": C["red"]}
-
-        if records:
-            badge = tk.Label(
-                self._fl_rec_border,
-                text="  Page {:,}  |  Table: {}  |  {} record{}  |  Confidence: {}".format(
-                    pg["page_num"], pg["table"],
-                    len(records), "s" if len(records) != 1 else "",
-                    pg["confidence"]),
-                font=("Segoe UI", 9, "bold"),
-                fg=conf_colors.get(pg["confidence"], C["text"]),
-                bg="#eef0f4", anchor="w",
-            )
-            badge.pack(fill="x")
-            max_cols = max((len(r["values"]) for r in records), default=0)
-            rec_cols = ["RowID"] + [
-                known_cols[i] if i < len(known_cols) else "col{}".format(i)
-                for i in range(max_cols)
-            ]
-            rec_tree = ttk.Treeview(
-                self._fl_rec_border, columns=rec_cols,
-                show="headings", selectmode="browse")
-            for col in rec_cols:
-                rec_tree.heading(col, text=col)
-                rec_tree.column(col, width=120, minwidth=60, stretch=True)
-            rec_tree.column("RowID", width=70, minwidth=50, stretch=False)
-            rec_ysb = ttk.Scrollbar(self._fl_rec_border, orient="vertical",
-                                    command=rec_tree.yview)
-            rec_tree.configure(yscrollcommand=rec_ysb.set)
-            rec_ysb.pack(side="right", fill="y")
-            rec_tree.pack(fill="both", expand=True)
-            rec_tree.tag_configure("odd",  background=C["alt"])
-            rec_tree.tag_configure("even", background=C["bg"])
-            TreeviewTooltip(rec_tree)
-            for ci, rec in enumerate(records):
-                rec_tree.insert("", "end",
-                                values=(rec["rowid"], *rec["values"]),
-                                tags=("odd" if ci % 2 else "even",))
-        else:
-            ttk.Label(self._fl_rec_border,
-                    text="No decodable records on this page.",
-                    style="M.TLabel").pack(padx=10, pady=10)
-
-        self._fl_hex_view.configure(state="normal")
-        self._fl_hex_view.delete("1.0", "end")
-        page_data  = pg.get("page_data", b"")
-        show_bytes = min(len(page_data), 4096)
-        lines = [
-            "Freelist Leaf Page {:,}  ({:,} bytes)".format(
-                pg["page_num"], len(page_data)),
-            "Showing first {:,} bytes:".format(show_bytes),
-            "=" * 72,
-            "Offset    Hexadecimal                                       ASCII",
-            "─" * 72,
-        ]
-        for off in range(0, show_bytes, 16):
-            chunk = page_data[off:off + 16]
-            hex_p   = " ".join("{:02X}".format(b) for b in chunk)
-            ascii_p = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-            lines.append("{:08X}  {:<48s}  {}".format(off, hex_p, ascii_p))
-        if len(page_data) > 4096:
-            lines.append("\n... ({:,} more bytes)".format(len(page_data) - 4096))
-        self._fl_hex_view.insert("1.0", "\n".join(lines))
-        self._fl_hex_view.configure(state="disabled")
-
-        self._fl_info_text.configure(state="normal")
-        self._fl_info_text.delete("1.0", "end")
-        info = [
-            "Freelist Page #{}".format(pg["page_num"]),
-            "=" * 50, "",
-            "Table:       {}".format(pg["table"]),
-            "Page Type:   {}".format(pg["page_type"]),
-            "Confidence:  {}".format(pg["confidence"]),
-            "Records:     {}".format(len(records)),
-            "Page size:   {:,} bytes".format(len(page_data)), "",
-            "What is a freelist page?",
-            "  When SQLite deletes rows, pages are not wiped.",
-            "  They go onto the freelist and sit intact until",
-            "  SQLite reuses them for new data. Until that",
-            "  happens the original rows are recoverable.", "",
-        ]
-        if pg["confidence"] == "High":
-            info += ["Recovery: Full — table and column names known."]
-        elif pg["confidence"] == "Medium":
-            info += ["Recovery: Partial — table known, column info limited."]
-        else:
-            info += ["Recovery: Low — page decoded, table not in schema.",
-                    "          Columns shown as col0, col1, etc."]
-        if known_cols:
-            info += ["", "Columns ({})".format(len(known_cols)),
-                    "  " + ", ".join(known_cols[:20]) +
-                    ("..." if len(known_cols) > 20 else "")]
-        self._fl_info_text.insert("1.0", "\n".join(info))
-        self._fl_info_text.configure(state="disabled")
-
-    def _fl_sort(self, col):
-        reverse = (self._fl_sort_col == col and not self._fl_sort_rev)
-        self._fl_sort_col = col
-        self._fl_sort_rev = reverse
-        key_map = {
-            "Page #":     lambda pg: pg["page_num"],
-            "Table":      lambda pg: pg["table"],
-            "Confidence": lambda pg: {"High": 0, "Medium": 1,
-                                    "Low": 2}.get(pg["confidence"], 3),
-            "Records":    lambda pg: len(pg["records"]),
-            "Page Type":  lambda pg: pg["page_type"],
-        }
-        self._fl_data.sort(key=key_map.get(col, lambda pg: pg["page_num"]),
-                        reverse=reverse)
-        self._fl_display()
-
-    def _fl_copy_hex(self):
-        if not hasattr(self, "_fl_hex_view"):
-            return
-        txt = self._fl_hex_view.get("1.0", "end-1c")
-        if txt.strip():
-            self.clipboard_clear()
-            self.clipboard_append(txt)
-
-    def _fl_export_csv(self):
-        if not self._fl_data:
-            messagebox.showinfo("Nothing to Export", "No freelist data loaded.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv", initialfile="deleted_records.csv",
-            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["Page#", "Table", "Confidence", "RowID", "Data"])
-                for pg in self._fl_data:
-                    for rec in pg["records"]:
-                        w.writerow([
-                            pg["page_num"], pg["table"],
-                            pg["confidence"], rec["rowid"],
-                            json.dumps(rec["values_dict"], default=str),
-                        ])
-            total = sum(len(pg["records"]) for pg in self._fl_data)
-            messagebox.showinfo("Export Complete",
-                                "Exported {:,} records to:\n{}".format(
-                                    total, os.path.basename(path)))
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    def _fl_export_json(self):
-        if not self._fl_data:
-            messagebox.showinfo("Nothing to Export", "No freelist data loaded.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json", initialfile="deleted_records.json",
-            filetypes=[("JSON", "*.json"), ("All", "*.*")])
-        if not path:
-            return
-        try:
-            out = []
-            for pg in self._fl_data:
-                for rec in pg["records"]:
-                    out.append({
-                        "page_num":   pg["page_num"],
-                        "table":      pg["table"],
-                        "confidence": pg["confidence"],
-                        "rowid":      rec["rowid"],
-                        "data": {
-                            k: (v.decode("utf-8", errors="replace")
-                                if isinstance(v, bytes) else v)
-                            for k, v in rec["values_dict"].items()
-                        },
-                    })
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"deleted_records": out, "total": len(out)},
-                        f, indent=2, default=str)
-            messagebox.showinfo("Export Complete",
-                                "Exported {:,} records to:\n{}".format(
-                                    len(out), os.path.basename(path)))
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+    def _configure_result_tags(self, tree):
+        tree.tag_configure("odd", background=C["alt"])
+        tree.tag_configure("even", background=C["bg"])
+        for state, (_label, _fg, bg, _desc) in WAL_STATES.items():
+            tree.tag_configure("wal_" + state, background=bg)
+        tree.tag_configure("sr_child", foreground=C["text2"])   # a row's cells / frames

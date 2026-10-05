@@ -1,902 +1,381 @@
-"""WAL (Write-Ahead Log) binary parser for SQLite forensic analysis.
+"""WAL tab adapter.
 
-Reads the raw .db-wal file directly using mmap — no sqlite3 dependency.
-Extracts frame headers, classifies frames (committed / uncommitted / old),
-parses b-tree leaf pages to recover cell records, and supports full-text
-search across all WAL data.
-
-WAL file layout:
-    [32-byte WAL header]
-    [24-byte frame header + page_size bytes of page data] × N frames
-
-References:
-    https://www.sqlite.org/walformat.html
-    https://www.sqlite.org/fileformat2.html (b-tree page format, varint, serial types)
+Keeps the WALParser interface the UI was written against, but every byte is now
+parsed by engine.fileformat: checksummed frame states, overflow chains, WITHOUT ROWID
+rows (index-tree pages) and schema-aware column mapping.
 """
 
-import mmap
-import os
-import re
-import struct
-from collections import namedtuple
+from collections import OrderedDict
 
-from constants import (WAL_MAGIC_BE, WAL_MAGIC_LE, WAL_HEADER_SIZE,
-                       WAL_FRAME_HEADER_SIZE, PAGE_TYPES)
+from constants import PAGE_TYPES, search_mode_key
+from engine.fileformat.btree import (BTreeReader, INDEX_INTERIOR, INDEX_LEAF, TABLE_INTERIOR,
+                                     TABLE_LEAF, cell_pointers, parse_page_header)
+from engine.fileformat.record import decode_record_lenient
+from engine.fileformat.wal import STATES
+from engine.schema import Locator, SchemaEntry, TableInfo, collation_names, describe_table
+from engine.search import match_row
 
-
-# ── Data structures ──────────────────────────────────────────────────────
-
-WALHeader = namedtuple("WALHeader", [
-    "magic", "version", "page_size", "checkpoint_seq",
-    "salt1", "salt2", "checksum1", "checksum2",
-])
-
-WALFrame = namedtuple("WALFrame", [
-    "index",          # 0-based frame index
-    "offset",         # byte offset of frame header in WAL file
-    "page_num",       # database page number this frame overwrites
-    "commit_size",    # >0 on last frame of a committed transaction
-    "salt1", "salt2", # frame salt values
-    "checksum1", "checksum2",
-    "category",       # 'committed' | 'uncommitted' | 'old'
-    "page_type",      # human-readable page type string
-    "page_type_byte", # raw first byte of page data
-])
+SYSTEM_TABLES = ("sqlite_master", "sqlite_sequence")
 
 
-# ── Varint / serial type helpers ─────────────────────────────────────────
+class WALFrameView(object):
+    """UI-facing frame: engine WalFrame plus the legacy attribute names."""
+    __slots__ = ("index", "offset", "page_num", "commit_size", "salt1", "salt2", "checksum1",
+                 "checksum2", "checksum_ok", "state", "category", "commit_group",
+                 "page_type", "page_type_byte")
 
-def _read_varint(data, offset):
-    """Read a SQLite varint (1-9 bytes, MSB continuation bit).
-
-    Returns (value, new_offset).  Raises ValueError on truncated data.
-    """
-    result = 0
-    for i in range(9):
-        if offset >= len(data):
-            raise ValueError("Truncated varint")
-        b = data[offset]
-        offset += 1
-        if i < 8:
-            result = (result << 7) | (b & 0x7F)
-            if b < 0x80:
-                return (result, offset)
-        else:
-            # 9th byte: all 8 bits are payload
-            result = (result << 8) | b
-            return (result, offset)
-    return (result, offset)
+    def __init__(self, fr):
+        self.index, self.offset, self.page_num = fr.index, fr.offset, fr.page_no
+        self.commit_size, self.salt1, self.salt2 = fr.db_size, fr.salt1, fr.salt2
+        self.checksum1, self.checksum2, self.checksum_ok = fr.checksum1, fr.checksum2, fr.checksum_ok
+        self.state = self.category = fr.state
+        self.commit_group = fr.commit_group
+        self.page_type_byte = fr.page_type
+        self.page_type = PAGE_TYPES.get(fr.page_type, "Unknown (0x%02X)" % fr.page_type)
 
 
-def _serial_type_size(st):
-    """Return the byte-length of a value with the given serial type code."""
-    if st == 0:
-        return 0      # NULL
-    if st == 1:
-        return 1      # 8-bit int
-    if st == 2:
-        return 2      # 16-bit int
-    if st == 3:
-        return 3      # 24-bit int
-    if st == 4:
-        return 4      # 32-bit int
-    if st == 5:
-        return 6      # 48-bit int
-    if st == 6:
-        return 8      # 64-bit int
-    if st == 7:
-        return 8      # IEEE 754 float
-    if st == 8:
-        return 0      # integer 0
-    if st == 9:
-        return 0      # integer 1
-    if st >= 12 and st % 2 == 0:
-        return (st - 12) // 2   # BLOB
-    if st >= 13 and st % 2 == 1:
-        return (st - 13) // 2   # TEXT
-    return 0
+class _FramePager(object):
+    """Pager look-alike exposing one WAL frame's copy of a page; other pages
+    (overflow chains) come from the session's effective pager."""
+
+    def __init__(self, pager, page_no, data):
+        self._pager, self._page_no, self._data = pager, page_no, data
+        self.usable_size, self.encoding = pager.usable_size, pager.encoding
+        self.page_count = pager.page_count
+
+    def page(self, n):
+        return self._data if n == self._page_no else self._pager.page(n)
 
 
-def _read_serial_value(data, offset, serial_type):
-    """Decode a value from data at offset given its serial type.
-
-    Returns (value, new_offset).
-    """
-    if serial_type == 0:
-        return (None, offset)
-    if serial_type == 8:
-        return (0, offset)
-    if serial_type == 9:
-        return (1, offset)
-
-    sz = _serial_type_size(serial_type)
-    if offset + sz > len(data):
-        raise ValueError(f"Truncated value: need {sz} bytes at offset {offset}")
-
-    chunk = data[offset:offset + sz]
-
-    if serial_type in (1, 2, 3, 4, 5, 6):
-        # Signed big-endian integer
-        val = int.from_bytes(chunk, "big", signed=True)
-        return (val, offset + sz)
-
-    if serial_type == 7:
-        val = struct.unpack(">d", chunk)[0]
-        return (val, offset + sz)
-
-    if serial_type >= 12 and serial_type % 2 == 0:
-        # BLOB
-        return (bytes(chunk), offset + sz)
-
-    if serial_type >= 13 and serial_type % 2 == 1:
-        # TEXT (UTF-8)
-        try:
-            val = bytes(chunk).decode("utf-8", errors="replace")
-        except Exception:
-            val = bytes(chunk).decode("latin-1", errors="replace")
-        return (val, offset + sz)
-
-    return (None, offset + sz)
+def display_value(v):
+    from utils import blob_type, fmtb
+    if v is None:
+        return "NULL"
+    if isinstance(v, bytes):
+        return "[BLOB: %s, %s]" % (fmtb(len(v)), blob_type(v))
+    if isinstance(v, float):
+        return "%.6g" % v
+    return str(v)
 
 
-def _parse_record(data, offset):
-    """Parse a full SQLite record at the given offset.
-
-    A record is: header_length (varint), serial_type1 (varint), ...,
-    followed by the values.
-
-    Returns list of decoded values.
-    """
-    start = offset
-    header_len, offset = _read_varint(data, offset)
-    header_end = start + header_len
-
-    # Read serial types
-    serial_types = []
-    while offset < header_end:
-        st, offset = _read_varint(data, offset)
-        serial_types.append(st)
-
-    # Ensure we're at header_end
-    offset = header_end
-
-    # Read values
-    values = []
-    for st in serial_types:
-        val, offset = _read_serial_value(data, offset, st)
-        values.append(val)
-
-    return values
-
-
-def _identify_page_type(page_data):
-    """Return (page_type_byte, human_label) for a page."""
-    if not page_data or len(page_data) < 1:
-        return (0, "Unknown")
-    pt = page_data[0]
-    label = PAGE_TYPES.get(pt, f"Unknown (0x{pt:02X})")
-    return (pt, label)
-
-
-# ── WALParser class ──────────────────────────────────────────────────────
-
-class WALParser:
-    """Pure binary WAL file parser using memory-mapped I/O."""
-
-    def __init__(self):
-        self._path = None
-        self._f = None
-        self._mm = None
-        self.header = None
+class WALParser(object):
+    def __init__(self, session):
+        self._session = session
+        self._wal = session.wal
+        self.valid = self._wal is not None
+        self.page_map, self.col_map, self.pk_col_idx = {}, {}, {}
+        self.tables = {}
+        self.index_pages = set()
+        self.wal_only_tables = set()
         self.frames = []
-        self.page_size = 0
-        self._valid = False
-        self._file_size = 0
-        # Set by DB._build_wal_page_map() after open
-        self.page_map = {}   # page_num → table_name
-        self.col_map = {}    # table_name → [col_name, ...]
-        self.pk_col_idx = {} # table_name → column index of INTEGER PRIMARY KEY
-
-    # ── open / close ─────────────────────────────────────────────────
-
-    def open(self, db_path):
-        """Open WAL file for the given database path (appends '-wal').
-
-        Silently returns if the WAL file doesn't exist or is too small.
-        """
-        wal_path = db_path + "-wal"
-        self.open_wal_file(wal_path, db_path)
-
-    def open_wal_file(self, wal_path, db_path=None):
-        """Open a specific WAL file directly.
-
-        Used for forensic backup copies where the WAL path doesn't match
-        the database path. ``db_path`` is stored for reference only.
-        """
-        self.close()
-        if not os.path.isfile(wal_path):
+        if not self.valid:
+            self.header, self.page_size, self.path = None, 0, None
             return
-        fsize = os.path.getsize(wal_path)
-        if fsize < WAL_HEADER_SIZE:
-            return
-
-        try:
-            self._f = open(wal_path, "rb")
-            self._file_size = fsize
-            self._path = wal_path
-
-            # Memory-map the entire file (read-only)
-            self._mm = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ)
-
-            self._parse_header()
-            if not self._valid:
-                self.close()
-                return
-            self._parse_frames()
-        except Exception:
-            self.close()
+        self.header = self._wal.header
+        self.page_size = self._wal.page_size
+        self.path = self._wal.path
+        self.frames = [WALFrameView(f) for f in self._wal.frames]
+        self._build_maps()
 
     def close(self):
-        """Release resources."""
-        if self._mm:
+        """The session owns the WAL file; nothing to release here."""
+
+    # -- page -> table mapping -------------------------------------------
+    def _frame_cells(self, frame, index_tree):
+        """(rowid_or_None, payload, CellRef) for every cell in this frame's page copy."""
+        data = self._wal.page_data(frame.index)
+        pager = _FramePager(self._session.pager, frame.page_num, data)
+        reader = BTreeReader(pager, self._session.issues)
+        try:
+            h = parse_page_header(data, frame.page_num)
+        except Exception:
+            return []
+        out = list(reader.read_segment(frame.page_num, None, index_tree)) \
+            if h.type in (TABLE_LEAF, INDEX_LEAF) else []
+        if h.type == INDEX_INTERIOR:
+            for i in range(len(reader._offsets(data, h))):
+                out.extend(reader.read_segment(frame.page_num, i, True))
+        return out
+
+    def _children(self, frame):
+        data = self._wal.page_data(frame.index)
+        try:
+            h = parse_page_header(data, frame.page_num)
+        except Exception:
+            return []
+        if h.right_child is None:
+            return []
+        kids = [h.right_child]
+        for off in cell_pointers(data, h, self._session.pager.usable_size):
+            if off + 4 <= len(data):
+                kids.append(int.from_bytes(data[off:off + 4], "big"))
+        return kids
+
+    def _wal_master_entries(self):
+        """sqlite_master rows found in any WAL copy of the schema pages (incl. uncommitted)."""
+        master_pages = {1}
+        for f in self.frames:
+            if f.page_num == 1 and f.page_type_byte == TABLE_INTERIOR:
+                master_pages.update(self._children(f))
+        entries = []
+        enc = self._session.pager.encoding
+        for f in self.frames:
+            if f.page_num in master_pages and f.page_type_byte == TABLE_LEAF:
+                for rowid, payload, ref in self._frame_cells(f, False):
+                    v, problem = decode_record_lenient(payload, enc)
+                    if problem or len(v) < 5:
+                        continue
+                    root = v[3] if isinstance(v[3], int) else 0
+                    entries.append(SchemaEntry(str(v[0] or ""), str(v[1] or ""), str(v[2] or ""),
+                                               root, v[4] if isinstance(v[4], str) else ""))
+        return entries
+
+    def _build_maps(self):
+        schema = self._session.schema
+        for name in schema.names("table"):
+            self.tables[name] = schema.get(name)
+        wal_entries = self._wal_master_entries()
+        colls = schema.collations | collation_names(e.sql for e in wal_entries)
+        roots = {}
+        for e in list(schema.entries) + wal_entries:
+            if e.rootpage <= 0:
+                continue
+            if e.type == "table" and not e.sql.lstrip().upper().startswith("CREATE VIRTUAL"):
+                if e.name not in self.tables:
+                    t = TableInfo(e.name, "table", e.rootpage, e.sql)
+                    describe_table(t, colls)
+                    if t.columns:
+                        self.tables[e.name] = t
+                        self.wal_only_tables.add(e.name)
+                roots.setdefault(e.rootpage, e.name)
+            elif e.type == "index":
+                self.index_pages.add(e.rootpage)
+        reader = BTreeReader(self._session.pager, self._session.issues)
+        for root, name in roots.items():
+            self.page_map[root] = name
             try:
-                self._mm.close()
-            except Exception:
-                pass
-            self._mm = None
-        if self._f:
-            try:
-                self._f.close()
-            except Exception:
-                pass
-            self._f = None
-        self._path = None
-        self.header = None
-        self.frames = []
-        self.page_size = 0
-        self._valid = False
-        self._file_size = 0
+                for p in reader.tree_pages(root):
+                    self.page_map.setdefault(p, name)
+            except Exception as e:     # e.g. a WAL-only root beyond the committed page count
+                self._session.issues.add("wal_page_map", str(e), "%s root %d" % (name, root))
+        self.page_map[1] = "sqlite_master"
+        for _ in range(8):   # follow interior pages that only exist in WAL frames
+            changed = False
+            for f in self.frames:
+                if f.page_type_byte not in (TABLE_INTERIOR, INDEX_INTERIOR):
+                    continue
+                owner = self.page_map.get(f.page_num)
+                if owner is None:
+                    continue
+                for child in self._children(f):
+                    if child not in self.page_map:
+                        self.page_map[child] = owner
+                        changed = True
+            if not changed:
+                break
+        for name, t in self.tables.items():
+            self.col_map[name] = t.column_names
+            if t.rowid_alias is not None:
+                self.pk_col_idx[name] = t.rowid_alias
+        self.col_map["sqlite_master"] = ["type", "name", "tbl_name", "rootpage", "sql"]
 
-    @property
-    def valid(self):
-        return self._valid
-
-    @property
-    def path(self):
-        return self._path
-
-    # ── header parsing ───────────────────────────────────────────────
-
-    def _parse_header(self):
-        """Parse the 32-byte WAL header."""
-        mm = self._mm
-        if len(mm) < WAL_HEADER_SIZE:
-            return
-
-        magic = struct.unpack(">I", mm[0:4])[0]
-        if magic not in (WAL_MAGIC_BE, WAL_MAGIC_LE):
-            return
-
-        # Determine byte order from magic number
-        self._big_endian = (magic == WAL_MAGIC_BE)
-        bo = ">" if self._big_endian else "<"
-
-        version, page_size, ckpt_seq = struct.unpack(f"{bo}III", mm[4:16])
-        salt1, salt2 = struct.unpack(f"{bo}II", mm[16:24])
-        cksum1, cksum2 = struct.unpack(f"{bo}II", mm[24:32])
-
-        self.header = WALHeader(
-            magic=magic, version=version, page_size=page_size,
-            checkpoint_seq=ckpt_seq, salt1=salt1, salt2=salt2,
-            checksum1=cksum1, checksum2=cksum2,
-        )
-        self.page_size = page_size
-        self._valid = True
-
-    # ── frame parsing ────────────────────────────────────────────────
-
-    def _parse_frames(self):
-        """Parse all frame headers from the WAL file.
-
-        Only reads the 24-byte frame headers (not full page data) — fast.
-        Page data is read lazily via get_page_data().
-        """
-        mm = self._mm
-        ps = self.page_size
-        frame_total_size = WAL_FRAME_HEADER_SIZE + ps
-        offset = WAL_HEADER_SIZE
-        bo = ">" if self._big_endian else "<"
-        hdr_salt1 = self.header.salt1
-        hdr_salt2 = self.header.salt2
-        idx = 0
-        frames = []
-
-        while offset + frame_total_size <= len(mm):
-            # Parse 24-byte frame header
-            page_num, commit_size, f_salt1, f_salt2, cksum1, cksum2 = \
-                struct.unpack(f"{bo}IIIIII", mm[offset:offset + WAL_FRAME_HEADER_SIZE])
-
-            # Classify
-            salt_match = (f_salt1 == hdr_salt1 and f_salt2 == hdr_salt2)
-            if salt_match and commit_size > 0:
-                category = "committed"
-            elif salt_match:
-                category = "uncommitted"
-            else:
-                category = "old"
-
-            # Identify page type from first byte of page data
-            page_data_offset = offset + WAL_FRAME_HEADER_SIZE
-            pt_byte, pt_label = _identify_page_type(mm[page_data_offset:page_data_offset + 1])
-
-            frames.append(WALFrame(
-                index=idx, offset=offset, page_num=page_num,
-                commit_size=commit_size, salt1=f_salt1, salt2=f_salt2,
-                checksum1=cksum1, checksum2=cksum2,
-                category=category, page_type=pt_label,
-                page_type_byte=pt_byte,
-            ))
-
-            offset += frame_total_size
-            idx += 1
-
-        self.frames = frames
-
-    # ── page data access ─────────────────────────────────────────────
-
+    # -- raw page access (frame detail panel) ----------------------------
     def get_page_data(self, frame_index):
-        """Return raw page bytes for the given frame index.
-
-        Uses memoryview slice of the mmap — zero-copy.
-        """
-        if not self._valid or frame_index < 0 or frame_index >= len(self.frames):
+        if not self.valid or not 0 <= frame_index < len(self.frames):
             return b""
+        return self._wal.page_data(frame_index)
+
+    def parse_btree_page(self, page_data, page_no=0):
+        try:
+            h = parse_page_header(page_data, page_no)
+        except Exception:
+            return None
+        return {"page_type": PAGE_TYPES.get(h.type, "Unknown (0x%02X)" % h.type),
+                "page_type_byte": h.type, "cell_count": h.cell_count,
+                "cell_offsets": cell_pointers(page_data, h, len(page_data)),
+                "first_free": h.first_freeblock, "frag_count": h.fragmented,
+                "right_child": h.right_child, "cell_content_start": h.content_start}
+
+    def parse_leaf_cells(self, page_data, page_no=0):
+        """Cells of a table-leaf page copy as [{rowid, values}] (overflow followed when page_no given)."""
+        pager = _FramePager(self._session.pager, page_no or 0, page_data)
+        issues = self._session.issues
+        reader = BTreeReader(pager, issues)
+        try:
+            h = parse_page_header(page_data, page_no or 0)
+        except Exception:
+            return []      # not a b-tree page (overflow/freelist copy): no cells to show
+        if h.type != TABLE_LEAF:
+            return []
+        out = []
+        enc = self._session.pager.encoding
+        for off in reader._offsets(page_data, h):
+            try:
+                rowid, payload, ref = reader._table_leaf_cell(page_data, page_no or 0, off)
+            except Exception as e:
+                issues.add("bad_cell", str(e), "WAL copy of page %d offset %d" % (page_no, off))
+                continue
+            values, _ = decode_record_lenient(payload, enc)
+            out.append({"rowid": rowid, "values": values})
+        return out
+
+    # -- records -----------------------------------------------------------
+    def _records_in_frame(self, frame, include_schema):
+        name = self.page_map.get(frame.page_num)
+        if frame.page_num == 1 or name == "sqlite_master":
+            if not include_schema:
+                return
+            name = "sqlite_master"
+        t = self.tables.get(name) if name else None
+        pt = frame.page_type_byte
+        if pt == TABLE_LEAF and (t is None or not t.without_rowid):
+            index_tree = False
+        elif pt in (INDEX_LEAF, INDEX_INTERIOR) and t is not None and t.without_rowid:
+            index_tree = True
+        else:
+            return
+        enc = self._session.pager.encoding
+        for ordinal, (rowid, payload, ref) in enumerate(self._frame_cells(frame, index_tree)):
+            values, problem = decode_record_lenient(payload, enc)
+            if t is not None and name != "sqlite_master":
+                row, flags = t.record_to_row(rowid, values, damaged=bool(problem))
+                cols = t.column_names
+                locator = t.locator_for(rowid, row, ordinal)
+            else:
+                row, flags = values, set()
+                cols = self.col_map.get(name or "", [])
+                cols = cols + ["col%d" % i for i in range(len(cols), len(row))]
+                locator = Locator("rowid", rowid)
+            if problem:
+                flags.add("damaged_record")
+            yield (name or "page_%d" % frame.page_num), cols, locator, row, flags
+
+    def records_of_frame(self, frame_index):
+        """The records of one frame's page copy (dicts like recover_all_records())."""
+        if not self.valid or not 0 <= frame_index < len(self.frames):
+            return []
         frame = self.frames[frame_index]
-        start = frame.offset + WAL_FRAME_HEADER_SIZE
-        end = start + self.page_size
-        if end > len(self._mm):
-            return b""
-        return bytes(self._mm[start:end])
+        return [self._record_dict(frame, table, cols, locator, row, flags)
+                for table, cols, locator, row, flags in self._records_in_frame(frame, False)]
 
-    # ── b-tree page parsing ──────────────────────────────────────────
+    @staticmethod
+    def _record_dict(frame, table, cols, locator, row, flags):
+        return {"table": table,
+                "rowid": locator.value if locator.kind == "rowid" else locator.display(),
+                "locator": locator,
+                "values_dict": dict((c, display_value(v)) for c, v in zip(cols, row)),
+                "raw_values": row, "flags": flags,
+                "frame_idx": frame.index, "page_num": frame.page_num,
+                "category": frame.category}
 
-    def parse_btree_page(self, page_data):
-        """Parse b-tree page header.
+    def recover_all_records(self, table_filter=None, category_filter=None, cancel=None,
+                            include_schema=False):
+        """Every record in every WAL frame, with its frame state.
 
-        Returns dict: {page_type, page_type_byte, cell_count, cell_offsets,
-                       first_free, frag_count, right_child (interior only)}
+        Yields dicts: table, rowid (int, or display text for WITHOUT ROWID), locator,
+        values_dict (display strings), raw_values, flags, frame_idx, page_num, category.
         """
-        if not page_data or len(page_data) < 8:
-            return None
-
-        pt = page_data[0]
-        if pt not in PAGE_TYPES or pt == 0:
-            return None
-
-        # Header size: 8 bytes for leaf pages, 12 for interior pages
-        is_interior = pt in (0x02, 0x05)
-        hdr_size = 12 if is_interior else 8
-
-        if len(page_data) < hdr_size:
-            return None
-
-        first_free = int.from_bytes(page_data[1:3], "big")
-        cell_count = int.from_bytes(page_data[3:5], "big")
-        cell_content_start = int.from_bytes(page_data[5:7], "big")
-        frag_count = page_data[7]
-
-        right_child = None
-        if is_interior:
-            right_child = int.from_bytes(page_data[8:12], "big")
-
-        # Cell pointer array follows header
-        ptr_start = hdr_size
-        cell_offsets = []
-        for i in range(cell_count):
-            po = ptr_start + i * 2
-            if po + 2 > len(page_data):
-                break
-            cell_offsets.append(int.from_bytes(page_data[po:po + 2], "big"))
-
-        return {
-            "page_type": PAGE_TYPES.get(pt, f"Unknown (0x{pt:02X})"),
-            "page_type_byte": pt,
-            "cell_count": cell_count,
-            "cell_offsets": cell_offsets,
-            "first_free": first_free,
-            "frag_count": frag_count,
-            "right_child": right_child,
-            "cell_content_start": cell_content_start,
-        }
-
-    def parse_leaf_cells(self, page_data):
-        """Parse all cells from a table leaf page (type 0x0D).
-
-        Returns list of dicts: {rowid: int, values: [v1, v2, ...]}
-        Returns empty list if page is not a table leaf or parsing fails.
-        """
-        if not page_data or len(page_data) < 8:
-            return []
-        if page_data[0] != 0x0D:
-            return []
-
-        info = self.parse_btree_page(page_data)
-        if not info:
-            return []
-
-        cells = []
-        for cell_offset in info["cell_offsets"]:
-            try:
-                if cell_offset >= len(page_data):
-                    continue
-                off = cell_offset
-                # payload_len (varint)
-                payload_len, off = _read_varint(page_data, off)
-                # rowid (varint)
-                rowid, off = _read_varint(page_data, off)
-
-                # Check for overflow: if payload fits on this page, parse inline
-                # Usable size = page_size - reserved (usually 0)
-                # Max local payload for table leaf: usable - 35
-                # If payload > max local, only part is inline, rest is overflow
-                # For simplicity, parse what's available on this page
-                payload_start = off
-                payload_end = min(payload_start + payload_len, len(page_data))
-                if payload_end <= payload_start:
-                    continue
-
-                payload = page_data[payload_start:payload_end]
-                values = _parse_record(payload, 0)
-                cells.append({"rowid": rowid, "values": values})
-            except Exception:
-                # Skip corrupt/unparseable cells
-                continue
-
-        return cells
-
-    def parse_page1_cells(self, page_data):
-        """Parse cells from page 1 which has a 100-byte DB header prefix.
-
-        Page 1 is special: bytes 0-99 are the database file header,
-        and the B-tree header starts at offset 100.
-        Returns list of dicts like parse_leaf_cells.
-        """
-        if not page_data or len(page_data) < 108:
-            return []
-        # Check btree type at offset 100
-        pt = page_data[100]
-        if pt != 0x0D:  # Must be table leaf
-            return []
-
-        # Parse header at offset 100
-        cell_count = int.from_bytes(page_data[103:105], "big")
-        # Cell pointer array starts at offset 108 (100 + 8 byte leaf header)
-        cell_offsets = []
-        for i in range(cell_count):
-            po = 108 + i * 2
-            if po + 2 > len(page_data):
-                break
-            cell_offsets.append(int.from_bytes(page_data[po:po + 2], "big"))
-
-        cells = []
-        for cell_offset in cell_offsets:
-            try:
-                if cell_offset >= len(page_data):
-                    continue
-                off = cell_offset
-                payload_len, off = _read_varint(page_data, off)
-                rowid, off = _read_varint(page_data, off)
-                payload_start = off
-                payload_end = min(payload_start + payload_len, len(page_data))
-                if payload_end <= payload_start:
-                    continue
-                payload = page_data[payload_start:payload_end]
-                values = _parse_record(payload, 0)
-                cells.append({"rowid": rowid, "values": values})
-            except Exception:
-                continue
-        return cells
-
-    # ── search ───────────────────────────────────────────────────────
-
-    def search(self, term, mode, limit=999999, cancel=None):
-        """Search all WAL table leaf pages for the given term.
-
-        Yields dicts: {table: str, column: str, rowid, value, type, source,
-                       frame_idx, page_num, category}
-
-        Only searches table leaf pages (0x0D) — other page types don't
-        contain user row data.
-        """
-        if not self._valid or not term:
+        if not self.valid:
             return
-
-        # Pre-compile regex if needed
-        rx = None
-        if mode == "Regex":
-            try:
-                rx = re.compile(term)
-            except re.error:
-                return
-
-        term_lower = term.lower()
-        found = 0
-
         for frame in self.frames:
-            if cancel and cancel():
+            if cancel is not None and cancel():
                 return
-            if found >= limit:
-                return
-
-            # Only table leaf pages contain row data
-            if frame.page_type_byte != 0x0D:
-                continue
-            # Skip sqlite_master / schema pages
-            if frame.page_num == 1:
-                continue
-
-            try:
-                page_data = self.get_page_data(frame.index)
-                cells = self.parse_leaf_cells(page_data)
-            except Exception:
-                continue
-
-            # Resolve table name and column names from page map
-            table_name = self.page_map.get(frame.page_num,
-                                            f"page_{frame.page_num}")
-            # Skip system tables
-            if table_name in ("sqlite_master", "sqlite_sequence"):
-                continue
-            col_names = self.col_map.get(table_name, [])
-            # INTEGER PRIMARY KEY column index (value = rowid, stored as NULL)
-            pk_idx = self.pk_col_idx.get(table_name, -1)
-
-            for cell in cells:
-                if cancel and cancel():
-                    return
-                if found >= limit:
-                    return
-
-                rowid = cell["rowid"]
-
-                # Build complete row dict — FULL values, no truncation
-                row_values = {}
-                for vi, v in enumerate(cell["values"]):
-                    cname = col_names[vi] if vi < len(col_names) else f"col{vi}"
-                    # INTEGER PRIMARY KEY: SQLite stores rowid separately,
-                    # the record payload has NULL — substitute the real rowid
-                    if vi == pk_idx and v is None:
-                        row_values[cname] = str(rowid)
-                    elif v is None:
-                        row_values[cname] = "NULL"
-                    elif isinstance(v, bytes):
-                        from utils import blob_type as _bt, fmtb as _fb
-                        row_values[cname] = f"[BLOB: {_fb(len(v))}, {_bt(v)}]"
-                    elif isinstance(v, float):
-                        row_values[cname] = f"{v:.6g}"
-                    else:
-                        row_values[cname] = str(v)  # Full value, no truncation
-
-                for ci, val in enumerate(cell["values"]):
-                    # For PK column, treat as rowid value for matching
-                    if ci == pk_idx and val is None:
-                        val = rowid
-                    if val is None:
-                        continue
-                    if isinstance(val, bytes):
-                        # Skip raw BLOB data in search (like main search does)
-                        continue
-
-                    s = str(val)
-                    matched = False
-
-                    if mode == "Case-Insensitive":
-                        matched = term_lower in s.lower()
-                    elif mode == "Case-Sensitive":
-                        matched = term in s
-                    elif mode == "Exact Match":
-                        matched = s == term
-                    elif mode == "Starts With":
-                        matched = s.lower().startswith(term_lower)
-                    elif mode == "Ends With":
-                        matched = s.lower().endswith(term_lower)
-                    elif mode == "Regex":
-                        matched = bool(rx.search(s))
-                    else:
-                        # Default: case-insensitive
-                        matched = term_lower in s.lower()
-
-                    if matched:
-                        found += 1
-                        # Truncate for search result display only
-                        display_val = s if len(s) <= 500 else s[:500] + "..."
-                        dt = "text" if isinstance(val, str) else \
-                             "integer" if isinstance(val, int) else \
-                             "real" if isinstance(val, float) else "text"
-                        col_name = col_names[ci] if ci < len(col_names) \
-                                   else f"col{ci}"
-                        yield {
-                            "table": table_name,
-                            "column": col_name,
-                            "rowid": rowid,
-                            "value": display_val,
-                            "type": dt,
-                            "source": "WAL ({})".format(
-                                {"committed": "Saved",
-                                 "uncommitted": "Unsaved",
-                                 "old": "Overwritten"}.get(
-                                    frame.category, frame.category)),
-                            "frame_idx": frame.index,
-                            "page_num": frame.page_num,
-                            "category": frame.category,
-                            "row_data": row_values,
-                        }
-                        if found >= limit:
-                            return
-
-    # ── bulk recovery ────────────────────────────────────────────────
-
-    def recover_all_records(self, table_filter=None, category_filter=None,
-                            cancel=None, include_schema=False):
-        """Recover ALL records from WAL table leaf pages.
-
-        Unlike ``search()``, this yields every record — no term filtering.
-        Used for the All-Records browser, WAL-only table browsing, full
-        forensic export, and BLOB extraction.
-
-        Parameters
-        ----------
-        table_filter : str or None
-            Only yield records belonging to this table.
-        category_filter : str or None
-            Only yield records from frames of this category
-            ('committed', 'uncommitted', 'old').
-        cancel : callable or None
-            Return True to abort early.
-        include_schema : bool
-            If False (default), skip sqlite_master records (CREATE TABLE
-            statements etc.) which are schema metadata, not user data.
-
-        Yields
-        ------
-        dict with keys:
-            table, rowid, values_dict, raw_values, frame_idx,
-            page_num, category
-        """
-        if not self._valid:
-            return
-
-        for frame in self.frames:
-            if cancel and cancel():
-                return
-            if frame.page_type_byte != 0x0D:
-                continue
             if category_filter and frame.category != category_filter:
                 continue
-
-            table_name = self.page_map.get(frame.page_num,
-                                           f"page_{frame.page_num}")
-
-            # Skip system tables / schema pages unless explicitly requested
-            if not include_schema:
-                if (table_name in ("sqlite_master", "sqlite_sequence")
-                        or frame.page_num == 1):
-                    continue
-
-            if table_filter and table_name != table_filter:
+            name = self.page_map.get(frame.page_num, "page_%d" % frame.page_num)
+            if table_filter and name != table_filter:
                 continue
+            if not include_schema and name in SYSTEM_TABLES:
+                continue
+            for table, cols, locator, row, flags in self._records_in_frame(frame, include_schema):
+                yield self._record_dict(frame, table, cols, locator, row, flags)
 
+    def search(self, term, mode, limit=None, cancel=None, deep_blob=False, decoded=False):
+        """Search every row version held in WAL frames, with the same rules as a table search
+        (engine.search: BLOB bytes in UTF-8/UTF-16, hex patterns, decoded content).
+
+        A row version is a row's key plus its values: the identical copies of it that superseded
+        and stale frames repeat are one version, searched once. Each hit is one matching cell of
+        a version and lists all frames holding that version in 'frames' [(frame index, page,
+        state)]; frame_idx/page_num/category describe the newest of them. At most `limit`
+        versions are returned (None: every one).
+        """
+        mode = search_mode_key(mode, mode)           # a UI label or an engine mode key
+        if not self.valid or not term or mode == "col":
+            return
+        matcher = self._session.matcher(term, mode, deep_blob, decoded)
+        versions = OrderedDict()                     # (table, locator, values) -> [record, frames]
+        for rec in self.recover_all_records(cancel=cancel):
             try:
-                page_data = self.get_page_data(frame.index)
-                cells = self.parse_leaf_cells(page_data)
-            except Exception:
+                key = (rec["table"], rec["locator"], tuple(rec["raw_values"]))
+                entry = versions.get(key)
+            except TypeError:                        # an unhashable value: keep this copy apart
+                key, entry = (rec["table"], rec["locator"], id(rec)), None
+            frame = (rec["frame_idx"], rec["page_num"], rec["category"])
+            if entry is None:
+                versions[key] = [rec, [frame]]
+            else:
+                entry[1].append(frame)
+        found = 0
+        hits = []
+        for rec, frames in versions.values():
+            if cancel is not None and cancel():
+                return
+            table = rec["table"]
+            cols = list(rec["values_dict"].keys())
+            t = self.tables.get(table)
+            decl = dict((c.name, c.decl_type) for c in t.columns) if t is not None else {}
+            del hits[:]
+            match_row(table, cols, [decl.get(c, "") for c in cols], rec["locator"],
+                      rec["raw_values"], matcher, hits.append)
+            if not hits:
                 continue
+            newest = max(frames)
+            for h in hits:
+                h.update({"rowid": rec["rowid"], "source": "WAL (%s)" % newest[2].title(),
+                          "frame_idx": newest[0], "page_num": newest[1], "category": newest[2],
+                          "frames": frames, "row_data": rec["values_dict"],
+                          "row": rec["raw_values"]})
+                yield h
+            found += 1
+            if limit is not None and found >= limit:
+                return
 
-            col_names = self.col_map.get(table_name, [])
-            pk_idx = self.pk_col_idx.get(table_name, -1)
-
-            # Detect misidentified sqlite_master pages by checking cell content.
-            # sqlite_master records have 5 columns where first is type string
-            # ("table", "index", "view", "trigger") and 5th is CREATE SQL.
-            is_schema_page = False
-            if not include_schema and cells:
-                first_vals = cells[0].get("values", [])
-                if (len(first_vals) >= 5
-                        and isinstance(first_vals[0], str)
-                        and first_vals[0] in ("table", "index", "view", "trigger")
-                        and isinstance(first_vals[4], str)
-                        and first_vals[4].strip().upper().startswith("CREATE")):
-                    is_schema_page = True
-            if is_schema_page:
-                continue
-
-            for cell in cells:
-                if cancel and cancel():
-                    return
-                rowid = cell["rowid"]
-                values_dict = {}
-                for vi, v in enumerate(cell["values"]):
-                    cname = (col_names[vi] if vi < len(col_names)
-                             else f"col{vi}")
-                    if vi == pk_idx and v is None:
-                        values_dict[cname] = str(rowid)
-                    elif v is None:
-                        values_dict[cname] = "NULL"
-                    elif isinstance(v, bytes):
-                        from utils import blob_type as _bt, fmtb as _fb
-                        values_dict[cname] = f"[BLOB: {_fb(len(v))}, {_bt(v)}]"
-                    elif isinstance(v, float):
-                        values_dict[cname] = f"{v:.6g}"
-                    else:
-                        values_dict[cname] = str(v)
-
-                yield {
-                    "table": table_name,
-                    "rowid": rowid,
-                    "values_dict": values_dict,
-                    "raw_values": cell["values"],
-                    "frame_idx": frame.index,
-                    "page_num": frame.page_num,
-                    "category": frame.category,
-                }
-
-    # ── summary / analytics ──────────────────────────────────────────
-
+    # -- summaries -----------------------------------------------------------
     def summary(self):
-        """Return summary statistics about the WAL file."""
-        if not self._valid:
+        if not self.valid:
             return {}
-
-        cats = {"committed": 0, "uncommitted": 0, "old": 0}
+        counts = self._wal.state_counts()
         page_types = {}
-        unique_pages = set()
-
         for f in self.frames:
-            cats[f.category] = cats.get(f.category, 0) + 1
             page_types[f.page_type] = page_types.get(f.page_type, 0) + 1
-            unique_pages.add(f.page_num)
-
-        return {
-            "total_frames": len(self.frames),
-            "committed": cats["committed"],
-            "uncommitted": cats["uncommitted"],
-            "old": cats["old"],
-            "unique_pages": len(unique_pages),
-            "page_types": page_types,
-            "wal_size": self._file_size,
-            "page_size": self.page_size,
-            "checkpoint_seq": self.header.checkpoint_seq if self.header else 0,
-            "header_salt1": self.header.salt1 if self.header else 0,
-            "header_salt2": self.header.salt2 if self.header else 0,
-        }
+        out = {"total_frames": len(self.frames), "unique_pages": len(set(f.page_num for f in self.frames)),
+               "page_types": page_types, "wal_size": self._wal.size, "page_size": self.page_size,
+               "checkpoint_seq": self.header.checkpoint_seq, "header_salt1": self.header.salt1,
+               "header_salt2": self.header.salt2, "commits": self._wal.commit_count,
+               "header_checksum_ok": self.header.checksum_ok,
+               "checksum_failures": sum(1 for f in self.frames if f.checksum_ok is False)}
+        out.update(counts)
+        return out
 
     def table_stats(self):
-        """Return per-table statistics from WAL frames.
-
-        Only counts records from table leaf pages (0x0D).
-        Uses page header cell_count for speed (no full cell parsing).
-
-        Returns
-        -------
-        dict : {table_name: {total_records, committed, uncommitted,
-                old, frames, pages: set, is_wal_only: bool}}
-        """
-        if not self._valid:
-            return {}
-
         stats = {}
         for frame in self.frames:
-            if frame.page_type_byte != 0x0D:
+            name = self.page_map.get(frame.page_num)
+            t = self.tables.get(name) if name else None
+            if not name or name in SYSTEM_TABLES or frame.page_num == 1:
                 continue
-            table_name = self.page_map.get(frame.page_num)
-            # Skip system tables, unmapped pages, schema pages
-            if (not table_name or table_name in ("sqlite_master", "sqlite_sequence")
-                    or frame.page_num == 1):
+            leaf = frame.page_type_byte == TABLE_LEAF or (
+                t is not None and t.without_rowid and frame.page_type_byte in (INDEX_LEAF, INDEX_INTERIOR))
+            if not leaf:
                 continue
-            if table_name not in stats:
-                stats[table_name] = {
-                    "total_records": 0,
-                    "committed": 0,
-                    "uncommitted": 0,
-                    "old": 0,
-                    "frames": 0,
-                    "pages": set(),
-                    "is_wal_only": False,
-                }
-            s = stats[table_name]
+            s = stats.setdefault(name, dict([("total_records", 0), ("frames", 0), ("pages", set()),
+                                             ("is_wal_only", name in self.wal_only_tables)]
+                                            + [(st, 0) for st in STATES]))
+            data = self._wal.page_data(frame.index)
+            n = int.from_bytes(data[3:5], "big")
             s["frames"] += 1
             s["pages"].add(frame.page_num)
-
-            try:
-                page_data = self.get_page_data(frame.index)
-                if page_data and len(page_data) >= 5:
-                    cell_count = int.from_bytes(page_data[3:5], "big")
-                    s["total_records"] += cell_count
-                    s[frame.category] += cell_count
-            except Exception:
-                pass
-
+            s["total_records"] += n
+            s[frame.category] += n
         return stats
-
-    def transaction_groups(self):
-        """Group frames into transactions.
-
-        A transaction = consecutive frames with the same salt values,
-        ending with a frame that has commit_size > 0.
-
-        Returns list of dicts: {start_frame, end_frame, frame_count,
-        pages, committed, salt1, salt2}
-        """
-        if not self._valid or not self.frames:
-            return []
-
-        groups = []
-        current = {
-            "start_frame": 0,
-            "frames": [self.frames[0]],
-            "salt1": self.frames[0].salt1,
-            "salt2": self.frames[0].salt2,
-        }
-
-        for i in range(1, len(self.frames)):
-            f = self.frames[i]
-            # Same transaction if salt matches
-            if f.salt1 == current["salt1"] and f.salt2 == current["salt2"]:
-                current["frames"].append(f)
-            else:
-                # Salt changed — finalize current group, start new one
-                grp = current["frames"]
-                groups.append({
-                    "start_frame": current["start_frame"],
-                    "end_frame": grp[-1].index,
-                    "frame_count": len(grp),
-                    "pages": sorted(set(fr.page_num for fr in grp)),
-                    "committed": any(fr.commit_size > 0 for fr in grp),
-                    "salt1": current["salt1"],
-                    "salt2": current["salt2"],
-                })
-                current = {
-                    "start_frame": f.index,
-                    "frames": [f],
-                    "salt1": f.salt1,
-                    "salt2": f.salt2,
-                }
-
-            # If this frame has commit_size > 0, it ends a transaction
-            if f.commit_size > 0:
-                grp = current["frames"]
-                groups.append({
-                    "start_frame": current["start_frame"],
-                    "end_frame": f.index,
-                    "frame_count": len(grp),
-                    "pages": sorted(set(fr.page_num for fr in grp)),
-                    "committed": True,
-                    "salt1": current["salt1"],
-                    "salt2": current["salt2"],
-                })
-                # Next frame (if any) starts a new group
-                if i + 1 < len(self.frames):
-                    nf = self.frames[i + 1]
-                    current = {
-                        "start_frame": nf.index,
-                        "frames": [],
-                        "salt1": nf.salt1,
-                        "salt2": nf.salt2,
-                    }
-                else:
-                    current = {"frames": []}
-
-        # Finalize any remaining frames (uncommitted tail)
-        if current.get("frames"):
-            grp = current["frames"]
-            groups.append({
-                "start_frame": current["start_frame"],
-                "end_frame": grp[-1].index,
-                "frame_count": len(grp),
-                "pages": sorted(set(fr.page_num for fr in grp)),
-                "committed": False,
-                "salt1": current.get("salt1", 0),
-                "salt2": current.get("salt2", 0),
-            })
-
-        return groups
