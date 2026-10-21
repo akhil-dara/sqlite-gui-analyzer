@@ -24,6 +24,18 @@ class WelcomeAndTagsAppTest(TempDirTest):
         self.addCleanup(free_tk, self)
         self.app.tags.warn_with_dialogs = False
         self.addCleanup(self.app.destroy)
+        # a message box is recorded, never shown: a modal dialog nobody answers would hold a
+        # test (and a CI runner) forever
+        import tkinter.messagebox as mb
+        saved = (mb.showinfo, mb.showwarning, mb.showerror, mb.askyesno)
+        self.shown = []
+        mb.showinfo = mb.showwarning = mb.showerror = \
+            lambda *a, **k: self.shown.append(a)
+        mb.askyesno = lambda *a, **k: True
+
+        def restore():
+            mb.showinfo, mb.showwarning, mb.showerror, mb.askyesno = saved
+        self.addCleanup(restore)
 
     def test_welcome_page_says_where_the_data_is_saved(self):
         app = self.app
@@ -433,7 +445,11 @@ class WelcomeAndTagsAppTest(TempDirTest):
         # another database shown next: the lists of the first one are gone, and choosing
         # 'only tables with history' never hands its 'All tables  (N changed)' label on as
         # a table name (it failed as "forensics_failed: 'All tables  (26 changed)'")
-        other = os.path.join(self.tmp, "plain.db")
+        # (in a folder of its own: a file added next to the open evidence is reported, as it
+        # should be, as a change of the evidence folder)
+        other_dir = tempfile.mkdtemp(prefix="sga_other_")
+        self.addCleanup(shutil.rmtree, other_dir, True)
+        other = os.path.join(other_dir, "plain.db")
         c = sqlite3.connect(other)
         c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
         c.execute("INSERT INTO t VALUES (1, 'x')")
@@ -450,6 +466,7 @@ class WelcomeAndTagsAppTest(TempDirTest):
         self.settle(1.0)
         failed = [i for i in app.db.session.issues if i.kind == "forensics_failed"]
         self.assertEqual(failed, [])
+        self.assertEqual([a for a in self.shown if "Evidence changed" in str(a)], [])
         self.assertFalse(tab.history_table.get().startswith("All tables"))
         # a label with counts that is not in the list is read as what it names
         tab.history_table.set("All tables  (26 changed)")

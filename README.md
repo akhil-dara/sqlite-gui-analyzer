@@ -95,7 +95,9 @@ a browser history); no real data.
 | ![Row History lists the rows with more than one version](docs/screenshots/row_history.png) **Row History** finds the rows with several versions in every table and shows each version. | ![Timeline with a density chart across three databases](docs/screenshots/timeline.png) **Timeline** of every dated row of every database, with a density chart and named time zones. |
 | ![Relationships diagram of the message table](docs/screenshots/diagram.png) **Relationships** found from foreign keys and from the values themselves, drawn as a diagram. | ![Overview of a case of three databases](docs/screenshots/overview.png) **Overview** of a case: date range, biggest tables, links between databases, triggers, evidence hashes. |
 | ![Row detail with timestamps decoded](docs/screenshots/row_detail.png) **Row detail**: every value selectable, dates decoded, Copy as UTC / Unix / WebKit. | ![Date format chooser with examples](docs/screenshots/date_format.png) **Date formats** shown with your own value as the example, or write your own pattern. |
-| ![BLOB inspector showing a decoded bplist as an XML property list](docs/screenshots/blob_inspector.png) **BLOB inspector**: bplist, protobuf and compressed BLOBs decoded, each in the view that suits it (XML plist, protobuf fields, JSON), searchable. | ![Excel-style column filter with value counts](docs/screenshots/column_filter.png) **Column filters** like a spreadsheet: values with counts, conditions, chips, undo. |
+| ![Fields inside a JSON payment value shown as columns: sender, receiver, amount and reference](docs/screenshots/fields_columns.png) **Fields inside values as columns**: a payment's sender, receiver, amount and reference read out of its JSON / plist / protobuf value, the amount shown ÷100 and the time as a date - sort, filter and export them like any column. | ![The formula editor with a formula and its live preview on real rows](docs/screenshots/formula.png) **Formulas of your own** (Calculate from…): `json(x, "amount") / 100`, `round(x / 100, 2)`, `date(x, "ms")`… or steps, checked as you type against real rows; the result is a new column, the stored value never changes. |
+| ![Open Folder: the folder, conditions on the file names, the databases found](docs/screenshots/open_folder.png) **Open a folder by your own conditions**: 1 the folder, 2 which files (name, path, folder, extension, size), 3 Scan - files that do not match are never opened; then tick the databases to open as one case. | ![Excel-style column filter with value counts](docs/screenshots/column_filter.png) **Column filters** like a spreadsheet: values with counts, conditions, chips, undo. |
+| ![BLOB inspector showing a decoded bplist as an XML property list](docs/screenshots/blob_inspector.png) **BLOB inspector**: bplist, protobuf and compressed BLOBs decoded, each in the view that suits it (XML plist, protobuf fields, JSON), searchable. | |
 
 <details>
 <summary><b>Dark theme</b> (View ▾ › Dark)</summary>
@@ -1144,8 +1146,9 @@ with PyInstaller and Inno Setup; the licenses of each are listed in
 ## Contributors
 
 Thanks to [digitalsleuth](https://github.com/digitalsleuth) for the packaging metadata, the
-PyInstaller specification, the icon and the version file, and to Sujay Adkesar for the
-first SQL editor and freelist recovery tabs.
+PyInstaller specification, the icon and the version file, and to
+[Sujay Adkesar](https://www.linkedin.com/in/sujay-adkesar-a90725224) for the first SQL editor
+and freelist recovery tabs.
 
 ## License
 
