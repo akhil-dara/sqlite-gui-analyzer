@@ -133,7 +133,7 @@ def write_version_resource(path, version):
 def artifact_names(version):
     return {"setup": "%s-%s-setup.exe" % (APP_ID, version),
             "zip": "%s-%s-portable.zip" % (APP_ID, version),
-            "exe": "%s-%s-portable.exe" % (APP_ID, version)}
+            }
 
 
 def make_zip(folder, zip_path, root_name=None):
@@ -208,12 +208,11 @@ def release_notes(version, changelog_text, checksums=None):
         "users, adds a Start menu entry and an uninstaller. |" % names["setup"],
         "| `%s` | Portable folder: unzip anywhere (for example a USB drive) and run "
         "`%s.exe` inside it. Nothing is installed. |" % (names["zip"], APP_ID),
-        "| `%s` | The same portable build as a single file. It unpacks itself to a temporary "
-        "folder on each start, so it starts more slowly than the zip. |" % names["exe"],
         "| `SHA256SUMS.txt` | SHA-256 checksums of the files above. |", "",
-        "The builds include Python, Tcl/Tk and Pillow (JPEG and WEBP previews). They are not "
-        "code-signed, so Windows SmartScreen may ask for confirmation on the first start "
-        "(More info, then Run anyway).", "",
+        "The builds include Python, Tcl/Tk and Pillow (JPEG and WEBP previews). The program is "
+        "a plain folder (no self-extracting single file) built with a PyInstaller bootloader "
+        "compiled for this release. Until the builds are code-signed, Windows SmartScreen may "
+        "ask for confirmation on the first start (More info, then Run anyway).", "",
         "To run from source instead you only need Python 3.8 or newer with Tkinter; see the "
         "[README](%s#run-from-source)." % REPO_URL,
     ]

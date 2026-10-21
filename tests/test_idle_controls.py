@@ -82,6 +82,10 @@ class IdleControlsTest(TempDirTest):
             tabs("no database")
             app._open_db(path, wait=True)
             self.settle(2.0)            # counts and the Overview's date scan finish
+            end = time.time() + 30      # and the recovery that starts by itself after opening
+            while time.time() < end and not app._forensics._scanned:
+                self.settle(0.2)
+            self.settle(0.3)
             tabs("database open")
             from case_ui import OpenFolderDialog
             dlg = OpenFolderDialog(app, auto_choose=False)

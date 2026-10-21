@@ -191,7 +191,7 @@ class AsOfFrameView(_View):
         existing = max(main.page_count, getattr(main, "file_pages", 0),
                        _max_page(timeline, self._salts))
         self.page_count = max(existing, clamp_page_count(fr.db_size or 0, existing))
-        self.label = "WAL frame %d" % index
+        self.label = "WAL frame %d" % (index + 1)
 
     def page(self, n):
         if n < 1 or n > self.page_count:

@@ -165,7 +165,7 @@ class ArtifactTest(TempDirTest):
             release.changelog_section(changelog, "9.9")         # no prefix matches
         notes = release.release_notes("9.9.9", changelog, "abc  SHA-file\n")
         for text in ("What's new in 9.9.9", "- **New** thing.", "SQLiteGUIAnalyzer-9.9.9-setup.exe",
-                     "SQLiteGUIAnalyzer-9.9.9-portable.zip", "SQLiteGUIAnalyzer-9.9.9-portable.exe",
+                     "SQLiteGUIAnalyzer-9.9.9-portable.zip",
                      "SHA256SUMS.txt", "abc  SHA-file"):
             self.assertIn(text, notes)
         self.assertNotIn("Old thing", notes)
@@ -186,7 +186,7 @@ class PinnedBuildInputsTest(unittest.TestCase):
             for line in text.splitlines():
                 if re.match(r"\s*(-\s+)?uses:", line):
                     seen += 1
-                    self.assertRegex(line, r"uses: [\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$",
+                    self.assertRegex(line, r"uses: [\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+(\.\d+)?$",
                                      "%s: %s" % (name, line.strip()))
         self.assertGreaterEqual(seen, 4)
 

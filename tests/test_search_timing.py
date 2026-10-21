@@ -8,6 +8,7 @@ import sqlite3
 import time
 
 from tests.test_review_ui import AppCase
+from tests.helpers import within  # noqa: E402
 
 
 class SearchTimingTest(AppCase):
@@ -21,18 +22,31 @@ class SearchTimingTest(AppCase):
             self.pump(lambda: not any(isinstance(v, str) for v in app.case.active.counts.values()),
                       30)
             app._search_var.set("a")
+            status = app._search_status
+            shown = []
+            set_status = status.set
+
+            def timed_set(summary, *a, **k):
+                set_status(summary, *a, **k)
+                if not shown and str(summary).startswith(("Complete", "Stopped")):
+                    shown.append(time.time())
+            status.set = timed_set
             t0 = time.time()
             app._do_search()
-            self.assertTrue(self.pump(lambda: app._search_status.summary().startswith(
+            self.assertTrue(self.pump(lambda: status.summary().startswith(
                 ("Complete", "Stopped")), 60))
-            wall = time.time() - t0
+            # the moment the status is set, not the moment this loop's update() returns:
+            # update() also lays out every line of the results list in one go, which the
+            # event loop does in short slices after the status is already on screen
+            wall = shown[0] - t0
             m = re.search(r"([0-9.]+)s\)", app._search_status.summary())
             self.assertIsNotNone(m, app._search_status.summary())
             said = float(m.group(1))
             self.assertAlmostEqual(said, app._search_elapsed, places=1)
             # the status is set once the results are ready: at most a poll later than that
             self.assertLessEqual(app._search_elapsed, wall + 0.01)
-            self.assertLess(wall - app._search_elapsed, 0.25)
+            within(self, wall - app._search_elapsed, 0.25,
+                   "the gap between the search's end and its status")
         self.run_app(scenario)
 
     def test_largest_tables_first(self):

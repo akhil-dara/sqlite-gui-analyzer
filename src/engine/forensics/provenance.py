@@ -21,6 +21,7 @@ File (Provenance.file): "main", "wal" or "journal": which evidence file holds th
 import hashlib
 
 from ..fileformat.record import InvalidText
+from ..fileformat.wal import frame_no
 
 LIVE, WAL, REPLACED, JOURNAL = "live", "wal", "replaced", "journal"
 FREEBLOCK, UNALLOCATED, FREELIST, ORPHAN, SCHEMA = (
@@ -33,6 +34,31 @@ MAIN_FILE, WAL_FILE, JOURNAL_FILE = "main", "wal", "journal"
 HIGH, MEDIUM, LOW = "high", "medium", "low"
 CONFIDENCES = (HIGH, MEDIUM, LOW)
 _RANK = {HIGH: 0, MEDIUM: 1, LOW: 2}
+
+
+FILE_NAMES = {MAIN_FILE: "main database file", WAL_FILE: "WAL file",
+              JOURNAL_FILE: "rollback journal"}
+
+
+def file_offset(prov, page_size, journal=None):
+    """Byte offset of a record's first byte inside the file it was read from (the main
+    database file, the WAL file or the rollback journal), from the page's place in that file
+    and the cell's offset in the page: main file (page - 1) * page size + offset; WAL file
+    32-byte header, then frames of a 24-byte header and a page each; journal: where the
+    journal holds its image of the page (journal.image_offset). None when it cannot be told
+    (no cell offset, no frame, no image of the page in the journal)."""
+    if prov.offset is None or prov.page is None or not page_size:
+        return None
+    if prov.file == WAL_FILE:
+        if prov.frame is None:
+            return None
+        from ..fileformat.wal import FRAME_HEADER_SIZE, WAL_HEADER_SIZE
+        return (WAL_HEADER_SIZE + prov.frame * (FRAME_HEADER_SIZE + page_size)
+                + FRAME_HEADER_SIZE + prov.offset)
+    if prov.file == JOURNAL_FILE:
+        start = journal.image_offset(prov.page) if journal is not None else None
+        return None if start is None else start + prov.offset
+    return (prov.page - 1) * page_size + prov.offset
 
 
 def worst(a, b):
@@ -64,7 +90,8 @@ class Provenance(object):
     def where(self):
         """Short human-readable location, e.g. 'WAL frame 12 (superseded) page 7 @ 3001'."""
         if self.file == WAL_FILE:
-            head = "WAL frame %s (%s) page %s" % (self.frame, self.frame_state, self.page)
+            head = "WAL frame %s (%s) page %s" % (frame_no(self.frame), self.frame_state,
+                                                  self.page)
         elif self.file == JOURNAL_FILE:
             head = "journal page %s" % self.page
         else:
@@ -91,7 +118,8 @@ class Record(object):
       freeblock header, or a WITHOUT ROWID table).
     confidence: 'high' | 'medium' | 'low'; reasons: why (list of short strings).
     flags: set of tags, e.g. 'rowid_unknown', 'truncated', 'overflow_partial',
-      'prior_version' (the key is live with other values), 'uncertain_value'.
+      'prior_version' (the key is live with other values), 'content_live' (deleted, and the
+      same values are live under another rowid), 'uncertain_value'.
     copies: Provenance of further locations holding the identical record.
     index: for an index entry (flag 'index_entry'), the index's name; table is then the
       indexed table and columns are the indexed columns followed by 'rowid'. None otherwise.

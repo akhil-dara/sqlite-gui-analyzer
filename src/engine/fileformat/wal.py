@@ -28,6 +28,17 @@ UNCOMMITTED = "uncommitted"  # current salts, after the last valid commit (in-pr
                              # back). SQLite re-checksums overwritten frames only at commit, so
                              # these may legitimately fail the checksum; see WalFrame.checksum_ok.
 STALE = "stale"              # salt mismatch: left over from an earlier WAL generation
+
+
+def frame_no(index):
+    """How a frame is numbered for people: 1 for the first frame after the WAL header (as
+    SQLite's documentation counts them); indexes stay 0-based inside the tool."""
+    return None if index is None else index + 1
+
+
+def commit_no(group):
+    """How a commit is numbered for people: 1 for the first commit in the WAL."""
+    return None if group is None else group + 1
 STATES = (CURRENT, SUPERSEDED, UNCOMMITTED, STALE)
 
 
@@ -264,6 +275,67 @@ class WalFile(object):
         self.overlay = latest
         if self.last_commit >= 0:
             self.db_size_pages = db_size[self.last_commit]
+
+    def commit_ends(self):
+        """Frame index of every commit's last frame (its commit frame), in order."""
+        d = self._db_size
+        return [i for i in range(self.last_commit + 1) if d[i] > 0]
+
+    def as_of(self, commit_no):
+        """This WAL as it was when commit `commit_no` (1 = the first) was written: the frames
+        after it are dropped from this view and the rest are classified again, so the
+        database read through it is the database as of that commit. Changes this object
+        (a session opens its own WalFile for it)."""
+        ends = self.commit_ends()
+        if not 1 <= commit_no <= len(ends):
+            raise WalError("there is no commit %d (the WAL has %d)" % (commit_no, len(ends)))
+        n = ends[commit_no - 1] + 1
+        # a checkpoint may already have copied later commits into the main file: then the
+        # pages they changed show that later state (said by the session's banner)
+        nb = self.backfilled()
+        self.as_of_backfill = (None if nb is None else
+                               (nb, self.commit_of_frame(nb - 1) if nb > 0 else 0))
+        for name in ("_page_no", "_db_size", "_salt1", "_salt2", "_c1", "_c2", "_flags",
+                     "_ptype"):
+            setattr(self, name, getattr(self, name)[:n])
+        self.as_of_commit = (commit_no, len(ends), self.frames_total)
+        self.frames_total, self.frames_cut = n, False
+        self.last_commit = n - 1
+        self._state = array("B", [_STATE_NO[STALE]]) * n
+        self._group = array("l", [-1]) * n
+        self.frames = _Frames(self)
+        self._classify()
+        return self
+
+    def backfilled(self):
+        """Frames a checkpoint already copied into the main file, from the -shm beside the
+        WAL (its WAL-index header and checkpoint info; read, never written): an int, or None
+        when there is no -shm, it is not SQLite's, or it belongs to another WAL (salts)."""
+        shm = self.path[:-4] + "-shm" if self.path.endswith("-wal") else None
+        try:
+            with open(shm, "rb") as f:
+                head = f.read(136)
+        except (OSError, TypeError):
+            return None
+        if len(head) < 136:
+            return None
+        for order in ("<", ">"):                # the writer's byte order (phones: little)
+            version, = struct.unpack_from(order + "I", head, 0)
+            if version != 3007000:
+                continue
+            salt1, salt2 = struct.unpack_from(">II", head, 32)  # copied as the WAL has them
+            if (salt1, salt2) != (self.header.salt1, self.header.salt2):
+                return None                     # the -shm of another WAL
+            nback, = struct.unpack_from(order + "I", head, 96)
+            return nback
+        return None
+
+    def commit_of_frame(self, frame_index):
+        """1-based number of the commit that frame (0-based) belongs to, or None."""
+        for k, end in enumerate(self.commit_ends(), 1):
+            if frame_index <= end:
+                return k
+        return None
 
     @property
     def commit_count(self):

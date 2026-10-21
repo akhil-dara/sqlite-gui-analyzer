@@ -35,7 +35,8 @@ from constants import ROW_FLAG_BG   # noqa: E402
 from dialogs import RowWin   # noqa: E402
 from engine.backends import Filter  # noqa: E402
 from engine.filters import value_expr   # noqa: E402
-from engine.tags import TagStore, group_key, tint   # noqa: E402
+from engine.tags import TagStore, group_key   # noqa: E402
+from tagging import row_tint as tint   # noqa: E402  (tagged rows, both themes)
 from engine import timeline as tl   # noqa: E402
 from utils import plain_text, row_flag_tag   # noqa: E402
 
@@ -508,7 +509,9 @@ def run_one(app, src_db, idx):
         # deleted index entries: listed as 'table [index name]' with indexed values + rowid
         entries = [r for r in tab._records if getattr(r, "index", None) is not None]
         src = tab.carve_grid.source
-        labels = set(v[2] for v in src.iter_rows()) if src is not None else set()
+        ti = src.columns().index("Table") if src is not None and "Table" in src.columns() \
+            else None
+        labels = set(v[ti] for v in src.iter_rows()) if ti is not None else set()
         note(tag, "  index entries: %d (%s)" % (len(entries), ", ".join(sorted(
             set(r.index for r in entries)))[:120]))
         if "indexed" in os.path.basename(src_db) and not entries:
@@ -712,9 +715,9 @@ def run_one(app, src_db, idx):
                     or "Suspicious" not in store.tags_of(group_key(g)):
                 errors.append((tag, "tags", "search result not tagged from its menu"))
             first = app._search_tree.get_children()[0]
-            if not app._search_tree.set(first, "Source").startswith("●"):
+            if not app._search_tree.set(first, "Kind").startswith("●"):
                 errors.append((tag, "tags", "tagged search line not marked: %r"
-                               % app._search_tree.set(first, "Source")))
+                               % app._search_tree.set(first, "Kind")))
             tg.tag_search_results("Not relevant", confirm=False)
             wait_jobs()
             want = len(set(group_key(g) for g in groups))
@@ -1344,6 +1347,44 @@ def run_one(app, src_db, idx):
         tab._offset_changed()
     step(timeline_check, "timeline")
 
+    def query_check():
+        """Query tab: the database's tables listed, two tables added (joined when a trusted
+        link exists, else said), a run, the SQL shown is the SQL that ran."""
+        tab = app._query
+        app._nb.select(tab)
+        app.update()
+        tables = [t for t in tab.tables_tree.get_children() if t != "grec"]   # not the
+        # recovered rows group (shown once Forensics recovered records)
+        if sorted(tables) != sorted(app.db.tables()):
+            errors.append((tag, "query", "tables listed %d of %d" % (len(tables),
+                                                                    len(app.db.tables()))))
+        if not tables:
+            return
+        tab.clear()
+        tab.add_table(tables[0])
+        if len(tables) > 1:
+            tab.add_table(tables[1])
+        deadline = time.time() + 60
+        while tab.runner.busy() and time.time() < deadline:
+            app.update()
+            time.sleep(0.02)
+        tab.run(confirm=False)       # two tables may share no link: run them paired anyway
+        deadline = time.time() + 60
+        app.update()
+        while (tab.runner.busy() or tab.status.cget("text").startswith("Running")) and \
+                time.time() < deadline:
+            app.update()
+            time.sleep(0.02)
+        text = tab.status.cget("text")
+        # SQLite refusing a damaged database is said plainly; anything else is a bug
+        if "failed" in text or "Running" in text:
+            errors.append((tag, "query", text[:160]))
+        if tab.sql_text.get("1.0", "end").strip() != tab.shown_sql():
+            errors.append((tag, "query", "the SQL shown is not the SQL run"))
+        note(tag, "query: %s | %s" % (text[:100], tab.model.to_sql().replace("\n", " ")[:120]))
+        tab.clear()
+    step(query_check, "query")
+
     def date_format_check():
         """Browse 'Show as date' on a detected date column: the grid shows dates, the raw value
         stays in the tooltip and 'Copy raw value', and the choice comes back after reopening."""
@@ -1836,7 +1877,7 @@ def run_case(app):
         srcs = [app._search_tree.item(i, "values")[1] for i in app._search_tree.get_children()]
         note(tag, "search: %s | sources %s" % (status, srcs))
         if "searched, nothing found (settings.db)" not in status or \
-                sorted(srcs) != ["contacts.db · DB", "messages.db · DB"]:
+                sorted(srcs) != ["contacts.db · Live row", "messages.db · Live row"]:
             errors.append((tag, "search", "%s | %s" % (status, srcs)))
         # open the contacts row: it opens in contacts.db, whatever database is active
         iid = next(i for i in app._search_tree.get_children()
@@ -2085,6 +2126,11 @@ def main():
             return
         fn, label = all_steps[k]
         current[0] = label
+        # each step is what a user does with the mouse or the keys: the app treats it as
+        # input (engine.uiyield.active), as it does a real click, so its background workers
+        # hand the interpreter over finely while the window works
+        from engine import uiyield as _uiyield
+        _uiyield.active()
         try:
             fn()
         except Exception:
@@ -2101,10 +2147,18 @@ def main():
     most = _limits.get("ui_stall_ms")
     note("watchdog", "longest event-loop gaps: %s (limit ui_stall_ms %d ms)" % (
         ", ".join("%.0f ms in %s" % (g, lbl) for g, lbl in worst), most))
+    # on a CI runner (shared, often several times slower; the steps also run many checks in
+    # one callback) a gap over the limit is a warning on the run, as in tests.helpers.within;
+    # on a desktop it is an error
+    on_ci = bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI"))
     for g, lbl in worst:
         if g > most:
-            errors.append(("watchdog", lbl, "the event loop stalled %.0f ms (limit "
-                                             "ui_stall_ms %d ms)" % (g, most)))
+            msg = "the event loop stalled %.0f ms (limit ui_stall_ms %d ms)" % (g, most)
+            if on_ci:
+                print("::warning title=Slower than the budget on this machine::%s in %s"
+                      % (msg, lbl))
+            else:
+                errors.append(("watchdog", lbl, msg))
     # tag files and settings were written to the temp app-data folder only
     cases = os.path.join(DATA_DIR, "cases")
     written = sorted(os.listdir(cases)) if os.path.isdir(cases) else []
@@ -2116,6 +2170,10 @@ def main():
     if not written:
         errors.append(("app-data", "tags", "no tag file was saved in %s" % DATA_DIR))
     shutil.rmtree(DATA_DIR, ignore_errors=True)
+    try:                                # a redirected console (cp1252) cannot print every
+        sys.stdout.reconfigure(errors="replace")   # character of the report: replace them
+    except (AttributeError, ValueError):
+        pass
     print("\n".join(report))
     print("steps run:", len(all_steps), "errors:", len(errors))
     for e in errors:

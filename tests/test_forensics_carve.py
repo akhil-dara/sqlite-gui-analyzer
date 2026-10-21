@@ -125,11 +125,18 @@ class FreeblockTest(ForensicsTestBase):
         m = self.of(res, "m")
         self.assertEqual(sorted(tuple(r.values[1:]) for r in m),
                          sorted(ff.line(i)[1:] for i in ff.LINES_DELETED))
+        truth = dict((tuple(ff.line(i)[1:]), i) for i in ff.LINES_DELETED)
         for r in m:
             self.assertEqual(r.source, FREEBLOCK)
             self.assertEqual(r.confidence, MEDIUM)
-            self.assertIsNone(r.rowid)                   # its bytes were overwritten
-            self.assertIn("rowid_unknown", r.flags)
+            # its rowid bytes were overwritten: unknown, or - the only gap between the live
+            # rows of its page - inferred, and then right
+            if r.rowid is None:
+                self.assertIn("rowid_unknown", r.flags)
+            else:
+                self.assertIn("rowid_inferred", r.flags)
+                self.assertEqual(r.rowid, truth[tuple(r.values[1:])])
+                self.assertTrue(any("inferred as %d" % r.rowid in x for x in r.reasons))
             self.assertTrue(any("rebuilt" in x for x in r.reasons))
 
     def test_lost_first_column_is_solved_from_the_size(self):
@@ -236,6 +243,199 @@ class WalCarveTest(ForensicsTestBase):
         self.assertEqual(res.stats["errors"], 0)
         self.assertTrue(any(r.prov.frame_state in ("stale", "uncommitted") for r in res
                             if r.prov.file == "wal"))
+
+
+class InsertedAgainTest(ForensicsTestBase):
+    def make(self):
+        import sqlite3
+        path = os.path.join(self.tmp, "again.db")
+        con = sqlite3.connect(path)
+        con.execute("PRAGMA secure_delete=OFF")
+        con.execute("CREATE TABLE t (a TEXT, b TEXT, n INTEGER)")
+        for i in range(1, 201):             # several leaf pages: the insert goes to the last
+            con.execute("INSERT INTO t VALUES (?, ?, ?)", ("name %03d" % i, "city %03d " % i
+                                                           + "x" * 60, i))
+        con.commit()
+        con.execute("DELETE FROM t WHERE rowid IN (5, 9)")
+        con.commit()
+        con.execute("INSERT INTO t SELECT 'name 005', 'city 005 ' || ?, 5", ("x" * 60,))
+        con.commit()
+        con.close()
+        return path
+
+    def test_a_deleted_row_live_again_under_another_rowid_is_said(self):
+        from forensics_tab import record_state
+        s = self.open(self.make())
+        recs = {r.rowid: r for r in self.of(s.forensics.carve(), "t")}
+        self.assertIn(5, recs)
+        self.assertIn(9, recs)
+        again = recs[5]
+        self.assertIn("content_live", again.flags)
+        self.assertTrue(any("live as rowid 201" in n for n in again.reasons), again.reasons)
+        self.assertEqual(record_state(again), "inserted again")
+        self.assertNotIn("content_live", recs[9].flags)
+        self.assertEqual(record_state(recs[9]), "deleted")
+
+
+class ReplacedRowTest(ForensicsTestBase):
+    def make(self):
+        import sqlite3
+        path = os.path.join(self.tmp, "replaced.db")
+        con = sqlite3.connect(path)
+        con.execute("PRAGMA secure_delete=OFF")
+        con.execute("CREATE TABLE meta (key TEXT UNIQUE, value TEXT)")
+        for i in range(1, 201):             # several pages: the new row goes to the last
+            con.execute("INSERT INTO meta VALUES (?, ?)", ("key %03d" % i, "old %03d " % i
+                                                           + "v" * 50))
+        con.commit()
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('key 007', 'new value')")   # rowid 201
+        con.commit()
+        con.close()
+        return path
+
+    def test_a_row_replaced_through_its_unique_key_is_an_older_version(self):
+        from forensics_tab import record_state
+        s = self.open(self.make())
+        recs = [r for r in self.of(s.forensics.carve(), "meta") if r.index is None]
+        old = [r for r in recs if r.values[0] == "key 007"]
+        self.assertEqual(len(old), 1, [r.values for r in recs])
+        self.assertTrue(old[0].values[1].startswith("old 007"))
+        self.assertIn("prior_version", old[0].flags)
+        self.assertTrue(any("unique key (key) is live as rowid 201" in n
+                            for n in old[0].reasons), old[0].reasons)
+        self.assertEqual(record_state(old[0]), "older version")
+
+
+class CappedUniqueSeekTest(ForensicsTestBase):
+    """A table over live_hash_rows keeps no row set: a record whose rowid was lost is checked
+    through the table's UNIQUE index on disk instead (found live only when identical)."""
+
+    def make(self, encoding="UTF-8"):
+        import sqlite3
+        path = os.path.join(self.tmp, "capped_%s.db" % encoding.replace("-", ""))
+        con = sqlite3.connect(path)
+        con.execute("PRAGMA encoding='%s'" % encoding)
+        con.execute("CREATE TABLE msg (_id INTEGER PRIMARY KEY, chat INTEGER, mine INTEGER, "
+                    "key TEXT, body TEXT)")
+        con.execute("CREATE UNIQUE INDEX msg_key ON msg (chat, mine, key)")
+        for i in range(1, 801):
+            con.execute("INSERT INTO msg VALUES (?, ?, ?, ?, ?)",
+                        (i, i % 7, i % 2, "K%05dé" % i, "text %d" % i))
+        con.commit()
+        con.close()
+        return path
+
+    def index(self, s, cap=50):
+        import types
+        from engine.forensics.live import LiveIndex
+        live = LiveIndex(s, cap=cap)
+        tpl = types.SimpleNamespace(kind="table", dropped=False, name="msg",
+                                    info=s.schema.get("msg"))
+        return live, tpl
+
+    def test_identical_copy_without_rowid_is_live_through_the_unique_index(self):
+        for enc in ("UTF-8", "UTF-16le", "UTF-16be"):
+            s = self.open(self.make(enc))
+            live, tpl = self.index(s)
+            row = [None, 423 % 7, 423 % 2, "K00423é", "text 423"]
+            self.assertEqual(live.status(tpl, None, row), "live", enc)
+            self.assertIn("msg", live.capped)
+            other = [None, 423 % 7, 423 % 2, "K00423é", "edited"]
+            self.assertIsNone(live.status(tpl, None, other), enc)      # same key, other text
+            self.assertEqual(live.replaced_by(tpl, None, other), (423, ["chat", "mine", "key"]))
+            gone = [None, 1, 1, "K99999", "text"]
+            self.assertIsNone(live.status(tpl, None, gone), enc)
+            self.assertIsNone(live.replaced_by(tpl, None, gone), enc)
+
+    def test_under_the_limit_nothing_changes(self):
+        s = self.open(self.make())
+        live, tpl = self.index(s, cap=10 ** 6)
+        row = [None, 423 % 7, 423 % 2, "K00423é", "text 423"]
+        self.assertEqual(live.status(tpl, None, row), "live")
+        self.assertNotIn("msg", live.capped)
+
+
+class LiveInAnotherTableTest(ForensicsTestBase):
+    def make(self):
+        import sqlite3
+        path = os.path.join(self.tmp, "twins.db")
+        con = sqlite3.connect(path)
+        con.execute("PRAGMA secure_delete=OFF")
+        con.execute("CREATE TABLE aaa (k TEXT, v INTEGER)")       # same shape, sorts first
+        con.execute("CREATE TABLE zzz (k TEXT, v INTEGER)")
+        for i in range(1, 1201):
+            con.execute("INSERT INTO zzz VALUES (?, ?)", ("key %04d " % i + "y" * 40, i))
+        con.commit()
+        con.execute("DELETE FROM zzz WHERE rowid % 4 != 0")      # pages merge: copies of live
+        con.commit()                                             # rows stay on freed pages
+        con.close()
+        return path
+
+    def test_a_copy_of_a_live_row_is_not_deleted_whichever_table_it_is_read_as(self):
+        s = self.open(self.make())
+        res = s.forensics.carve()
+        live = self.live(s, "zzz")
+        self.assertTrue(any(r.table in ("aaa", "zzz") for r in res))
+        for r in res:
+            if r.index is None and r.table in ("aaa", "zzz"):
+                self.assertNotIn(tuple(value_key(v) for v in r.values), live,
+                                 "%s rowid %s is a live zzz row" % (r.table, r.rowid))
+
+
+class NoInformationTest(unittest.TestCase):
+    """A rebuilt reading whose values say nothing is noise (carve.NOINFO_NOISE)."""
+
+    def test_informative(self):
+        from engine.forensics.carve import _informative
+        from engine.fileformat.record import InvalidText
+        self.assertFalse(_informative([None, 0, 0.0, "", b""]))
+        self.assertFalse(_informative([None, 0, b"\x00" * 20]))
+        self.assertFalse(_informative([InvalidText(b"\x00\x00"), 0]))
+        self.assertFalse(_informative([]))
+        self.assertTrue(_informative([None, 1]))
+        self.assertTrue(_informative([None, "x"]))
+        self.assertTrue(_informative([b"\x00\x01"]))
+        self.assertTrue(_informative([0.5]))
+        self.assertTrue(_informative([-1]))
+
+
+class ZeroDamagedCopyTest(unittest.TestCase):
+    def test_a_partly_wiped_copy_of_the_live_row_is_not_an_older_version(self):
+        from engine.forensics.carve import _zero_damaged_copy
+        live = [3338, 115, 0, "3CF23EA51ADD24C345141A1B48EE030F", 1713106776000, 20, None]
+        wiped = [None, 115, 0, "3CF23EA51ADD24C345141A1B" + "\x00" * 8, 0, 0, None]
+        self.assertTrue(_zero_damaged_copy(wiped, live, None))
+        # a real older version: the status / timestamps were 0 then, no padded text
+        older = [None, 115, 0, "3CF23EA51ADD24C345141A1B48EE030F", 1713106776000, 0, None]
+        self.assertFalse(_zero_damaged_copy(older, live, None))
+        # other text in a column: a different value, not a wiped copy
+        other = [None, 115, 0, "3CF2" + "\x00" * 28, 0, 0, "new text"]
+        self.assertFalse(_zero_damaged_copy(other, live, None))
+        # nothing but zeros matches nothing
+        self.assertFalse(_zero_damaged_copy([None, 0, 0, "\x00" * 8, 0, 0, None], live, None))
+        self.assertFalse(_zero_damaged_copy(wiped, None, None))
+
+
+class PageEndTest(unittest.TestCase):
+    def test_a_freed_cell_in_the_last_bytes_of_a_page_does_not_stop_the_page(self):
+        # a free area ending at the page's very end: the varints tried for a lost cell header
+        # must not be read past the buffer (it raised IndexError and the page was skipped)
+        from engine.forensics.cellparse import _layouts
+        buf = bytes(1020) + b"\x81\x81\x81\x81"
+        for pos in range(1016, 1021):
+            for index in (False, True):
+                _layouts(buf, pos, 1024, index, 4)
+
+
+class SequenceTemplateTest(unittest.TestCase):
+    def test_sqlite_sequence_holds_only_a_text_name_and_an_integer(self):
+        t = TableInfo("sqlite_sequence", "table", 3, "CREATE TABLE sqlite_sequence(name,seq)")
+        describe_table(t, set())
+        tpl = Template.for_table(t)
+        self.assertTrue(tpl.check_types([2 * 5 + 13, 1])[0])        # text, 1-byte integer
+        for types in ([2 * 5 + 12, 1], [2 * 5 + 13, 7], [0, 1], [2 * 5 + 13, 0],
+                      [1, 1]):
+            self.assertFalse(tpl.check_types(types)[0], types)
 
 
 class EvidenceSafetyTest(ForensicsTestBase):

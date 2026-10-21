@@ -330,8 +330,15 @@ class FreelistSearchTest(AdapterTestBase):
                              ("Freelist", "notes", "body", "text"))
             self.assertIn(h["confidence"], ("high", "medium", "low"))   # the carver's scale
             self.assertTrue(h["reasons"])
-            cell = [c for c in page_cells(pager, h["page"]) if c[3].offset == h["cell_offset"]]
-            self.assertEqual(cell[0][1], h["rowid"])          # the cell really holds that record
+            # every main-file place counts (a copy can sit in a page's unallocated space)
+            self.assertIn(h["found_in"], db.MAIN_FILE_SOURCES)
+            if h["found_in"] == "freelist":
+                cell = [c for c in page_cells(pager, h["page"])
+                        if c[3].offset == h["cell_offset"]]
+                self.assertEqual(cell[0][1], h["rowid"])      # the cell really holds that record
+            else:
+                page = pager.page(h["page"])
+                self.assertIn(h["value"].encode("utf-8"), bytes(page)[h["cell_offset"]:])
             self.assertEqual(h["row"][1], h["value"])
         self.assertEqual(len(set(h["locator"] for h in hits)), len(hits))
         limited = list(db.search_freelist("note number", "ci", limit=3))

@@ -90,6 +90,29 @@ class Fixture(TempDirTest):
         return want
 
 
+class BusyBinsTest(unittest.TestCase):
+    """The filter's date chart: fine bins from the source, the busy part drawn, merged to a
+    readable number of bars (WhatsApp message.timestamp: 9,211 of 2.56M rows before 2024)."""
+
+    def test_busy_part_and_merging(self):
+        from datetime import datetime, timedelta
+        import colfilter
+        step = timedelta(days=7)
+        edges = [datetime(2016, 1, 4) + step * i for i in range(521)]       # 10 years
+        totals = [2] * 400 + [5000] * 120                                   # busy last 2.3 y
+        i, j = colfilter.busy_bins(totals)
+        self.assertGreaterEqual(i, 350)
+        self.assertEqual(j, 520)
+        e, t, big, name = colfilter.merge_bins(edges[i:j + 1], totals[i:j], step, 60)
+        self.assertLessEqual(len(t), 60)
+        self.assertEqual(sum(t), sum(totals[i:j]))
+        self.assertEqual(len(e), len(t) + 1)
+        self.assertTrue(name.endswith("days") or name == "1 week", name)
+        self.assertIsNone(colfilter.busy_bins([100] * 50))                 # spread: all
+        e2, t2, _b, name2 = colfilter.merge_bins(edges[:11], totals[:10], step, 60)
+        self.assertEqual((len(t2), name2), (10, "1 week"))                 # few: as given
+
+
 class TypeDetectionTest(unittest.TestCase):
     def test_kinds(self):
         det = cf.detect_type

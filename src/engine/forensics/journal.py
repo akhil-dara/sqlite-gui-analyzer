@@ -184,6 +184,11 @@ class Journal(object):
         """Page numbers that have a pre-transaction image."""
         return sorted(self._first)
 
+    def image_offset(self, n):
+        """Byte offset in the journal file of its image of page n (the first record of the
+        page with a valid checksum), or None when the journal does not hold it."""
+        return self._first.get(n)
+
     def page(self, n):
         """Pre-transaction image of page n, or None when the journal does not hold it."""
         off = self._first.get(n)

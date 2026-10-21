@@ -33,7 +33,7 @@ from grid import Runner
 from utils import plain_text
 
 SECTION = "lookups"     # {table: {column: {"db": path or "", "table", "key", "show"}}}
-COLOR = K["teal"]       # looked-up values (dates are green, BLOBs purple)
+COLOR = "teal"          # looked-up values: a theme token, the grid looks it up when drawn
 ARROW = "→"
 _SHOW_NAMES = re.compile(r"(?:^|_)(?:display_?name|full_?name|name|title|subject|label|url|"
                          r"nickname|description|text|value|number|address|email)$", re.I)

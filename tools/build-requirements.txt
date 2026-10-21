@@ -1,9 +1,12 @@
 # Build-only tools for the Windows release (the app itself needs none of these).
 # Every package, including the dependencies, is pinned by version and by the SHA-256 of its
-# wheel for 64-bit Windows and Python 3.13 (the release build). Install with:
-#   python -m pip install --require-hashes --only-binary=:all: -r tools/build-requirements.txt
+# file for 64-bit Windows and Python 3.13 (the release build). PyInstaller is pinned to its
+# SOURCE archive and installed with --no-binary pyinstaller: its bootloader is then compiled
+# on the release runner (the prebuilt bootloader of the wheel is what heuristic virus
+# scanners flag). Install with:
+#   python -m pip install --require-hashes --only-binary=:all: --no-binary pyinstaller -r tools/build-requirements.txt
 pyinstaller==6.22.3 \
-    --hash=sha256:500bd58c7bf7e584a8435adccbd763a0b918d5c12b08d74ff50fd79b2915458b
+    --hash=sha256:05eb2f5615503e72939a7224d68b4aff572c6b0438ee4a17d0a4b481f399362d
 pillow==12.3.0 \
     --hash=sha256:1cca606cd25738df4ed873d5ad46bbdb3d83b5cbca291f6b4ff13a4df6b0bbe8
 # Dependencies of pyinstaller

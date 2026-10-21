@@ -16,6 +16,7 @@ carries everything in full (BLOBs as hex).
 import datetime
 import io
 import json
+from collections import OrderedDict
 import os
 import platform
 import sqlite3
@@ -81,12 +82,39 @@ def build(fx, version, records=None, findings=None, dropped=None, history=None,
                      "journal": s.evidence.path("journal")},
         "evidence": evidence_hashes(s),
         "findings": [f.as_dict() for f in (findings or [])],
-        "records": [r.as_dict() for r in (records or [])],
+        "records": [record_dict(fx, r) for r in (records or [])],
         "carve": dict(carve_stats or {}),
         "wal_history": [hs.as_dict() for hs in (history or [])],
         "dropped_schema": [d.as_dict() for d in (dropped or [])],
     }
     return data
+
+
+def record_state(flags, index=None):
+    """'deleted', 'older version', 'inserted again', 'unreferenced page' or 'index entry'
+    (the same words as the Forensics tab) from a record's flags."""
+    if index:
+        return "index entry"
+    flags = set(flags or ())
+    if "unreferenced_page" in flags:
+        return "unreferenced page"
+    if "prior_version" in flags:
+        return "older version"
+    if "content_live" in flags:
+        return "inserted again"
+    return "deleted"
+
+
+def record_dict(fx, r):
+    """A record as JSON, its provenance with the file's path and the byte offset of the
+    record in it (the page's place in the file plus the cell's offset in the page), and its
+    state in words."""
+    d = r.as_dict()
+    d["state"] = record_state(d["flags"], d.get("index"))
+    for p, prov in [(d["provenance"], r.prov)] + list(zip(d["copies"], r.copies)):
+        p["file_path"] = fx.file_path(prov)
+        p["file_offset"] = fx.file_offset(prov)
+    return d
 
 
 def write_report(fx, path, fmt, version, case_name="", **kw):
@@ -155,14 +183,16 @@ def to_csv(data):
     row("finding", "level", "code", "message", "details")
     for f in data["findings"]:
         row("finding", f["level"], f["code"], f["message"], f["details"])
-    row("record", "id", "table", "confidence", "source", "file", "page", "offset", "frame",
-        "frame_state", "rowid", "flags", "reasons", "values", "copies", "index")
+    row("record", "id", "state", "table", "confidence", "source", "file", "page", "offset",
+        "file_offset", "length", "frame", "frame_state", "rowid", "flags", "reasons", "values",
+        "copies", "index")
     for r in data["records"]:
         p = r["provenance"]
-        row("record", r["id"], r["table"], r["confidence"], p["source"], p["file"], p["page"],
-            p["offset"], p["frame"], p["frame_state"], r["rowid"], " ".join(r["flags"]),
-            "; ".join(r["reasons"]), dict(zip(r["columns"], r["values"])), len(r["copies"]),
-            r.get("index"))
+        row("record", r["id"], r.get("state") or record_state(r["flags"], r.get("index")),
+            r["table"], r["confidence"], p["source"], p["file"], p["page"], p["offset"],
+            p.get("file_offset"), p.get("length"), p["frame"], p["frame_state"], r["rowid"],
+            " ".join(r["flags"]), "; ".join(r["reasons"]), dict(zip(r["columns"], r["values"])),
+            len(r["copies"]), r.get("index"))
     row("wal_history", "table", "keys_seen", "multi_version", "deleted", "reused")
     for hs in data["wal_history"]:
         row("wal_history", hs["table"], hs["keys_seen"], len(hs["multi_version"]),
@@ -194,8 +224,55 @@ def _val(v):
     return s if len(s) <= HTML_CELL_CAP else s[:HTML_CELL_CAP] + " ... (%d chars)" % len(s)
 
 
-RECORD_FIELDS = ("id", "table", "confidence", "source", "file", "page", "offset", "frame",
-                 "frame_state", "rowid", "values", "reasons", "flags", "copies")
+# the records table: what an examiner reads first, then where the bytes are, the id last
+RECORD_FIELDS = ("state", "table", "rowid", "confidence", "preview", "values", "source", "page",
+                 "offset", "file_offset", "length", "file", "frame", "frame_state", "reasons",
+                 "flags", "copies", "id")
+PREVIEW_VALUES = 4          # values the preview column shows
+PREVIEW_CHARS = 140
+CARVE_WORDS = (("pages", "pages looked at"), ("frames", "WAL frames"),
+               ("journal_pages", "journal pages"), ("raw_pages", "pages read raw"),
+               ("candidates", "candidate cells"), ("records", "records"),
+               ("live_skipped", "copies of live rows left out"),
+               ("merged", "identical copies merged"), ("index_entries", "index entries"),
+               ("index_pages", "index pages"), ("indexes", "indexes"),
+               ("overflow_pages_skipped", "overflow pages skipped"),
+               ("rowids_inferred", "rowids inferred"), ("errors", "page errors"))
+
+
+def carve_words(stats):
+    """The recovery's numbers in words: 'pages looked at 3,922 · candidate cells 1,961 ·
+    records 1,405 · ... · took 10.6 s · ran to the end'."""
+    parts = []
+    for key, words in CARVE_WORDS:
+        v = stats.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and (v or key in (
+                "records", "pages", "errors")):
+            parts.append("%s %s" % (words, format(int(v), ",")))
+    secs = stats.get("seconds")
+    if isinstance(secs, (int, float)):
+        parts.append("took %.1f s" % secs)
+    stopped = stats.get("stopped")
+    parts.append("stopped: %s" % stopped if stopped else "ran to the end")
+    for key in ("live_check_skipped", "live_index_check_skipped"):
+        names = stats.get(key) or ()
+        if names:
+            parts.append("not compared with the live rows (over the limit): %s" % ", ".join(
+                str(n) for n in names))
+    return " \u00b7 ".join(parts)
+
+
+def _preview(r):
+    """'col=value, col=value…' of the first values that say something (not NULL / empty)."""
+    parts = []
+    for c, v in zip(r["columns"], r["values"]):
+        if v is None or v == "" or (isinstance(v, dict) and not v):
+            continue
+        parts.append("%s=%s" % (c, _val(v)))
+        if len(parts) >= PREVIEW_VALUES:
+            break
+    text = ", ".join(parts)
+    return text if len(text) <= PREVIEW_CHARS else text[:PREVIEW_CHARS] + "\u2026"
 _LEVEL_TONE = {"error": "bad", "warning": "warn", "info": "info"}
 
 
@@ -205,10 +282,12 @@ def _record_rows(records):
         table = r["table"] or "(unknown)"
         if r.get("index"):
             table = "%s (index entry of %s)" % (table, r["index"])
-        yield [r["id"], table, r["confidence"], pv["source"], pv["file"], pv["page"],
-               pv["offset"], pv["frame"], pv["frame_state"], r["rowid"],
-               "\n".join("%s = %s" % (c, _val(v)) for c, v in zip(r["columns"], r["values"])),
-               "; ".join(r["reasons"]), " ".join(r["flags"]), len(r["copies"])]
+        values = OrderedDict((c, _val(v)) for c, v in zip(r["columns"], r["values"]))
+        yield [r.get("state") or record_state(r["flags"], r.get("index")), table, r["rowid"],
+               r["confidence"], _preview(r), values, pv["source"], pv["page"], pv["offset"],
+               pv.get("file_offset"), pv.get("length"), pv["file"], pv["frame"],
+               pv["frame_state"], "; ".join(r["reasons"]), " ".join(r["flags"]),
+               len(r["copies"]), r["id"]]
 
 
 def html_report(data, limits=None, case_name=""):
@@ -242,19 +321,26 @@ def html_report(data, limits=None, case_name=""):
         rep.add_simple_table(
             ["Level", "Code", "Message", "Details"],
             [[badge(f["level"], _LEVEL_TONE.get(f["level"], "muted")), f["code"], f["message"],
-              json.dumps(f["details"], ensure_ascii=False, default=str)]
+              _details_html(f["details"])]
              for f in data["findings"]],
-            classes=[_LEVEL_TONE.get(f["level"], "") for f in data["findings"]], mono=(3,))
+            classes=[_LEVEL_TONE.get(f["level"], "") for f in data["findings"]])
     else:
         rep.add_text("No finding.")
     recs = data["records"]
     rep.add_section("Recovered records (%d)" % len(recs), id="records")
     if data["carve"]:
-        rep.add_text(", ".join("%s: %s" % kv for kv in sorted(data["carve"].items())), "muted")
+        rep.add_text(carve_words(data["carve"]), "muted")
+    if recs:
+        rep.add_text("Each line is one record the database no longer shows. State says what "
+                     "it is (deleted; an older version of a live row; the same values "
+                     "inserted again; on a page nothing references; an index entry). Open a "
+                     "line (Enter, or the row's button) for every value and where its bytes "
+                     "are: file, page, offset in the page and byte offset in the file.")
     rep.add_table("Recovered records", list(RECORD_FIELDS), _record_rows(recs),
                   total=len(recs), dates=False,
-                  detail={"prov": ["source", "file", "page", "offset", "frame", "frame_state",
-                                   "confidence", "reasons", "flags", "copies"],
+                  detail={"prov": ["state", "confidence", "source", "file", "page", "offset",
+                                   "file_offset", "length", "frame", "frame_state", "reasons",
+                                   "flags", "copies", "id"],
                           "path": [os.path.basename(db.get("path") or "") or "database",
                                    {"col": "table"}, {"col": "rowid"}]})
     if data["wal_history"]:
@@ -270,6 +356,26 @@ def html_report(data, limits=None, case_name=""):
                                d["root_status"], d["sql"]] for d in data["dropped_schema"]],
                              mono=(5,))
     return rep
+
+
+def _details_html(details, most=8):
+    """A finding's details, readable: a dict as 'key: value' lines, a list as a bullet list
+    (long lists folded behind their count), plain text as it is."""
+    from ..html_report import Markup, details_html, esc
+
+    def one(v):
+        if isinstance(v, dict):
+            return "<ul class=\"kv-list\">%s</ul>" % "".join(
+                "<li><strong>%s</strong>: %s</li>" % (esc(k), one(x)) for k, x in v.items())
+        if isinstance(v, (list, tuple)):
+            items = "".join("<li>%s</li>" % one(x) for x in v)
+            if len(v) > most:
+                return details_html("%d items" % len(v), "<ul>%s</ul>" % items)
+            return "<ul>%s</ul>" % items
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return esc(format(v, ",") if isinstance(v, int) else v)
+        return esc("" if v is None else v)
+    return Markup(one(details))
 
 
 def to_html(data):

@@ -168,6 +168,21 @@ class SnippetTest(unittest.TestCase):
         self.assertTrue(long.endswith("[hex @0: " + " ".join(["78"] * 32) + " ...]"))
 
 
+class PreviewSnippetTest(unittest.TestCase):
+    def test_the_match_shows_near_the_start_of_the_preview(self):
+        # a JSON value of 300 characters matching at 220 (PhonePe transaction_core.tstore_data):
+        # the Preview column shows ~60 characters, so the preview starts just before the match
+        from utils import _snippet
+        value = '{"amount":18500,"context":{"tag":"MISC"},' + "x" * 170 + \
+            '"payee":{"name":"Bharath Kalyan"}}'
+        s = _snippet(value, "bharath", "ci")
+        self.assertTrue(s.startswith("..."))
+        self.assertLess(s.lower().find("bharath"), 50)
+        self.assertEqual(_snippet("short Bharath text", "bharath", "ci"), "short Bharath text")
+        head = '{"name":"Bharath"}' + "y" * 100
+        self.assertEqual(_snippet(head, "bharath", "ci"), head)   # near the start: as is
+
+
 class MatcherTest(unittest.TestCase):
     def hits(self, matcher, decl, value):
         out = []

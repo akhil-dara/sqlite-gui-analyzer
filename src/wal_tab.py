@@ -13,6 +13,7 @@ runs on a worker thread with progress and Stop.
 Exports (frames, records, BLOBs) run on a worker thread with the provenance of engine.export.
 """
 
+import os
 import tkinter as tk
 from collections import OrderedDict
 from tkinter import filedialog, messagebox, ttk
@@ -22,6 +23,7 @@ from combobox import SearchableCombobox
 from constants import C, VERSION, WAL_STATES, wal_state_label
 from tokens import COLOR as K, FONT as F
 from database import RID
+from engine.fileformat.wal import frame_no
 from engine.tags import entry_from_wal_record
 from grid import DataGrid, Runner, grid_search
 from hexview import HexView
@@ -120,6 +122,19 @@ class WalTab(ttk.Frame):
                                               anchor="w", justify="left",
                                               font=F["body"]), pad=24)
 
+        # the time machine: the database as of an earlier commit (opened beside it)
+        tm = self.tm_row = FlowFrame(self)
+        tm.add(ttk.Label(tm, text="Time machine: see the database as it was at"))
+        self.tm_var = tk.StringVar()
+        self.tm_combo = tm.add(SearchableCombobox(tm, textvariable=self.tm_var,
+                                                  state="readonly", width=34), gap=6)
+        self.tm_btn = tm.add(ttk.Button(tm, text="Open it beside this one",
+                                        style="Small.TButton", command=self.open_as_of), gap=6)
+        self.tm_note = tm.add(ttk.Label(tm, text="", style="M.TLabel"), gap=8)
+        ToolTip(self.tm_btn, "Opens the same files read-only as a second database of the "
+                             "case, with the WAL applied only up to that commit: Browse, Search, "
+                             "the Query tab (also both together) and Recover work on it")
+
         # per-table statistics, collapsed
         self.stats_btn = ttk.Button(self, text="▶ Per-table statistics",
                                     command=self._toggle_stats)
@@ -191,10 +206,15 @@ class WalTab(ttk.Frame):
         self.tree.pack(fill="both", expand=True)
         self.frames_filter = TreeFilter(self.tree, self.frames_search, "frame", "frames")
         self.tree.bind("<<TreeviewSelect>>", self._on_frame)
+        self.tree.bind("<Button-3>", self._frames_menu)
         for state, (_l, fg, bg, _d) in WAL_STATES.items():
             self.tree.tag_configure(state, foreground=fg, background=bg)
         low = ttk.Notebook(self.frames_pane)
         self.frames_pane.add(low, weight=2)
+        # the panes start at what they ask for and the page's record grid asks for much: the
+        # frames list - what the tab is about - was ~8 rows. Once shown it gets ~60%
+        self._split_done = False
+        self.frames_pane.bind("<Configure>", self._first_split, add="+")
         self.detail_nb = low
         info = ttk.Frame(low)
         low.add(info, text="  Summary  ")
@@ -266,11 +286,62 @@ class WalTab(ttk.Frame):
     def worker_threads(self):
         return self._runner.threads()
 
+    def absent_text(self):
+        """Why this tab lists nothing: the active database has no -wal file; which databases
+        of the case have one; how a WAL is read when there is one."""
+        db = self.db
+        app = self.app
+        name = os.path.basename(getattr(db.evidence, "main", "") or "") or "this database"
+        main = getattr(db.evidence, "main", "") or ""
+        mode = None
+        try:
+            mode = "wal" if db.session.pager.header.is_wal_mode else "rollback"
+        except Exception:               # noqa: BLE001 - the header's mode is a detail
+            pass
+        others = []
+        case = getattr(app, "case", None)
+        if case is not None and getattr(case, "multi", False):
+            try:
+                others = [m.name for m in case if m.db.ok and m.db.has_wal]
+            except Exception:           # noqa: BLE001 - no list then
+                others = []
+        lines = ["%s has no write-ahead log: there is no file %s-wal beside it%s." % (
+            name, main or name,
+            " (its header says journal mode %s)" % mode if mode else "")]
+        lines.append("A -wal file exists only while a database is in WAL mode and until a "
+                     "checkpoint folds its frames into the main file and the last connection "
+                     "deletes it; what it held is in the main file now. Older versions of rows "
+                     "may still be recovered from freed pages and free space: Forensics \u203a "
+                     "Recovered Records and Row History.")
+        if others:
+            lines.append("Databases of this case with a WAL (%d): %s - make one active (the "
+                         "navigator, or the breadcrumb of Browse) to see its frames here."
+                         % (len(others), ", ".join(others)))
+        lines.append("When there is a WAL, this tab reads it itself: the 32-byte file header "
+                     "and every 24-byte frame header, the salts and the checksum chain verified "
+                     "as SQLite does; frames after the last commit, of an earlier use of the "
+                     "file or failing the chain are labelled so and not applied; the valid "
+                     "frames are overlaid in memory (the file is never written) and listed "
+                     "frame by frame with their table, page, records and commit; Search, "
+                     "Recovered Records, Row History and the Timeline use the same frames.")
+        return "\n\n".join(lines)
+
     def on_open(self):
-        """Show the active database's WAL (or why it cannot be read)."""
+        """Show the active database's WAL (or why it cannot be read, or that there is none)."""
         self.reset()
         db = self.db
         problem = db.session.wal_problem if db.ok else None
+        if db.ok and not problem and not db.has_wal:
+            self.summary.configure(text="")
+            self.problem.configure(text=self.absent_text(), bg=K["primary_soft"],
+                                   fg=K["primary"])
+            if not self.problem.winfo_manager():
+                self.problem.pack(fill="x", padx=10, pady=(4, 2), after=self.summary)
+            for w in (self.stats_btn, self.bar_row, self.frames_pane, self.records_box,
+                      self.tm_row):
+                w.pack_forget()
+            return
+        self.problem.configure(bg=C["rl"], fg=C["red"])
         if problem or not db.has_wal:
             path = db.evidence.path("wal") if db.ok else None
             self.problem.configure(text=(
@@ -280,12 +351,15 @@ class WalTab(ttk.Frame):
                 % (problem or "no frames", "\n%s" % path if path else "")))
             if not self.problem.winfo_manager():
                 self.problem.pack(fill="x", padx=10, pady=(4, 2), after=self.summary)
-            for w in (self.stats_btn, self.bar_row, self.frames_pane, self.records_box):
+            for w in (self.stats_btn, self.bar_row, self.frames_pane, self.records_box,
+                      self.tm_row):
                 w.pack_forget()
             return
         if self.problem.winfo_manager():
             self.problem.pack_forget()
-        self.stats_btn.pack(anchor="w", padx=10, pady=(2, 0), after=self.summary)
+        self._fill_time_machine()
+        self.stats_btn.pack(anchor="w", padx=10, pady=(2, 0),
+                            after=self.tm_row if self.tm_row.winfo_manager() else self.summary)
         self.bar_row.pack(fill="x", padx=10, pady=(4, 2), after=self.stats_btn)
         self._switch_view()
         wp = db.wal
@@ -449,10 +523,23 @@ class WalTab(ttk.Frame):
         for f in frames:
             n = self._records_in(f)
             tree.insert("", "end", iid=str(f.index), tags=(f.category,), values=(
-                f.index, wp.page_map.get(f.page_num, "page_%d" % f.page_num),
+                f.index + 1, wp.page_map.get(f.page_num, "page_%d" % f.page_num),
                 wal_state_label(f.category), f.page_type,
                 "…" if counting else ("" if n is None else n),
                 self._checksum(f), self._commit(f)))
+        kids = tree.get_children()
+        if kids and not tree.selection():   # the first frame's details show at once
+            tree.selection_set(kids[0])
+            tree.focus(kids[0])
+
+    def _first_split(self, e):
+        if self._split_done or e.height < 300:
+            return
+        self._split_done = True
+        try:
+            self.frames_pane.sashpos(0, int(e.height * 0.6))
+        except tk.TclError:
+            pass
 
     def navigate(self, frame_idx):
         """Show one frame (from a search result or a record window): filters cleared."""
@@ -481,7 +568,7 @@ class WalTab(ttk.Frame):
         self._selected_data = data
         table = wp.page_map.get(f.page_num, "page_%d" % f.page_num)
         n = self._records_in(f)
-        lines = ["Frame %d  —  table %s" % (f.index, table), "",
+        lines = ["Frame %d  —  table %s" % (f.index + 1, table), "",
                  "Status:       %s — %s" % (wal_state_label(f.category),
                                             WAL_STATES.get(f.category, ("", "", "", ""))[3]),
                  "Transaction:  %s%s" % (self._commit(f), " (this frame ends the commit)"
@@ -572,6 +659,61 @@ class WalTab(ttk.Frame):
             menu.add_command(label="Row history (every version)",
                              command=lambda: self.app.show_row_history(rec["table"], loc))
         self.app.tag_menu(menu, lambda: [entry_from_wal_record(rec)], label="Tag record")
+
+    # -- the time machine -------------------------------------------------------------------------
+    def _fill_time_machine(self):
+        """The commits to choose from: 'commit 3 of 7 (frames 1-120)'. Hidden for a database
+        that is itself a view as of a commit (its WAL ends there)."""
+        wal = self.db.session.wal if self.db.ok else None
+        ends = wal.commit_ends() if wal is not None else []
+        as_of = getattr(wal, "as_of_commit", None) if wal is not None else None
+        if not ends or as_of:
+            self.tm_row.pack_forget()
+            return
+        n = len(ends)
+        self._tm_values = ["commit %d of %d (frames 1–%s)%s" % (
+            k, n, format(e + 1, ","), " - the current state" if k == n else "")
+            for k, e in enumerate(ends, 1)]
+        self.tm_combo.configure(values=self._tm_values)
+        self.tm_var.set(self._tm_values[-2] if n > 1 else self._tm_values[0])
+        if self.tm_note is not None:
+            self.tm_note.configure(text="(starts one commit back: commit %d of %d is the "
+                                        "current state the tabs show)" % (n, n) if n > 1 else "")
+        self.tm_row.pack(fill="x", padx=10, pady=(4, 0), after=self.summary)
+
+    def open_as_of(self, commit_no=None):
+        """Open the active database as of a commit, beside it in the case."""
+        if commit_no is None:
+            values = getattr(self, "_tm_values", [])
+            if self.tm_var.get() not in values:
+                return None
+            commit_no = values.index(self.tm_var.get()) + 1
+        return self.app.open_as_of(self.app.case.active, commit_no)
+
+    def _frames_menu(self, e):
+        """Right-click a frame: open the database as of the commit the frame belongs to."""
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        k = self.commit_of_frame(int(iid))
+        wal = self.db.session.wal if self.db.ok else None
+        if k is None or wal is None or getattr(wal, "as_of_commit", None):
+            return
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Open the database as of commit %d (this frame's commit)" % k,
+                      command=lambda: self.open_as_of(k))
+        m.tk_popup(e.x_root, e.y_root)
+
+    def commit_of_frame(self, index):
+        """The commit (1 = first) frame `index` belongs to, or None (not committed)."""
+        wal = self.db.session.wal if self.db.ok else None
+        if wal is None:
+            return None
+        for k, e in enumerate(wal.commit_ends(), 1):
+            if index <= e:
+                return k
+        return None
 
     # -- per-table statistics -------------------------------------------------------------------
     def _toggle_stats(self):
@@ -729,7 +871,7 @@ class WalTab(ttk.Frame):
             if status == "different":
                 mark = "≠ %d differ" % len(diff)
             head = [i + 1, mark, rec["table"], rec["rowid"], wal_state_label(rec["category"]),
-                    rec["frame_idx"], rec["page_num"]]
+                    frame_no(rec["frame_idx"]), rec["page_num"]]
             if cols is not None:
                 rows.append((head + list(rec["raw_values"]) + [reason],
                              rec.get("flags") or ()))
@@ -803,7 +945,7 @@ class WalTab(ttk.Frame):
 
         def rows():
             for f in frames:
-                yield [f.index, f.page_num, wp.page_map.get(f.page_num, "page_%d" % f.page_num),
+                yield [f.index + 1, f.page_num, wp.page_map.get(f.page_num, "page_%d" % f.page_num),
                        wal_state_label(f.category), f.page_type, self._records_in(f),
                        self._checksum(f), self._commit(f), f.commit_size,
                        "0x%08X" % f.salt1, "0x%08X" % f.salt2, f.offset]
@@ -865,7 +1007,7 @@ class WalTab(ttk.Frame):
                 if job.cancelled:
                     break
                 n_ok, n_err, f1 = export_row_blobs(
-                    folder, "%s_f%d" % (rec["table"], rec["frame_idx"]),
+                    folder, "%s_f%d" % (rec["table"], rec["frame_idx"] + 1),
                     ["_rid"] + list(rec["values_dict"].keys()),
                     [[rec["locator"]] + list(rec["raw_values"])], files=files)
                 count, errors, first = count + n_ok, errors + n_err, first or f1
@@ -933,7 +1075,7 @@ class WalRecordWindow(tk.Toplevel):
         member = getattr(app.case, "active", None)
         self.title("Row detail (WAL) — %s, row %s" % (app.member_label(member, table), rowid))
         fit_geometry(self, 900, 620)
-        self.configure(bg=C["bg"])
+        self.configure(bg=C["bg2"])         # the ttk widgets' own background: no odd strips
         self.transient(app)
         self.columns, self.values = list(columns), list(values)
         self.values += [None] * (len(self.columns) - len(self.values))
@@ -951,9 +1093,10 @@ class WalRecordWindow(tk.Toplevel):
         _l, fg, bg, desc = WAL_STATES.get(category, ("", C["text"], C["bg2"], ""))
         head = tk.Frame(self, bg=bg, padx=10, pady=6)
         head.pack(fill="x")
-        tk.Label(head, text="WAL frame %s (%s), page %s  |  table %s  |  row %s" % (
-            frame_idx, wal_state_label(category) if category else "?", page_num, table, rowid),
-            bg=bg, fg=fg, font=F["heading"], anchor="w").pack(fill="x")
+        wrap_to_width(tk.Label(head, text="WAL frame %s (%s), page %s  |  table %s  |  row %s" % (
+            frame_no(frame_idx), wal_state_label(category) if category else "?", page_num, table,
+            rowid), bg=bg, fg=fg, font=F["heading"], anchor="w", justify="left"),
+            pad=4).pack(fill="x")
         what = {"same": "The database has this row with the same values.",
                 "different": "The database has this row now with other values in %d "
                              "column(s): %s (marked ≠)." % (len(diff), ", ".join(sorted(diff))),
@@ -961,13 +1104,15 @@ class WalRecordWindow(tk.Toplevel):
                 "wal_table": "Its table exists only in the WAL (not in the database's "
                              "current schema).",
                 "error": "Could not compare with the database: %s." % reason}.get(status, "")
-        tk.Label(head, text=what + ("  (%s)" % desc if desc else ""), bg=bg, fg=C["text2"],
-                 anchor="w", justify="left", wraplength=860,
-                 font=F["body"]).pack(fill="x")
+        # body text colour on the state's band: readable in both themes (never muted grey)
+        wrap_to_width(tk.Label(head, text=what + ("  (%s)" % desc if desc else ""), bg=bg,
+                               fg=K["text"], anchor="w", justify="left",
+                               font=F["body"]), pad=4).pack(fill="x", pady=(2, 0))
         if match_col:
-            tk.Label(self, text="Matched in %s: %s" % (match_col, str(match_val)[:300]),
-                     bg=C["bg"], fg=C["text2"], anchor="w", wraplength=860,
-                     font=F["body"]).pack(fill="x", padx=10, pady=(4, 0))
+            wrap_to_width(tk.Label(self, text="Matched in %s: %s" % (match_col,
+                                                                    str(match_val)[:300]),
+                                   bg=C["bg2"], fg=C["text2"], anchor="w", justify="left",
+                                   font=F["body"])).pack(fill="x", padx=10, pady=(4, 0))
         fbar = ttk.Frame(self)
         fbar.pack(fill="x", padx=8, pady=(6, 0))
         self.find = SearchBox(fbar, placeholder="Find a column or value…", delay=100,
@@ -976,10 +1121,11 @@ class WalRecordWindow(tk.Toplevel):
         box = ttk.Frame(self)
         box.pack(fill="both", expand=True, padx=8, pady=6)
         self.tree = ttk.Treeview(box, columns=("col", "wal", "db", "same"), show="headings")
-        for c, text, w in (("col", "Column", 160), ("wal", "Value in the WAL", 320),
-                           ("db", "Value in the database now", 320), ("same", "", 70)):
+        # widths that fit a narrow window; the two value columns share what is left
+        for c, text, w in (("col", "Column", 150), ("wal", "Value in the WAL", 200),
+                           ("db", "Value in the database now", 200), ("same", "", 50)):
             self.tree.heading(c, text=text)
-            self.tree.column(c, width=w, stretch=c in ("wal", "db"))
+            self.tree.column(c, width=w, minwidth=40, stretch=c in ("wal", "db"))
         ysb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ysb.set)
         ysb.pack(side="right", fill="y")
@@ -998,22 +1144,25 @@ class WalRecordWindow(tk.Toplevel):
         self.tree.bind("<Double-1>", self._open_value)
         ttk.Label(self, text="Double-click a BLOB to open it in the BLOB Inspector.",
                   style="M.TLabel").pack(anchor="w", padx=10)
-        bar = ttk.Frame(self)
-        bar.pack(fill="x", padx=8, pady=6)
-        ttk.Button(bar, text="Copy as JSON", command=self._copy_json).pack(side="left")
+        # the buttons wrap onto a second line in a narrow window (never cut off); Close sits
+        # on its own at the right
+        low = ttk.Frame(self)
+        low.pack(fill="x", padx=8, pady=6)
+        ttk.Button(low, text="Close", command=self.destroy).pack(side="right", anchor="n")
+        bar = FlowFrame(low)
+        bar.pack(side="left", fill="x", expand=True)
+        bar.add(ttk.Button(bar, text="Copy as JSON", command=self._copy_json))
         if frame_idx is not None:
-            ttk.Button(bar, text="Go to frame %s" % frame_idx,
-                       command=lambda: (self.destroy(), app.show_wal_frame(frame_idx))).pack(
-                side="left", padx=4)
+            bar.add(ttk.Button(bar, text="Go to frame %s" % frame_no(frame_idx),
+                               command=lambda: (self.destroy(), app.show_wal_frame(frame_idx))),
+                    gap=4)
         if getattr(locator, "kind", None) in ("rowid", "pk") and db.ok and \
                 table in db.tables():
-            ttk.Button(bar, text="Row history",
-                       command=lambda: (self.destroy(), app.show_row_history(table, locator))
-                       ).pack(side="left", padx=4)
-        tag_btn = ttk.Button(bar, text="Tag ▾")
+            bar.add(ttk.Button(bar, text="Row history",
+                               command=lambda: (self.destroy(),
+                                                app.show_row_history(table, locator))), gap=4)
+        tag_btn = bar.add(ttk.Button(bar, text="Tag ▾"), gap=4)
         tag_btn.configure(command=lambda: self._tag(tag_btn))
-        tag_btn.pack(side="left", padx=4)
-        ttk.Button(bar, text="Close", command=self.destroy).pack(side="right")
 
     def _open_value(self, _e=None):
         sel = self.tree.selection()
@@ -1023,7 +1172,7 @@ class WalRecordWindow(tk.Toplevel):
         v = self.values[i] if i < len(self.values) else None
         if isinstance(v, (bytes, bytearray)):
             self.app.open_blob(bytes(v), self.columns[i], "%s.%s (WAL frame %s)" % (
-                self.table, self.columns[i], self.frame_idx))
+                self.table, self.columns[i], frame_no(self.frame_idx)))
 
     def record(self):
         return {"table": self.table, "rowid": self.rowid, "locator": self.locator,
@@ -1046,7 +1195,7 @@ class WalRecordWindow(tk.Toplevel):
         from engine.export import json_cell
         d = OrderedDict([("tool", "SQLite GUI Analyzer %s" % VERSION),
                          ("source", "WAL frame %s (%s), page %s" % (
-                             self.frame_idx, self.category, self.page_num)),
+                             frame_no(self.frame_idx), self.category, self.page_num)),
                          ("table", self.table), ("row", json_cell(self.locator)),
                          ("compared_with_database", self.status),
                          ("differing_columns", sorted(self.diff)),

@@ -4,7 +4,7 @@ from collections import OrderedDict
 
 # The one version source: the window title, About/Help, the schema report, the PyInstaller
 # builds, the installer and pyproject.toml all read it (see tools/release.py).
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 
 # Windows taskbar icon fix — show app icon instead of Python icon
 try:
@@ -61,7 +61,7 @@ def search_mode_key(label, default="ci"):
 
 
 # a search hit's internal source key -> the name the UI shows (tag files keep the key)
-SOURCE_NAMES = {"Freelist": "Freed pages"}
+SOURCE_NAMES = {"Freelist": "Recovered"}
 
 
 def source_name(source):
@@ -170,6 +170,12 @@ WAL_STATES = OrderedDict([
 ])
 
 
+_WAL_STATE_TOKENS = {"current": ("success_text", "success_soft"),
+                     "superseded": ("purple", "purple_soft"),
+                     "uncommitted": ("warning", "warning_soft"),
+                     "stale": ("danger_text", "danger_soft")}
+
+
 def wal_state_label(state):
     return WAL_STATES.get(state, (state,))[0]
 
@@ -190,6 +196,11 @@ def refresh_colors():
     ROW_FLAG_BG.clear()
     ROW_FLAG_BG.update({"flag_damaged": _K["danger_soft"],
                         "flag_prealter": _K["warning_soft"]})
+    # the WAL state colours follow the theme too (a dark window must never get the light
+    # theme's pale bands with light text on them)
+    for state, (fg, bg) in _WAL_STATE_TOKENS.items():
+        label, _fg, _bg, meaning = WAL_STATES[state]
+        WAL_STATES[state] = (label, _K[fg], _K[bg], meaning)
 
 
 # Row backgrounds for engine row flags (utils.row_flag_tag -> colour): refreshed in place

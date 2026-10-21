@@ -5,6 +5,7 @@ import time
 import unittest
 
 from tests.helpers import tk_root
+from tests.helpers import within  # noqa: E402
 from engine import limits
 from engine.fileformat.record import InvalidText
 from engine.schema import Locator
@@ -288,7 +289,7 @@ class GridBigTextTest(unittest.TestCase):
             g.redraw_now()
             self.root.update_idletasks()
             worst = max(worst, time.time() - t0)
-        self.assertLess(worst, 0.5, "a redraw took %.2fs" % worst)
+        within(self, worst, 0.5, "the slowest redraw")
         self.assertTrue(all(b.startswith("↵ 3 lines") for b in g.badge_items().values()))
 
 

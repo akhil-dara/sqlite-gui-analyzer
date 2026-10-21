@@ -34,7 +34,7 @@ from ..fileformat.wal import CURRENT
 from ..issues import IssueLog
 from ..schema import (column_affinity, quote_ident, register_collations, rename_create_table,
                       replace_collations, unquote_ident, _skip_identifier)
-from .carve import INDEX_KIND, IINT_KIND, Carver, _Site
+from .carve import INDEX_KIND, IINT_KIND, Carver, _Site, _cell_digest
 from .cellparse import parse_intact
 from .pages import AsOfFrameView, is_btree_page
 from .provenance import (FREELIST, JOURNAL, JOURNAL_FILE, MAIN_FILE, ORPHAN, REPLACED, WAL,
@@ -555,6 +555,9 @@ def index_templates(specs):
 
 
 # -- live entries ------------------------------------------------------------------------------
+SEEKS_BEFORE_MAP = 200      # rowid seeks into one table before it is read once into a map
+
+
 class LiveIndexEntries(object):
     """The entries every live index holds now (hashed once per index, up to the limit
     live_index_entries: a larger index is listed in `capped`, its entries are not compared,
@@ -569,6 +572,8 @@ class LiveIndexEntries(object):
         self._reader = BTreeReader(session.pager, self.issues)
         self._sets = {}
         self._rows = {}
+        self._seek_count = {}       # table -> rowid seeks so far
+        self._payloads = {}         # table -> {rowid: payload} or None
         self.capped = set()
         self._current = dict((e.name, (e.rootpage, e.tbl_name))
                              for e in session.schema.entries if e.type == "index")
@@ -589,10 +594,12 @@ class LiveIndexEntries(object):
         row = None
         if info is not None and info.kind == "table" and not info.without_rowid \
                 and info.root_page:
-            try:
-                hit = self._reader.find_rowid(info.root_page, rowid)
-            except Exception:
-                hit = None
+            hit = self._from_map(info, rowid)
+            if hit is False:
+                try:
+                    hit = self._reader.find_rowid(info.root_page, rowid)
+                except Exception:
+                    hit = None
             if hit is not None:
                 raw, _problem = decode_record_lenient(hit[1], self.session.pager.encoding)
                 row = dict((cid, raw[pos]) for pos, cid in enumerate(info.storage_order)
@@ -603,6 +610,35 @@ class LiveIndexEntries(object):
             self._rows.clear()
         self._rows[key] = row
         return row
+
+    def _from_map(self, info, rowid):
+        """After SEEKS_BEFORE_MAP seeks into one table (every entry of replaced index pages),
+        the table is read once into {rowid: payload} with the same reader the seek uses:
+        (rowid, payload) or None (not live) from it; False when there is no map (too many
+        rows for the limit, unreadable, or not enough seeks yet): seek."""
+        name = info.name
+        n = self._seek_count.get(name, 0) + 1
+        self._seek_count[name] = n
+        if n <= SEEKS_BEFORE_MAP:
+            return False
+        if name not in self._payloads:
+            m = {}
+            try:
+                for k, (rid, payload, _ref) in enumerate(self._reader.iter_table(info.root_page)):
+                    if k % 1024 == 0 and self.cancel is not None and self.cancel():
+                        return False        # not remembered
+                    if len(m) >= self.cap:
+                        m = None
+                        break
+                    m.setdefault(rid, payload)
+            except Exception:               # noqa: BLE001 - the seeks go on
+                m = None
+            self._payloads[name] = m
+        m = self._payloads[name]
+        if m is None:
+            return False
+        payload = m.get(rowid)
+        return None if payload is None else (rowid, payload)
 
     def entries(self, tpl):
         """(set of value keys, {rowid: True}) of the live index, or None."""
@@ -973,12 +1009,12 @@ class IndexCarver(Carver):
                          raw)
 
     # -- accepting --------------------------------------------------------------------------------
-    def _accept(self, cand, site, source, data):
+    def _accept(self, cand, site, source, data, alts=()):
         cell = cand.cell
         if self._stop():
             return cell.end
         self.stats["candidates"] += 1
-        key = (bytes(data[cell.start:cell.end]), site.owner, site.file) \
+        key = (_cell_digest(data, cell), site.owner, site.file) \
             if cell.ovfl is None and cell.rebuilt == 0 else None
         if cell.rebuilt and cand.atypical:
             # a rebuilt index entry is short: an unusual value means a chance fit
@@ -1100,6 +1136,8 @@ def learn_index_lengths(templates, live, table_rows=None, reference=None):
     for t in templates:
         try:
             t.learn_lengths(live.sample(t))
+            t._assign_memo = None       # cellparse._assign reads length_prior
+            t._ovfl_memo = None
             for row in (table_rows or {}).get(t.table, ()):
                 for pos, col in enumerate(t.spec.columns):
                     v = row[col.cid] if col.cid is not None and 0 <= col.cid < len(row) \

@@ -314,15 +314,31 @@ class TimelineTab(ttk.Frame):
         self.top.show(self._scope_rule, multi)
         picker.refresh()
 
+    def _scope_names(self):
+        """Names of the databases in scope, or None with one database (nothing to narrow)."""
+        if not self.multi():
+            return None
+        return set(m.name for m in self._scope())
+
     def _scope_changed(self):
         """The scope changed: with nothing shown yet, look again (when shown); with a
-        timeline shown, keep it and say that Build reads the new scope."""
+        timeline shown, show at once only what it holds of the databases now in scope, and
+        say which ones Build still has to read."""
         if self.detection is None and self.result is None:
             self.on_open()
             return
-        self._stale_scope = True
-        self.status.set("The scope is now %s: Build timeline reads them (the events shown "
-                        "are those of the previous scope)" % self.app.scopes.text("timeline"))
+        read = set(m.uid for m in self.members)
+        missing = [m for m in self._scope() if m.uid not in read]
+        self._fill_columns()
+        self._fill_status_counts()
+        self._show_events()
+        self._stale_scope = bool(missing)
+        if missing:
+            self.status.set("%s not read yet: Build timeline adds %s" % (
+                ", ".join(m.name for m in missing[:4]) + (" \u2026" if len(missing) > 4 else ""),
+                "it" if len(missing) == 1 else "them"))
+        else:
+            self.status.set("Showing %s" % self.app.scopes.text("timeline"))
 
     def _member(self, uid):
         for m in self.members:
@@ -489,7 +505,7 @@ class TimelineTab(ttk.Frame):
         zone_box = ttk.Frame(top)
         ttk.Label(zone_box, text="Timezone:").pack(side="left", padx=(0, XS))
         self.offset_combo = SearchableCombobox(zone_box, textvariable=self.offset_var,
-                                               values=OFFSETS, width=26, state="readonly")
+                                               values=OFFSETS, width=20, state="readonly")
         self.offset_combo.pack(side="left")
         top.add(zone_box, gap=0)
         self.offset_combo.bind("<<ComboboxSelected>>", lambda e: self._offset_changed())
@@ -646,7 +662,9 @@ class TimelineTab(ttk.Frame):
         self.grid.pack(fill="both", expand=True)
         # the inline preview: the selected event, without opening its row window
         pv = self.preview = ttk.Frame(right)
-        pv.pack(fill="x", pady=(XS, 0))
+        # anchored at the bottom and packed before the grid: a short window shrinks the
+        # grid, never the preview
+        pv.pack(side="bottom", fill="x", pady=(XS, 0), before=self.grid)
         prow = ttk.Frame(pv)
         prow.pack(fill="x")
         self.preview_toggle = ttk.Button(prow, text="", style="Link.TButton",
@@ -979,7 +997,8 @@ class TimelineTab(ttk.Frame):
         q = self.col_filter.get().strip().lower()
         groups = {}
         if multi:
-            order = [m for m, _d in det.parts]
+            names = self._scope_names()
+            order = [m for m, _d in det.parts if names is None or m.name in names]
             for m in order:
                 d = det.of(m)
                 if d is None or not d.columns:
@@ -995,8 +1014,11 @@ class TimelineTab(ttk.Frame):
                         len(empty), "" if len(empty) == 1 else "s", ", ".join(empty)),
                     "", "", ""))
                 self._group_iids[None] = eid
+        names = self._scope_names()
         for i, c in enumerate(det.columns):
             db = self._db_name(c)
+            if names is not None and db and db not in names:
+                continue                # a database outside the scope
             if q and q not in c.table.lower() and q not in c.column.lower() and \
                     q not in db.lower():
                 continue
@@ -1097,7 +1119,7 @@ class TimelineTab(ttk.Frame):
         self._update_build_btn()
 
     def _update_build_btn(self):
-        """Enable Build timeline only when at least one date column is ticked (P1-17)."""
+        """Enable Build timeline only when at least one date column is ticked."""
         det = getattr(self, "detection", None)
         n = sum(1 for c in det.columns if c.enabled) if det is not None else 0
         try:
@@ -1128,15 +1150,19 @@ class TimelineTab(ttk.Frame):
         det = self.detection
         if det is None:
             return
-        on = sum(1 for c in det.columns if c.enabled)
-        dbs = len(set(c.database for c in det.columns)) if self.multi() else 1
+        uids = set(m.uid for m in self._scope()) if self.multi() else None
+        cols = [c for c in det.columns if uids is None or not getattr(c, "database", "")
+                or c.database in uids]
+        detected = set(id(c) for c in det.detected())
+        on = sum(1 for c in cols if c.enabled)
+        dbs = len(set(c.database for c in cols)) if self.multi() else 1
         self.cols_head.configure(text="%d date column%s%s" % (
-            len(det.columns), "" if len(det.columns) == 1 else "s",
-            " in %d databases" % dbs if self.multi() else ""))
-        self.col_status.configure(text="%d of %d ticked (%d detected, %d only named like "
-                                       "dates) · right-click: read as another kind" % (
-                                           on, len(det.columns), len(det.detected()),
-                                           len(det.columns) - len(det.detected())))
+            len(cols), "" if len(cols) == 1 else "s",
+            " in %d database%s" % (dbs, "" if dbs == 1 else "s") if self.multi() else ""))
+        found = sum(1 for c in cols if id(c) in detected)
+        self.col_status.configure(text="%d of %d ticked: %d detected, %d by name only · "
+                                       "right-click: read as another kind" % (
+                                           on, len(cols), found, len(cols) - found))
 
     def toggle_group(self, uid):
         """Tick every column of a database (untick all when all are ticked)."""
@@ -1305,9 +1331,10 @@ class TimelineTab(ttk.Frame):
             return
         columns = [c for c in self.detection.columns if c.enabled]
         if not columns:
-            self.status.configure(text="Tick at least one date column.")
+            self.status.configure(text="Tick at least one date column." if self.detection.columns
+                                  else "No date columns were found in the databases in scope.")
             return
-        # P1-4: drop the old results/placeholder so the build state is unambiguous
+        # drop the old results / placeholder so the build state is unambiguous
         self.result = None
         self._show_events()
         self.status.set("Reading events from %d column%s\u2026" % (
@@ -1348,20 +1375,28 @@ class TimelineTab(ttk.Frame):
                     return row.values if row is not None else None
                 if not cols:
                     return tl.EventSet()
+                # describing ids shown with what they stand for (url=3 (https://...))
+                links, link_notes = tl.link_lookups(session, desc, cancel)
                 res = tl.build_events(session, cols, desc, start, end, cap,
-                                      total_cap * 2, cancel, prog)
+                                      total_cap * 2, cancel, prog, lookups=links)
+                res.notes.extend(link_notes)
                 if wal is not None and not res.cancelled:
                     try:
                         evs, notes = tl.wal_events(wal.recover_all_records(cancel=cancel), cols,
-                                                   desc, start, end, live, cancel, cap)
+                                                   desc, start, end, live, cancel, cap,
+                                                   unset=res.unset, lookups=links)
                         res.events.extend(evs)
                         res.notes.extend(notes)
                     except tl.Cancelled:
                         res.cancelled = True
                 if records and not res.cancelled:
-                    evs, notes = tl.carved_events(records, cols, desc, start, end, cap)
+                    evs, notes = tl.carved_events(records, cols, desc, start, end, cap,
+                                                  unset=res.unset, lookups=links)
                     res.events.extend(evs)
                     res.notes.extend(notes)
+                note = tl.unset_note(res.unset)
+                if note:
+                    res.notes.append(note)
                 if multi:
                     for e in res.events:
                         e.database = member.name
@@ -1375,6 +1410,7 @@ class TimelineTab(ttk.Frame):
                 res.notes.extend(r.notes)
                 res.cancelled = res.cancelled or r.cancelled
                 res.per_database.append((member, len(r.events)))
+                res.unset_total = getattr(res, "unset_total", 0) + sum(r.unset.values())
             if multi or len(res.events) > total_cap or any(j[4] or j[5] for j in jobs):
                 res.events = tl.finish(res.events, total_cap, res.notes)
             return res
@@ -1387,7 +1423,7 @@ class TimelineTab(ttk.Frame):
                 return
             self.result = res
             self._show_events()
-            # P1-4: explicit end state, never an ambiguous 'Reading…'
+            # an explicit end state, never an ambiguous 'Reading…'
             if not res.events and not res.cancelled:
                 text = ("No events found in the ticked columns" +
                         (" (%.1fs)" % seconds))
@@ -1407,6 +1443,11 @@ class TimelineTab(ttk.Frame):
                 if none:
                     details.append("%d database%s: no dated rows in the ticked columns (%s)" % (
                         len(none), "" if len(none) == 1 else "s", ", ".join(none)))
+            left = getattr(res, "unset_total", 0)
+            if left:
+                # dates stored as 0 or below: 'not set', not 1970 or 1601
+                text += " · %s unset date%s (0 or below) left out" % (
+                    format(left, ","), "" if left == 1 else "s")
             if res.notes:
                 text += " · %d note%s" % (len(res.notes), "" if len(res.notes) == 1 else "s")
                 details.extend(res.notes)       # every note, none left out
@@ -1607,15 +1648,18 @@ class TimelineTab(ttk.Frame):
             self.chart.set_data([])
             self.sources.configure(text="")
             return
-        src = EventSource(res.events, self._offset(), self.db.encoding if self.db.ok else "utf-8",
+        names = self._scope_names()
+        events = res.events if names is None else [e for e in res.events
+                                                    if not e.database or e.database in names]
+        src = EventSource(events, self._offset(), self.db.encoding if self.db.ok else "utf-8",
                           databases=self.multi(), time_format=self.timefmt_var.get(),
                           time_custom=self._time_custom)
         self.grid.set_source(src)
         self.filter_var.set("")
         # the density chart (the bars in the databases' colours in a case)
         colours = dict((m.name, m.color) for m in self.members) if self.multi() else {}
-        self.chart.set_data([e.when for e in res.events],
-                            [e.database for e in res.events] if self.multi() else None, colours)
+        self.chart.set_data([e.when for e in events],
+                            [e.database for e in events] if self.multi() else None, colours)
         self.chart.set_split(self.split_var.get())
         if self.multi() != self._split_shown:
             self._split_shown = self.multi()
@@ -1632,22 +1676,25 @@ class TimelineTab(ttk.Frame):
         if res is None:
             self.sources.configure(text="")
             return
+        names = self._scope_names()
+        events = res.events if names is None else [e for e in res.events
+                                                    if not e.database or e.database in names]
         by = OrderedDict()
-        for e in res.events:
+        for e in events:
             k = e.source.split(" ")[0]
             by[k] = by.get(k, 0) + 1
-        parts = ["%s events" % format(len(res.events), ",")]
+        parts = ["%s events" % format(len(events), ",")]
         if self.multi():
-            dbs = len(set(e.database for e in res.events))
+            dbs = len(set(e.database for e in events))
             parts.append("from %d database%s" % (dbs, "" if dbs == 1 else "s"))
         parts.append(", ".join("%s %s" % (format(n, ","), k) for k, n in by.items()) or "none")
-        if res.events:
-            parts.append("%s – %s" % (tl.fmt_time(res.events[0].when)[:16],
-                                      tl.fmt_time(res.events[-1].when)[:16]))
+        if events:
+            parts.append("%s – %s UTC" % (tl.fmt_time(events[0].when)[:16],
+                                          tl.fmt_time(events[-1].when)[:16]))
         src = self.grid.source
         rng = getattr(src, "time_range", None) if src is not None else None
         if rng is not None:
-            n = sum(1 for e in res.events if rng[0] <= e.when <= rng[1])
+            n = sum(1 for e in events if rng[0] <= e.when <= rng[1])
             parts.append("%s in the selected range (drag again, or click the chart to clear)"
                          % format(n, ","))
         self.sources.configure(text=" · ".join(parts))

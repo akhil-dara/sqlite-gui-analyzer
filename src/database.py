@@ -52,21 +52,41 @@ def as_locator(rid):
     return None
 
 
+def count_error_text(e):
+    """Why a table's rows cannot be counted, in plain words (the navigator's hover)."""
+    text = str(e)
+    m = re.search(r"unknown tokenizer: (\S+)", text)
+    if m:
+        return ("a full-text index that needs the app's own tokenizer (%s): this SQLite cannot "
+                "read it; its text is usually in the app's other tables" % m.group(1))
+    m = re.search(r"no such module: (\S+)", text)
+    if m:
+        return ("a virtual table of the app's own module (%s): this SQLite cannot read it"
+                % m.group(1))
+    if "RTree" in text or "rtree" in text:
+        return "a spatial (R*Tree) index SQLite refuses to read: %s" % text
+    return "SQLite cannot count it: %s" % text
+
+
 class DB(object):
     def __init__(self):
         self.session = None
         self._wal_adapter = None
         self._path = None
         self.last_page = None
+        self.count_errors = {}      # table -> why its rows cannot be counted (plain words)
 
     # -- lifecycle -----------------------------------------------------------
-    def open(self, path, ram_limit=None, safe_parse=False, cancel=None, progress=None):
+    def open(self, path, ram_limit=None, safe_parse=False, cancel=None, progress=None,
+             as_of=None):
         """Open the evidence at path. safe_parse=True: only the built-in parser reads it
-        (SQLite never opens the file). cancel() -> True stops a long open; progress(text)."""
+        (SQLite never opens the file). cancel() -> True stops a long open; progress(text).
+        as_of=k: the database as of the WAL's commit k (the WAL time machine)."""
         self.close()
         kw = {} if ram_limit is None else {"ram_limit": ram_limit}
+        self.as_of = as_of
         self.session = Session.open(path, safe_parse=safe_parse, cancel=cancel,
-                                    progress=progress, **kw)
+                                    progress=progress, as_of=as_of, **kw)
         self._path = self.session.evidence.main
         if self.session.wal is not None:
             from wal_parser import WALParser
@@ -236,6 +256,20 @@ class DB(object):
         """Exact row count; errors propagate (the UI shows '?' for a table it cannot count)."""
         return self.session.count(tbl) if self.session else 0
 
+    def is_empty(self, tbl):
+        """True when an SQL-served table has no row (one row looked for: instant), False
+        when it has one, None when that cannot be asked."""
+        s = self.session
+        if not s:
+            return None
+        try:
+            if s.source(tbl) != "sql":
+                return None
+            r = s.conn().execute("SELECT 1 FROM %s LIMIT 1" % quote_ident(tbl)).fetchone()
+            return r is None
+        except Exception:
+            return None
+
     def approx_count(self, tbl):
         """Instant max(rowid) estimate for SQL-served rowid tables, else None."""
         s = self.session
@@ -365,7 +399,8 @@ class DB(object):
                 hit["rowid"] = hit["locator"] if hit["locator"] is not None else "-"
             yield tbl, hits, err
 
-    def search_freelist(self, term, mode, limit=500, deep_blob=False, cancel=None, decoded=False):
+    def search_freelist(self, term, mode, limit=500, deep_blob=False, cancel=None, decoded=False,
+                        progress=None):
         """Search the records still held by freed pages with the table-search rules.
 
         The records are those the Forensics carver recovers from freed pages (freed_page_
@@ -379,7 +414,8 @@ class DB(object):
         if not self.session or not term or mode == "col":
             return
         matcher = self.session.matcher(term, mode, deep_blob, decoded)
-        for hit in search_records(self._freelist_search_records(cancel), matcher, limit, cancel):
+        for hit in search_records(self._freelist_search_records(cancel, progress), matcher, limit,
+                                  cancel):
             yield hit
 
     def recovered_records(self, cancel=None):
@@ -406,7 +442,7 @@ class DB(object):
                                           "frame_state": rec["category"], "columns": cols,
                                           "flags": rec.get("flags") or (), "wal_record": rec}}
             out["WAL"] = wal_records
-        if self.session is not None and self.freelist_count():
+        if self.session is not None:
             def freelist_records():
                 for rec in self._freelist_search_records(cancel):
                     rec = dict(rec)
@@ -432,17 +468,61 @@ class DB(object):
             self._freed_cache = (self.session, recs)
         return recs
 
-    def freed_record(self, record_id):
-        """The freed-page Record with this id from the records already recovered (never
-        recovers them again: None when they are not at hand)."""
-        cached = getattr(self, "_freed_cache", None)
-        if cached is None or cached[0] is not self.session:
-            return None
-        return next((r for r in cached[1] if r.id == record_id), None)
+    # where Search's 'Recovered records' looks: the main file's free space and pages, the
+    # main-file pages a WAL frame replaces, and the rollback journal's page copies (WAL
+    # frames are searched on their own, as 'WAL row versions')
+    MAIN_FILE_SOURCES = ("freeblock", "unallocated", "freelist", "orphan", "replaced", "journal")
 
-    def _freelist_search_records(self, cancel=None):
+    def recovered_main_records(self, cancel=None, progress=None):
+        """Every record recovered outside the live rows (freeblocks, unallocated space, freed
+        and unreferenced pages, replaced main-file pages, the rollback journal; WAL versions
+        are searched on their own), as the Forensics
+        carver finds them; kept once read completely, and taken from Forensics when it
+        recovered every table from those places (set_recovered)."""
+        if not self.session:
+            return []
+        cached = getattr(self, "_recovered_cache", None)
+        if cached is not None and cached[0] is self.session:
+            return cached[1]
+        from engine import limits
+        res = self.session.forensics.carve(sources=list(self.MAIN_FILE_SOURCES),
+                                           cancel=cancel, index_entries=False,
+                                           progress=progress,
+                                           time_limit=limits.get("search_recover_seconds"))
+        recs = list(res)
+        # how far it got: a Search says when the recovery stopped at the limit
+        self.recovered_stopped = (res.stats or {}).get("stopped") if not getattr(
+            res, "complete", True) else None
+        if getattr(res, "complete", True):
+            self._recovered_cache = (self.session, recs)
+        return recs
+
+    def set_recovered(self, records, sources):
+        """Forensics recovered every table from `sources`: its main-file records serve Search
+        (when they cover every main-file place)."""
+        if self.session is None or not set(self.MAIN_FILE_SOURCES) <= set(sources or ()):
+            return
+        keep = [r for r in records if r.prov.source in self.MAIN_FILE_SOURCES and
+                getattr(r, "index", None) is None]
+        self._recovered_cache = (self.session, keep)
+
+    def freed_record(self, record_id):
+        """The recovered Record with this id from the records already recovered (never
+        recovers them again: None when they are not at hand)."""
+        for name in ("_recovered_cache", "_freed_cache"):
+            cached = getattr(self, name, None)
+            if cached is None or cached[0] is not self.session:
+                continue
+            r = next((r for r in cached[1] if r.id == record_id), None)
+            if r is not None:
+                return r
+        return None
+
+    def _freelist_search_records(self, cancel=None, progress=None):
+        """The recovered main-file records as search records (source 'Freelist', the key
+        Search, tags and the result groups use for records found outside the tables)."""
         s = self.session
-        for r in self.freed_page_records(cancel):
+        for r in self.recovered_main_records(cancel, progress):
             cols = list(r.columns) or ["col%d" % i for i in range(len(r.values))]
             t = s.schema.get(r.table) if r.table else None
             decl = [c.decl_type for c in t.columns] \
@@ -453,7 +533,7 @@ class DB(object):
                    "source": "Freelist",
                    "provenance": {"page": r.prov.page, "cell_offset": r.prov.offset,
                                   "confidence": r.confidence, "reasons": list(r.reasons),
-                                  "record_id": r.id}}
+                                  "record_id": r.id, "found_in": r.prov.source}}
 
     # -- WAL-only tables -------------------------------------------------------
     def wal_tables(self):

@@ -200,8 +200,10 @@ class NameIndex(object):
 
 
 SORTS = (("name", "Name"), ("size", "Size"), ("rows", "Rows"), ("hits", "Search hits"),
-         ("recent", "Recently used"))
+         ("history", "Rows with history"), ("recent", "Recently used"))
 PLACEHOLDER = "loading"
+SQL_LINES = 6                   # lines of the CREATE statement pane
+SQL_LINES_MAX = 16              # ... when it also says what triggers do
 
 
 class CaseNavigator(ttk.Frame):
@@ -214,6 +216,7 @@ class CaseNavigator(ttk.Frame):
         self.index = None
         self.hits = {}                  # uid -> search hits (after a search)
         self.dates = {}                 # uid -> date columns found (once known)
+        self.history = {}               # uid -> {table: rows with history} (once known)
         self.pinned = set()             # paths
         self.last_used = {}             # uid -> time made active
         self.sort = "name"
@@ -274,12 +277,22 @@ class CaseNavigator(ttk.Frame):
                 ("dates", "Has dates", "Only databases with date columns (known once the "
                                        "Overview or Timeline looked for them)"),
                 ("hits", "Has hits", "Only databases where the last search found something"),
+                ("history", "Has history", "Only databases with rows that have older versions "
+                                           "in their WAL or rollback journal (known once "
+                                           "Forensics > Row History looked)"),
                 ("warn", "Warnings", "Only databases with a warning (hot journal, WAL SQL "
                                      "cannot see, read natively...)")):
             self._chip[key] = self.chips.add_chip(text, toggle=True, tooltip=tip,
                                                   on_change=lambda on: self.apply_filter())
+        # tables, not databases: the same choice as Sort > Hide empty tables
+        self._chip["empty"] = self.chips.add_chip(
+            "Hide empty tables", toggle=True, on=bool(self.hide_empty_var.get()),
+            tooltip="Leave tables without rows out of every database's list (a line says how "
+                    "many are hidden)",
+            on_change=lambda on: (self.hide_empty_var.set(bool(on)), self._hide_empty_changed()))
         self.chips.show(self._chip["dates"], False)
         self.chips.show(self._chip["hits"], False)
+        self.chips.show(self._chip["history"], False)
         self.chips.show(self._chip["warn"], False)
 
         # the selection bar: shown while two or more databases are selected
@@ -298,11 +311,13 @@ class CaseNavigator(ttk.Frame):
         box.pack(fill="both", expand=True, padx=(XS, 0))
         self._tree_box = box
         self.tree = ttk.Treeview(box, style="Nav.Treeview", columns=("st", "tables", "rows"),
-                                 show="tree", selectmode="extended")
+                                 show="tree headings", selectmode="extended")
         self.tree.column("#0", width=150, minwidth=110, stretch=True)
         self.tree.column("st", width=40, minwidth=30, stretch=False, anchor="center")
-        self.tree.column("tables", width=34, minwidth=28, stretch=False, anchor="e")
-        self.tree.column("rows", width=52, minwidth=40, stretch=False, anchor="e")
+        self.tree.column("tables", width=54, minwidth=50, stretch=False, anchor="e")
+        self.tree.column("rows", width=56, minwidth=44, stretch=False, anchor="e")
+        for col, text in (("#0", "Name"), ("st", ""), ("tables", "Tables"), ("rows", "Rows")):
+            self.tree.heading(col, text=text, anchor="e" if col in ("tables", "rows") else "w")
         ysb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=ysb.set)
         xsb = ttk.Scrollbar(box, orient="horizontal", command=self.tree.xview)
@@ -333,17 +348,21 @@ class CaseNavigator(ttk.Frame):
 
         self.schema = Expander(self, "CREATE statement", style="Muted.TLabel")
         self.schema.pack(fill="x", padx=M, pady=(XS, M), side="bottom")
-        self.sql_text = tk.Text(self.schema.body, height=6, font=F["mono_small"], wrap="word",
+        self.sql_text = tk.Text(self.schema.body, height=SQL_LINES, font=F["mono_small"],
+                                wrap="word",
                                 background=K["card"], foreground=K["text"], relief="flat",
                                 highlightthickness=1, highlightbackground=K["border"],
                                 state="disabled")
         self.sql_text.pack(fill="x")
+        # what triggers do, above the SQL: the interface font, so it reads as words, not code
+        self.sql_text.tag_configure("note", font=F["small"], foreground=K["muted_text"])
         btns = ttk.Frame(self.schema.body)
         btns.pack(fill="x", pady=(XS, 0))
         ttk.Button(btns, text="Copy CREATE", style="Small.TButton",
                    command=self.copy_sql).pack(side="left")
-        ttk.Button(btns, text="Copy schema", style="Small.TButton",
-                   command=self.copy_schema).pack(side="left", padx=XS)
+        self.copy_schema_btn = ttk.Button(btns, text="Copy schema", style="Small.TButton",
+                                          command=self.copy_schema)
+        self.copy_schema_btn.pack(side="left", padx=XS)
         self.note = ttk.Label(btns, text="", style="Success.TLabel")
         self.note.pack(side="left", padx=XS)
         self._note_after = None
@@ -377,6 +396,7 @@ class CaseNavigator(ttk.Frame):
         self.chips.show(self._chip["wal"], multi and any(m.db.ok and m.db.has_wal for m in ms))
         self.chips.show(self._chip["dates"], multi and bool(self.dates))
         self.chips.show(self._chip["hits"], multi and bool(self.hits))
+        self.chips.show(self._chip["history"], multi and any(self.history.values()))
         self.chips.show(self._chip["warn"], multi and any(member_warnings(m) for m in ms))
         for key, chip in self._chip.items():
             if not self.chips.shown(chip) and chip.on:
@@ -385,6 +405,8 @@ class CaseNavigator(ttk.Frame):
             self._chip["hits"].set(count=sum(1 for v in self.hits.values() if v))
         if self.dates:
             self._chip["dates"].set(count=sum(1 for v in self.dates.values() if v))
+        if any(self.history.values()):
+            self._chip["history"].set(count=sum(1 for v in self.history.values() if v))
 
     def set_hits(self, hits):
         """{uid: hits} of the last search (empty: no search)."""
@@ -394,6 +416,32 @@ class CaseNavigator(ttk.Frame):
             self.apply_filter()
         else:
             self.refresh_counts()
+
+    def set_history(self, uid, counts):
+        """{table: rows with history} of a database, once Row History counted them (an empty
+        dict: looked, none). The table lines get a mark, the chip its count."""
+        self.history[uid] = dict((t, n) for t, n in (counts or {}).items() if n)
+        self._update_chips()
+        tree = self.tree
+        for iid, (kind, m, name) in list(self._nodes.items()):
+            if m is None or m.uid != uid or not tree.exists(iid):
+                continue
+            if kind == "table":
+                tree.item(iid, text=self._table_text(m, name))
+            elif kind == "db":
+                tree.item(iid, text=self._db_text(m))
+        if self._chip["history"].on or self.sort == "history":
+            self.apply_filter()
+
+    def _table_text(self, m, t):
+        """A table's line: its name, and '⟲ n' when n of its rows have older versions."""
+        n = (self.history.get(m.uid) or {}).get(t)
+        return "%s  \u27f2 %s" % (t, short_count(n)) if n else t
+
+    def _db_text(self, m):
+        """A database's line: its name, and '\u27f2 n' rows with older versions once counted."""
+        n = sum((self.history.get(m.uid) or {}).values())
+        return " %s  \u27f2 %s" % (m.name, short_count(n)) if n else " " + m.name
 
     def set_dates(self, dates):
         """{uid: date columns found} once known."""
@@ -420,6 +468,8 @@ class CaseNavigator(ttk.Frame):
             return False
         if self.chip_on("hits") and not self.hits.get(m.uid):
             return False
+        if self.chip_on("history") and not self.history.get(m.uid):
+            return False
         if self.chip_on("warn") and not member_warnings(m):
             return False
         return True
@@ -432,6 +482,8 @@ class CaseNavigator(ttk.Frame):
             return (-member_rows(m)[0], m.name.lower())
         if s == "hits":
             return (-(self.hits.get(m.uid) or 0), m.name.lower())
+        if s == "history":
+            return (-sum((self.history.get(m.uid) or {}).values()), m.name.lower())
         if s == "recent":
             return (-self.last_used.get(m.uid, 0), m.name.lower())
         return (m.name.lower(),)
@@ -543,9 +595,9 @@ class CaseNavigator(ttk.Frame):
         tree = self.tree
         rows, exact = member_rows(m)
         img = dot_image(tree, m.color, 10, ring=K["heading"] if active else None)
-        iid = tree.insert(parent, "end", text=" " + m.name, image=img,
+        iid = tree.insert(parent, "end", text=self._db_text(m), image=img,
                           values=(status_glyph(m), len(m.db.tables()),
-                                  ("" if exact else "~") + short_count(rows)),
+                                  short_count(rows) if exact else "\u2026"),
                           tags=("db",) + (("active",) if active else ()))
         self._nodes[iid] = ("db", m, m.name)
         self._db_iid[m.uid] = iid
@@ -612,6 +664,9 @@ class CaseNavigator(ttk.Frame):
     def _hide_empty_changed(self):
         """Hide empty tables was ticked or unticked: kept in the settings, the lists filled
         again."""
+        chip = getattr(self, "_chip", {}).get("empty")
+        if chip is not None and chip.on != bool(self.hide_empty_var.get()):
+            chip.set(on=bool(self.hide_empty_var.get()))
         settings = getattr(getattr(self.app, "tags", None), "settings", None)
         if isinstance(settings, dict):
             settings["nav_hide_empty"] = bool(self.hide_empty_var.get())
@@ -666,8 +721,8 @@ class CaseNavigator(ttk.Frame):
         text = short_count(n) if n is not None else ("~" + short_count(_int_count(c))
                                                      if isinstance(c, str) and c.startswith("~")
                                                      else "…")
-        x = self.tree.insert(parent, "end", text=t, values=("", "", text), tags=tags,
-                             open=open_)
+        x = self.tree.insert(parent, "end", text=self._table_text(m, t), values=("", "", text),
+                             tags=tags, open=open_)
         self._nodes[x] = ("table", m, t)
         if not open_:
             self.tree.insert(x, "end", text=PLACEHOLDER)
@@ -715,7 +770,9 @@ class CaseNavigator(ttk.Frame):
                 continue
             if kind == "db":
                 rows, exact = member_rows(m)
-                tree.set(iid, "rows", ("" if exact else "~") + short_count(rows))
+                # the total once every table is counted: a sum of rowid estimates can be far
+                # from the rows (a table emptied by deletes keeps its high rowids)
+                tree.set(iid, "rows", short_count(rows) if exact else "\u2026")
                 tree.set(iid, "st", status_glyph(m))
             elif kind == "table":
                 c = m.counts.get(name, "?")
@@ -807,23 +864,57 @@ class CaseNavigator(ttk.Frame):
         if n is None:
             return
         kind, m, name = n
+        if kind == "trigger" and m is not None:
+            self._show_sql(m, name, trigger=True)
+            self.schema.toggle(True)        # a trigger has no other view: its pane opens
+            return
         table = name if kind in ("table", "view") else name[0] if kind in ("column", "fk") \
             else None
         if table is not None and m is not None:
             self._show_sql(m, table)
 
-    def _show_sql(self, m, table):
+    def _trigger_note(self, m, name, trigger):
+        """What triggers do here, in words: for a trigger its summary, for a table the
+        triggers that fire on it or change it; '' when none."""
+        try:
+            from engine.triggers import for_session
+            tmap = for_session(m.db.session)
+        except Exception:               # noqa: BLE001 - no note, the SQL is still shown
+            return ""
+        if trigger:
+            t = tmap.named(name)
+            if t is None:
+                return "This trigger's statement could not be read - see its SQL below."
+            return "What it does (read from the SQL below, never run):\n" + t.summary()
+        lines = tmap.table_text(name)
+        if not lines:
+            return ""
+        return "Triggers (the database does this by itself):\n" + \
+            "\n".join("  - " + x for x in lines)
+
+    def _show_sql(self, m, table, trigger=False):
         try:
             sql = m.db.create_sql(table) or ""
         except Exception:               # noqa: BLE001
             sql = ""
+        note = self._trigger_note(m, table, trigger)
         self.sql_text.configure(state="normal")
         self.sql_text.delete("1.0", "end")
-        self.sql_text.insert("1.0", sql)
-        self.sql_text.configure(state="disabled")
-        self.schema.set_title("CREATE statement", "%s › %s" % (m.name, table)
-                              if len(self.members()) > 1 else table)
+        if note:
+            self.sql_text.insert("1.0", note + "\n\n", ("note",))
+        self.sql_text.insert("end", sql)
+        # room for the words when there are some (the pane scrolls past SQL_LINES_MAX)
+        lines = note.count("\n") + 3 + max(1, len(sql) // 40) if note else SQL_LINES
+        self.sql_text.configure(state="disabled",
+                                height=max(SQL_LINES, min(SQL_LINES_MAX, lines)))
+        if trigger:
+            self.copy_schema_btn.pack_forget()      # a table's schema: not for a trigger
+        elif not self.copy_schema_btn.winfo_manager():
+            self.copy_schema_btn.pack(side="left", padx=XS, before=self.note)
+        where = "%s › %s" % (m.name, table) if len(self.members()) > 1 else table
+        self.schema.set_title("Trigger" if trigger else "CREATE statement", where)
         self._sql_of = (m, table)
+        self._sql_kind = "trigger" if trigger else "table"
 
     def _on_click(self, e):
         """A click on a table opens it in Browse (in its database, made active)."""
@@ -923,25 +1014,43 @@ class CaseNavigator(ttk.Frame):
             active = m is getattr(self.app.case, "active", None)
             rows, exact = member_rows(m)
             lines = member_tooltip(m, active).split("\n")
-            lines.insert(3, "%d tables, %s%s rows" % (len(m.db.tables()),
-                                                       "" if exact else "about ",
-                                                       format(rows, ",")))
+            lines.insert(3, "%d tables, %s%s rows%s" % (
+                len(m.db.tables()), "" if exact else "about ", format(rows, ","),
+                "" if exact else " (a rough estimate from the table sizes, can be far off: "
+                                 "exact counts replace it when counted)"))
             lines.insert(4, "App / folder: %s" % group_key(m.path))
             warns = member_warnings(m)
             for b in warns:
                 lines.append("⚠ " + b.text)
             if self.hits.get(m.uid):
                 lines.append("Last search: %s rows found" % format(self.hits[m.uid], ","))
+            hist = self.history.get(m.uid)
+            if hist:
+                lines.append("Row history: %s rows with older versions in %d table%s (%s)" % (
+                    format(sum(hist.values()), ","), len(hist), "" if len(hist) == 1 else "s",
+                    ", ".join(sorted(hist, key=lambda t: -hist[t])[:4])))
             return "\n".join(l for l in lines if not l.startswith("Click:")) + \
                 "\nDouble-click or Enter: make active.  Right-click: more."
+        if kind == "trigger":
+            try:
+                from engine.triggers import for_session
+                t = for_session(m.db.session).named(name)
+            except Exception:           # noqa: BLE001
+                t = None
+            return "%s\n%s\nClick: what it does and its SQL, below." % (
+                name, t.summary() if t is not None else "Its statement could not be read.")
         if kind == "table":
             c = m.counts.get(name, "?")
             try:
                 ncols = len(m.db.columns(name))
             except Exception:           # noqa: BLE001
                 ncols = 0
-            return "%s\n%s · %s rows · %d columns\nClick: open in Browse." % (
-                name, m.name, format(c, ",") if isinstance(c, int) else c, ncols)
+            rough = isinstance(c, str) and c.startswith("~")
+            why = (getattr(m.db, "count_errors", None) or {}).get(name) if c == "?" else None
+            return "%s\n%s · %s rows%s · %d columns%s\nClick: open in Browse." % (
+                name, m.name, format(c, ",") if isinstance(c, int) else c,
+                " (~: a rough estimate until counted)" if rough else "", ncols,
+                "\n? : " + why if why else "")
         if kind == "column":
             table, col = name
             try:
@@ -1001,6 +1110,13 @@ class CaseNavigator(ttk.Frame):
                                                                                     "name"))
                 menu.add_command(label="Search in '%s'%s" % (table, where),
                                  command=lambda: app.search_in_table(m, table))
+                if kind == "table":
+                    menu.add_command(label="Missing row numbers (deleted rows)…",
+                                     command=lambda: app.show_missing_rows(m, table))
+                    n = (self.history.get(m.uid) or {}).get(table)
+                    menu.add_command(label="Row history of '%s'%s" % (
+                        table, " (%s rows with older versions)" % format(n, ",") if n
+                        else ""), command=lambda: app.show_table_history(m, table))
             if kind == "column" and app.relations.supported(table, m):
                 col = str(name[1])
                 menu.add_command(label="Column relationships of '%s'…" % col,
@@ -1075,7 +1191,7 @@ class CaseNavigator(ttk.Frame):
 
     def copy_schema(self):
         m, t = getattr(self, "_sql_of", (None, None))
-        if m is None:
+        if m is None or getattr(self, "_sql_kind", "table") == "trigger":
             self.flash("Select a table first")
             return
         from utils import _build_schema_text

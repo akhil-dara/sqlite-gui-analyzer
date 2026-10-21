@@ -86,7 +86,8 @@ class RelationsTabTest(TabCase):
         self.assertEqual(tab.card_title.cget("text"), "message")
         self.assertIn("Referred by 5 tables, refers to 1", tab.card_info.cget("text"))
         heads = [tab.card_tree.item(i, "text") for i in tab.card_tree.get_children()]
-        self.assertEqual(heads[:2], ["Refers to (1)", "Referred by (5)"])
+        self.assertEqual(heads[:2], ["Refers to: 1 link to 1 table",
+                                     "Referred by: 5 links from 5 tables"])
         # live search: the list of tables, its count, the empty state
         tab.search.set("poll")
         names = [tab.table_tree.item(i, "text") for i in tab.table_tree.get_children()]
@@ -255,15 +256,15 @@ class HubTabTest(TabCase):
         # the card groups the 150 alike tables
         tree = tab.card_tree
         heads = dict((tree.item(i, "text"), i) for i in tree.get_children())
-        self.assertIn("Referred by (150)", heads)
-        groups = [tree.item(i, "text") for i in tree.get_children(heads["Referred by (150)"])]
+        self.assertIn("Referred by: 150 links from 150 tables", heads)
+        groups = [tree.item(i, "text") for i in tree.get_children(heads["Referred by: 150 links from 150 tables"])]
         self.assertEqual(groups, ["150 tables via message_row_id → _id"])
         # the empty table: hidden, counted, its link only a weaker one
         self.assertEqual(tab.empty_cb.cget("text"), "Show empty tables (1)")
         names = [tab.table_tree.item(i, "text") for i in tab.table_tree.get_children()]
         self.assertNotIn("message_draft", names)
-        self.assertIn("Weaker links (1)", heads)
-        weak = tree.get_children(heads["Weaker links (1)"])
+        self.assertIn("Weaker links: 1 link with 1 table", heads)
+        weak = tree.get_children(heads["Weaker links: 1 link with 1 table"])
         self.assertTrue(tree.item(weak[0], "values")[2].startswith(EMPTY))
         tab.empty_var.set(True)
         tab.refresh()

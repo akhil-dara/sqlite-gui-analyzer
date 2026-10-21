@@ -1,5 +1,5 @@
 """The WAL tab's Stop button is only shown while a comparison runs; an idle Stop
-button is misleading (round 4 UX fix)."""
+button is misleading."""
 import unittest
 from types import SimpleNamespace
 

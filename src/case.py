@@ -39,6 +39,21 @@ class Member(object):
         return self._path
 
     @property
+    def as_of(self):
+        """(commit, commits) when this is the database as of an earlier WAL commit, else
+        None."""
+        session = getattr(self.db, "session", None) if getattr(self.db, "ok", False) else None
+        wal = getattr(session, "wal", None)
+        info = getattr(wal, "as_of_commit", None) if wal is not None else None
+        return info[:2] if info else None
+
+    @property
+    def key(self):
+        """What tells this database apart from the others of the case: its path, and the
+        commit for a view as of an earlier commit (the same files)."""
+        return self._path + ("@commit%d" % self.as_of[0] if self.as_of else "")
+
+    @property
     def size(self):
         fp = self.db.evidence.fingerprints.get("main") if self.db.ok else None
         return fp.size if fp is not None else None
@@ -168,9 +183,15 @@ class Case(object):
             self.active = member
 
     def _rename(self):
-        names = display_names([m.path for m in self.members])
-        for m, n in zip(self.members, names):
-            m.name = n
+        live = [m for m in self.members if not m.as_of]
+        names = dict(zip([id(m) for m in live], display_names([m.path for m in live])))
+        for m in self.members:
+            if m.as_of:                 # the same files as another member: named by commit
+                base_name = next((names[id(o)] for o in live if o.path == m.path),
+                                 os.path.basename(m.path))
+                m.name = "%s @ commit %d of %d" % ((base_name,) + m.as_of)
+            else:
+                m.name = names[id(m)]
 
     def interrupt(self, thread=None):
         """Cancel running SQL in every database (on one worker thread, or all)."""

@@ -175,6 +175,39 @@ def unique_indexes(session, tables):
     return dict((t, cache[t]) for t in tables)
 
 
+def declared_fks(session, table):
+    """{lower column: (parent table, parent column or None)} of the table's declared FOREIGN
+    KEYs (one-column ones), from its CREATE statement replayed in a scratch in-memory
+    database. Cached on the session; {} when the statement cannot be replayed."""
+    cache = session.__dict__.setdefault("_erd_fks", {})
+    if table in cache:
+        return cache[table]
+    out = cache[table] = {}
+    try:
+        sql = rename_create_table(session.info(table).sql, table)
+    except Exception:               # noqa: BLE001 - a table the schema cannot describe
+        return out
+    if not sql or "references" not in sql.lower():
+        return out
+    with sqlsafe.Scratch() as scratch:
+        try:
+            unregistered = register_collations(scratch.conn, session.schema.collations)
+        except Exception:           # noqa: BLE001
+            unregistered = set()
+        try:
+            scratch.replay(replace_collations(sql, unregistered))
+            rows = scratch.pragma("PRAGMA foreign_key_list(%s)" % quote_ident(table))
+        except sqlsafe.SQL_ERRORS:
+            return out
+    groups = {}
+    for r in rows:                  # id, seq, table, from, to, ...
+        groups.setdefault(r[0], []).append(r)
+    for g in groups.values():
+        if len(g) == 1 and isinstance(g[0][3], str):
+            out.setdefault(g[0][3].lower(), (g[0][2], g[0][4]))
+    return out
+
+
 def table_specs(session, tables, rows=None):
     """{table: TableSpec} for tables of one session (rows: table -> row count or None)."""
     uniq = unique_indexes(session, tables)
@@ -1513,19 +1546,22 @@ def _extent(lay, nodes, edges):
 
 
 def _pack(lay, placed, edges):
-    """Put the components side by side in rows (largest first), each moved by its extent."""
+    """Put the components together (largest first) in a block about as wide as it is high
+    on a wide screen: each goes to the lowest free place from the left under those placed
+    before it (a skyline packer), so the small ones fill the room beside a tall one instead
+    of a row of their own under it; each is moved by its extent."""
     if not placed:
         return
-    area = sum((e[2] - e[0]) * (e[3] - e[1]) for _n, e in placed)
-    row_w = max(max(e[2] - e[0] for _n, e in placed), math.sqrt(area) * 1.6)
-    x = y = shelf = 0.0
+    area = sum((e[2] - e[0] + COMP_GAP) * (e[3] - e[1] + COMP_GAP) for _n, e in placed)
+    row_w = max(max(e[2] - e[0] for _n, e in placed), math.sqrt(area) * 1.5)
     rid_of = {}
     for a, b, rid in edges:
         rid_of.setdefault(a, []).append(rid)
+    skyline = [(0.0, row_w, 0.0)]       # (x0, x1, top) of the free line, left to right
     for nodes, (x0, y0, x1, y1) in placed:
-        w, h = x1 - x0, y1 - y0
-        if x > 0 and x + w > row_w:
-            x, y, shelf = 0.0, y + shelf + COMP_GAP, 0.0
+        w, h = x1 - x0 + COMP_GAP, y1 - y0 + COMP_GAP
+        x, y = _skyline_place(skyline, w, row_w)
+        _skyline_raise(skyline, x, x + w, y + h)
         dx, dy = x - x0, y - y0
         for n in nodes:
             c = lay.cards[n]
@@ -1536,8 +1572,47 @@ def _pack(lay, placed, edges):
                 lb = lay.labels.get(rid)
                 if lb is not None:
                     lay.labels[rid] = (lb[0] + dx, lb[1] + dy, lb[2], lb[3])
-        x += w + COMP_GAP
-        shelf = max(shelf, h)
+
+
+def _skyline_place(skyline, w, row_w):
+    """The lowest (then leftmost) x, y where a box w wide rests on the skyline within
+    row_w (a box wider than the row goes at the left, below everything)."""
+    best = None
+    for i, (x0, _x1, _top) in enumerate(skyline):
+        if x0 + w > row_w + 0.5 and i > 0:
+            break
+        top = 0.0
+        for xa, xb, t in skyline[i:]:
+            if xa >= x0 + w:
+                break
+            top = max(top, t)
+        if best is None or top < best[1] - 0.5 or (abs(top - best[1]) <= 0.5 and x0 < best[0]):
+            best = (x0, top)
+    return best if best is not None else (0.0, max(t for _a, _b, t in skyline))
+
+
+def _skyline_raise(skyline, x0, x1, top):
+    """The skyline with [x0, x1) raised to `top` (segments split at the edges, equal
+    neighbours merged)."""
+    out = []
+    for xa, xb, t in skyline:
+        if xb <= x0 or xa >= x1:
+            out.append((xa, xb, t))
+            continue
+        if xa < x0:
+            out.append((xa, x0, t))
+        out.append((max(xa, x0), min(xb, x1), top))
+        if xb > x1:
+            out.append((x1, xb, t))
+    if x1 > out[-1][1]:
+        out.append((out[-1][1], x1, top))
+    merged = []
+    for seg in out:
+        if merged and abs(merged[-1][2] - seg[2]) < 0.5 and abs(merged[-1][1] - seg[0]) < 0.5:
+            merged[-1] = (merged[-1][0], seg[1], seg[2])
+        else:
+            merged.append(seg)
+    skyline[:] = merged
 
 
 # -- cardinality markers (shared by the canvas and the SVG) ------------------------------------

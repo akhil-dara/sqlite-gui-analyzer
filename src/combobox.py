@@ -668,7 +668,7 @@ class SearchableCombobox(ttk.Frame):
         return self._nav(event.keysym)
 
     def _cycle_value(self, step):
-        """Move selection by step through values (DB Browser-style arrow cycling)."""
+        """Move the selection by step through the values (arrow keys cycle them while the list is closed)."""
         if not self._values:
             return
         cur = self.get()
@@ -1382,10 +1382,18 @@ class SearchableCombobox(ttk.Frame):
         if self._dead or self._popup is None:
             return
         f = self._focus_now()
-        if f is None or isinstance(f, (tk.Tk, tk.Toplevel)):
-            # another program has the keyboard focus (the user switched away), or the window
-            # manager handed it to a window itself: the list stays open for when the user
-            # comes back; a click or key in the app closes it
+        if f is None:
+            # another program has the keyboard focus (the user switched away): the list is a
+            # topmost window of its own and would float over that program - it closes, and
+            # the entry keeps what was typed
+            try:
+                self.close(focus=False)
+            except tk.TclError:
+                pass
+            return
+        if isinstance(f, (tk.Tk, tk.Toplevel)):
+            # the window manager handed the focus to a window itself (a click on a title
+            # bar): the list stays for a click or key in the app
             return
         p = str(f)
         if p == str(self.entry) or p.startswith(str(self._popup)):

@@ -14,6 +14,7 @@ cancel() -> True that stops a scan made in Python; an SQL read is stopped by int
 import sqlite3
 
 from database import RID
+from engine import limits
 from engine import timeline as tl
 from engine.backends import Filter
 from engine.filters import parse_words
@@ -69,6 +70,19 @@ class TableSource(object):
         if n is None:
             n = self.db.count_filtered(self.table, flt)
         return flt, n
+
+    def seeks_fast(self):
+        """A window anywhere in the view in force now reads in milliseconds: its position
+        index is complete (without it a window far into the table is an OFFSET scan - 0.6 s
+        at row 2.4 million of a 2.5-million-row table)."""
+        session = getattr(self.db, "session", None)
+        if session is None:
+            return False
+        try:
+            info = session.positions_info(self.table, self.order, self.desc, self.flt)
+        except Exception:               # noqa: BLE001 - unknown: treated as slow
+            return False
+        return bool(info and info.get("complete") and info.get("usable"))
 
     def build_positions(self, cancel=None):
         """Index the positions of the view in force now (see engine.positions), so windows
@@ -387,6 +401,14 @@ class ListSource(object):
         for values, _flags in self._all:
             yield values
 
+    def iter_rows_matching(self, flt):
+        """The rows held passing flt (None: all), the list's own filters ignored."""
+        lead = 1 if self._cols and self._cols[0] == RID else 0
+        data_cols = self._cols[lead:]
+        for values, _flags in self._all:
+            if flt is None or flt.matches(data_cols, list(values[lead:]), self.encoding):
+                yield values
+
     def _rebuild(self):
         lead = 1 if self._cols and self._cols[0] == RID else 0
         data_cols = self._cols[lead:]
@@ -401,3 +423,277 @@ class ListSource(object):
         elif self.desc:
             rows = list(reversed(rows))
         self._view = rows
+
+
+class DerivedColumn(object):
+    """A column the tool derives from another column's values (a field read out of a BLOB /
+    JSON value by engine.decode.fields): name (as the grid shows it), the raw column it is
+    read from, fn(raw value) -> value, and what it is in words (for the header's tooltip)."""
+    __slots__ = ("name", "source", "fn", "about", "row")
+
+    def __init__(self, name, source, fn, about="", row=False):
+        self.name, self.source, self.fn, self.about = name, source, fn, about
+        self.row = row              # fn(value, look) reads other columns: look(name) -> value
+
+
+class DerivedSource(object):
+    """A source with derived columns after the table's own: each row gets the derived
+    values as it is read (the stored rows are never changed). Sorting or filtering ON a
+    derived column cannot be done by the engine, so the rows are then read into memory (up to
+    the limit derived_scan_rows; `note` says when the table was cut) and sorted / filtered
+    there by the same rules as every in-memory list; the engine serves everything else
+    unchanged."""
+
+    threaded = True
+
+    def __init__(self, inner, derived):
+        self.inner = inner
+        self.derived = list(derived)
+        self._names = [d.name for d in self.derived]
+        self._mem = None            # ListSource of the extended rows, in memory mode
+        self._where = None          # column name -> index in the inner rows (on first use)
+        self._sort = (None, False)
+        self._filters = ({}, "")
+        self._cut = None            # rows loaded when the table was larger than the limit
+
+    def __getattr__(self, name):
+        """Everything else (db, table, flt, order...) is the table's source's."""
+        if name.startswith("_") or name == "inner":
+            raise AttributeError(name)
+        return getattr(self.inner, name)
+
+    # -- what the grid asks every source ------------------------------------------------------
+    def columns(self):
+        return list(self.inner.columns()) + self._names
+
+    def seeks_fast(self):
+        """See TableSource.seeks_fast (rows held in memory: always)."""
+        if self._mem is not None:
+            return True
+        hook = getattr(self.inner, "seeks_fast", None)
+        return bool(hook()) if hook is not None else False
+
+    def row_count(self):
+        return self._mem.row_count() if self._mem is not None else self.inner.row_count()
+
+    def _extend(self, values):
+        where = self._where
+        if where is None:
+            where = self._where = dict((c, i) for i, c in enumerate(self.inner.columns()))
+        out = list(values)
+
+        def look(name):
+            k = where.get(name)
+            if k is None:
+                raise KeyError(name)
+            return values[k] if k < len(values) else None
+        for d in self.derived:
+            try:
+                k = where.get(d.source)
+                raw = values[k] if k is not None and k < len(values) else None
+                if d.row:
+                    out.append(d.fn(raw, look))
+                else:
+                    out.append(d.fn(raw) if raw is not None else None)
+            except Exception:           # noqa: BLE001 - a value the field cannot be read from
+                out.append(None)
+        return out
+
+    def rows(self, start, count):
+        if self._mem is not None:
+            return self._mem.rows(start, count)
+        return [(self._extend(v), f) for v, f in self.inner.rows(start, count)]
+
+    def _needs_memory(self):
+        col, _desc = self._sort
+        exprs, _words = self._filters
+        return col in self._names or any(c in self._names for c in exprs)
+
+    def _enter_memory(self):
+        """Read the rows (the engine's filters on the table's own columns applied first)."""
+        cap = limits.get("derived_scan_rows")
+        rows, cut = [], False
+        for values in self.inner.iter_rows():
+            if len(rows) >= cap:
+                cut = True
+                break
+            rows.append((self._extend(values), ()))
+        self._cut = len(rows) if cut else None
+        self._mem = ListSource(self.columns(), rows, encoding=self.encoding)
+
+    def _apply(self):
+        """Put the sort and filters where they belong: the derived ones in memory, the
+        table's own in the engine (so a filter on a real column still narrows the read)."""
+        exprs, words = self._filters
+        own = dict((c, e) for c, e in exprs.items() if c not in self._names)
+        col, desc = self._sort
+        if self._needs_memory():
+            self.inner.set_filters(own, words)
+            if col not in self._names:
+                self.inner.sort(col, desc)
+            self._mem = None
+            self._enter_memory()
+            mine = dict((c, e) for c, e in exprs.items() if c in self._names)
+            self._mem.set_filters(mine, "")
+            if col in self._names:
+                self._mem.sort(col, desc)
+        else:
+            self._mem = None
+            self._cut = None
+            self.inner.set_filters(own, words)
+            self.inner.sort(col, desc)
+
+    def sort(self, column, desc):
+        self._sort = (column, bool(desc))
+        self._apply()
+
+    def set_filters(self, col_exprs, global_text):
+        self._filters = (dict(col_exprs or {}), global_text or "")
+        self._apply()
+
+    @property
+    def filtered(self):
+        exprs, words = self._filters
+        return bool(exprs) or bool((words or "").strip())
+
+    @property
+    def note(self):
+        inner = getattr(self.inner, "note", "") or ""
+        if self._cut is not None:
+            mine = ("sorted / filtered on a derived column over the first %s rows only (limit "
+                    "derived_scan_rows)" % format(self._cut, ","))
+            return (inner + "; " + mine) if inner else mine
+        return inner
+
+    def count_rows(self, cancel=None):
+        if self._mem is not None:
+            return self._mem.count_rows(cancel)
+        return self.inner.count_rows(cancel)
+
+    def set_count(self, flt, n):
+        fn = getattr(self.inner, "set_count", None)
+        if fn is not None:
+            fn(flt, n)
+
+    def iter_rows(self):
+        if self._mem is not None:
+            for values in self._mem.iter_rows():
+                yield values
+        else:
+            for values in self.inner.iter_rows():
+                yield self._extend(values)
+
+    def iter_all(self):
+        for values in self.inner.iter_all():
+            yield self._extend(values)
+
+    @property
+    def encoding(self):
+        return getattr(self.inner, "encoding", "utf-8") or "utf-8"
+
+    @property
+    def column_types(self):
+        return dict(getattr(self.inner, "column_types", {}) or {})
+
+    @property
+    def total(self):
+        return getattr(self.inner, "total", None)
+
+    def release_thread(self):
+        fn = getattr(self.inner, "release_thread", None)
+        if fn is not None:
+            fn()
+
+    def interrupt(self, thread):
+        fn = getattr(self.inner, "interrupt", None)
+        if fn is not None:
+            fn(thread)
+
+    @staticmethod
+    def retryable(error):
+        return TableSource.retryable(error)
+
+    def build_positions(self, cancel=None):
+        fn = getattr(self.inner, "build_positions", None)
+        return fn(cancel) if fn is not None and self._mem is None else None
+
+    # -- the column filter popover ----------------------------------------------------------------
+    def _mem_for(self, flt):
+        """An in-memory list of the rows passing flt's conditions on the table's own columns,
+        for a popover on a derived column (flt is the OTHER columns' filters)."""
+        return ListSource(self.columns(), [(self._extend(v), ()) for v in _capped(
+            self.inner, _own(flt, self._names), limits.get("derived_scan_rows"))],
+            encoding=self.encoding)
+
+    def distinct_values(self, column, flt, limit, scan_rows, cancel=None):
+        import colfilter
+        if column in self._names:
+            return colfilter.generic_distinct(self._mem_for(flt), column, _mine(flt, self._names),
+                                              limit, scan_rows, cancel)
+        return self.inner.distinct_values(column, _own(flt, self._names), limit, scan_rows, cancel)
+
+    def count_matching(self, flt, cancel=None):
+        import colfilter
+        if flt is not None and any(c in self._names for c, _e in flt.col_exprs):
+            return colfilter.source_count(self._mem_for(flt), _mine(flt, self._names), cancel)
+        fn = getattr(self.inner, "count_matching", None)
+        return fn(flt, cancel) if fn is not None else colfilter.source_count(self.inner, flt,
+                                                                             cancel)
+
+    def nth_value(self, column, flt, n, desc, cancel=None):
+        import colfilter
+        if column in self._names:
+            return colfilter.nth_from_rows(self._mem_for(flt).iter_rows_matching(
+                _mine(flt, self._names)), self.columns().index(column), n, desc, cancel)
+        fn = getattr(self.inner, "nth_value", None)
+        return fn(column, _own(flt, self._names), n, desc, cancel) if fn is not None else None
+
+    def date_bins(self, column, flt, kind, most, scan_rows, cancel=None):
+        import colfilter
+        if column in self._names:
+            return colfilter.source_date_bins(self._mem_for(flt), column,
+                                              _mine(flt, self._names), kind, most, scan_rows,
+                                              cancel)
+        fn = getattr(self.inner, "date_bins", None)
+        if fn is not None:
+            return fn(column, _own(flt, self._names), kind, most, scan_rows, cancel)
+        return colfilter.source_date_bins(self.inner, column, _own(flt, self._names), kind,
+                                          most, scan_rows, cancel)
+
+
+def _split(flt, derived_names, keep_derived):
+    """flt with only the conditions on derived columns (keep_derived) or only those on the
+    table's own columns (the engine cannot read the derived ones); None when nothing is left."""
+    if flt is None:
+        return None
+    keep = [(c, e) for c, e in flt.col_exprs if (c in derived_names) == keep_derived]
+    words = [] if keep_derived else list(flt.anywhere)
+    if len(keep) == len(flt.col_exprs) and len(words) == len(flt.anywhere):
+        return flt
+    if not keep and not words:
+        return None
+    return Filter(col_exprs=dict(keep), words=words)
+
+
+def _own(flt, derived_names):
+    return _split(flt, derived_names, False)
+
+
+def _mine(flt, derived_names):
+    return _split(flt, derived_names, True)
+
+
+def _capped(inner, flt, cap):
+    """Up to cap rows of inner passing flt (filters of the source itself ignored)."""
+    names = inner.columns()
+    lead = 1 if names and names[0] == RID else 0
+    data_cols = names[lead:]
+    enc = getattr(inner, "encoding", "utf-8") or "utf-8"
+    n = 0
+    for values in inner.iter_all():
+        if flt is not None and not flt.matches(data_cols, list(values[lead:]), enc):
+            continue
+        yield values
+        n += 1
+        if n >= cap:
+            break

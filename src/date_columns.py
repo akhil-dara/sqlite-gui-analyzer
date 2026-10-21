@@ -3,10 +3,14 @@
 Right-click a column header > Show as date > Auto / Unix s, ms, us, ns / Cocoa / WebKit /
 FILETIME / HFS+ / .NET / OLE / GPS / date text / Off. The grid then draws the converted date
 through its column-formatter hook (grid.DataGrid.set_column_formatter); sorting, filters,
-copies of rows and exports keep the raw values, and the tooltip, the row inspector and 'Copy
+copies of rows keep the raw values, exports keep them and add '<column> (date, UTC)'
+beside them (export_columns), and the tooltip, the row inspector and 'Copy
 raw value' give the raw value. Auto uses the timeline's detector (engine.timeline.judge) on a
 sample of the column. The choice is kept per table with the tags of the database (never next to
-the evidence) and applied again when the table is shown.
+the evidence) and applied again when the table is shown. A column whose name says date or
+time ('strong': created_at, ZCREATEDAT, timestamp) and that has no choice yet is shown as a
+date when its sample reads as one (as the Query and SQL tabs do); Off is remembered, so a
+column turned off stays as stored.
 """
 
 import tkinter as tk
@@ -16,7 +20,7 @@ from engine import limits
 from tokens import FONT as F
 from engine import timeline as tl
 
-SECTION = "date_formats"        # {table: {column: kind or 'auto'}, '_display': {...}}
+SECTION = "date_formats"        # {table: {column: kind, 'auto' or 'off'}, '_display': ...}
 DISPLAY_KEY = "_display"        # {'format': 'iso'/'12h'/'custom', 'custom': strftime}
 # the names of engine.decode.timestamps (the one decoder of the tool), in its order
 CHOICES = tuple((k, tl.LABELS[k]) for k in tl.KINDS)
@@ -69,6 +73,13 @@ class BrowseDates(object):
     def choice(self, table, column):
         return self.saved(table).get(column)
 
+    def turned_off(self, table):
+        """The columns of `table` set to Off by hand (left as stored, never shown as dates
+        on their own)."""
+        tags = getattr(self.app, 'tags', None)
+        per = tags.state_section(SECTION).get(table) if tags is not None else None
+        return set(c for c, k in per.items() if k == tl.OFF) if isinstance(per, dict) else set()
+
     def display_format(self):
         """(format, custom strftime): how 'Show as date' renders dates, everywhere."""
         tags = getattr(self.app, 'tags', None)
@@ -91,8 +102,10 @@ class BrowseDates(object):
     def _store(self, table, column, choice):
         st = self.app.tags.state_section(SECTION)
         per = st.get(table) if isinstance(st.get(table), dict) else {}
-        if choice in (None, tl.OFF):
+        if choice is None:
             per.pop(column, None)
+        elif choice == tl.OFF:
+            per[column] = tl.OFF        # remembered: the automatic date view leaves it alone
         else:
             per[column] = choice
         if per:
@@ -175,9 +188,17 @@ class BrowseDates(object):
 
     # -- applying ---------------------------------------------------------------------------------
     def apply(self, table):
-        """The Browse grid shows `table` now: give its columns their saved date formats."""
-        for column, choice in self.saved(table).items():
+        """The Browse grid shows `table` now: give its columns their saved date formats, and
+        show as dates the columns named like dates with no choice yet (when their sample reads
+        as dates; the stored values stay in copies, exports and the tooltip)."""
+        saved = self.saved(table)
+        for column, choice in saved.items():
             self._apply_one(table, column, choice, quiet=True)
+        off = self.turned_off(table)
+        for column in self.grid.columns():
+            if column in saved or column in off or tl.name_hint(column) != "strong":
+                continue
+            self._apply_one(table, column, tl.AUTO, quiet=True)
 
     def _apply_one(self, table, column, choice, quiet=False):
         cols = self.grid.columns()
@@ -187,7 +208,10 @@ class BrowseDates(object):
             ok, kind = self.known(table, column)
             if not ok:                  # the sample is read on a worker, then applied
                 def then(kind):
-                    if self.table() == table and self.choice(table, column) == tl.AUTO:
+                    # still Auto - chosen, or the automatic view of a column with no choice
+                    now = self.choice(table, column)
+                    if self.table() == table and (now == tl.AUTO or (
+                            now is None and column not in self.turned_off(table))):
                         self._show_kind(table, column, choice, kind, quiet)
                 self.suggest_later(table, column, then)
                 return None
@@ -210,6 +234,19 @@ class BrowseDates(object):
                 self._tell("No date format fits the values of %s: it is shown as stored."
                            % column)
         return kind
+
+    def export_columns(self, table, names):
+        """[(index of the raw column, name of the added column, fn(value) -> date text)] for
+        an export: each column shown as a date keeps its stored value and adds
+        '<column> (date, UTC)' as the grid shows it."""
+        out = []
+        fmt, custom = self.display_format()
+        for i, name in enumerate(names):
+            choice = self.choice(table, name)
+            kind = self.known(table, name)[1] if choice == tl.AUTO else choice
+            if kind in tl.KINDS:
+                out.append((i, "%s (date, UTC)" % name, tl.formatter(kind, fmt, custom)))
+        return out
 
     def set(self, table, column, choice):
         """Show a column as dates of `choice` (a kind, 'auto', or 'off'); remembered."""

@@ -26,7 +26,7 @@ is reported as reused when, between two consecutive versions,
 from ..fileformat.btree import (BTreeReader, INDEX_INTERIOR, INDEX_LEAF, TABLE_INTERIOR,
                                 TABLE_LEAF, cell_pointers, parse_page_header)
 from ..fileformat.record import decode_record_lenient
-from ..fileformat.wal import STALE, UNCOMMITTED
+from ..fileformat.wal import STALE, UNCOMMITTED, commit_no, frame_no
 from .. import limits
 from ..issues import IssueLog
 from ..schema import Locator
@@ -54,7 +54,7 @@ class Version(object):
 
     def where(self):
         if self.file == WAL_FILE:
-            return "WAL frame %s (%s)" % (self.frame, self.frame_state)
+            return "WAL frame %s (%s)" % (frame_no(self.frame), self.frame_state)
         return {"main": "main file", "journal": "journal"}.get(self.file, self.file)
 
     def as_dict(self):
@@ -284,7 +284,13 @@ class Historian(object):
         self._find_error = None
         main_hit = self._find(info, fx.main, key, self._main_root(info),
                               hint_pages=set(v.page for v in obs), cancel=cancel)
-        if self._find_error:
+        root = self._main_root(info)
+        if self._find_error and isinstance(root, int) and (
+                root > getattr(fx.main, "page_count", root)):
+            # the table's root page is beyond the main file: created after the last checkpoint
+            hist.notes.append("this table exists only in the WAL; the main file has no copy of "
+                              "it")
+        elif self._find_error:
             # a read error is not 'not in the main file': say it
             hist.notes.append("the main file could not be read to look for the row: %s "
                               "(it may be there)" % self._find_error)
@@ -394,7 +400,8 @@ class Historian(object):
                 out.append(Version(None, "committed", WAL_FILE, frame=end,
                                    frame_state=fx.session.wal.frames[end].state, commit_group=g,
                                    present=False, order=end,
-                                   note="gone after WAL commit %d (frame %d)" % (g, end)))
+                                   note="gone after WAL commit %d (frame %d)" % (
+                                       commit_no(g), frame_no(end))))
             present = now
         return out
 

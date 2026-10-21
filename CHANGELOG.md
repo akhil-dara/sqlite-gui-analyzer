@@ -3,6 +3,207 @@
 Notable changes in each release. The section of a version is also the text of its GitHub
 release.
 
+## 3.0.0
+
+Deleted-record recovery rebuilt around what examiners need to trust it, a query builder that
+needs no SQL, the values inside BLOBs as columns, and plain words for what a database does by
+itself.
+
+### Highlights
+
+- **Recovered records you can trust.** Every record says what it is - deleted, older version,
+  inserted again, unreferenced page, index entry - where it was found, how sure the match to
+  a table is and why. Copies of live rows are left out, even when the bytes fit several
+  tables; rows on pages nothing references are listed apart (they may be live rows a damaged
+  or manipulated tree hides).
+- **Query without SQL.** Add tables and they join on their links; tick columns; filter with
+  month bars, value lists, number ranges or any SQLite condition; summarise, label values,
+  calculate new columns; across the databases of a case, and over recovered rows too.
+- **Fields inside values.** Open a BLOB or JSON column (plists, NSKeyedArchiver, protobuf,
+  JSON) and use its fields - a payment's sender, receiver and amount - as columns in Query
+  and its exports (also to join other tables), and as columns of their own in Browse
+  (`ƒ sender.name`, `ƒ amount`: sorted, filtered, copied and exported like any column).
+- **Formulas of your own, as new columns.** Right-click a column header › Calculate
+  from…: a formula in Excel-like terms (`round(x / 100, 2)`, `x * qty + fee`,
+  `upper(left(name, 3))`, `x if x > 0 else 0`, `date(x, "ms")`, `json(x, "to.name")`,
+  any column of the row by name; sizes `size(x)`, durations, date parts and zones,
+  conversions between date kinds, hashes, base64 / hex / UTF-8, regular expressions,
+  fields inside JSON, plist, NSKeyedArchiver and protobuf values) or steps (divide,
+  round, thousands, text edits…),
+  checked as you type with a live preview on real rows; the result is a new ƒ= column,
+  sortable and exportable, remembered per table; the stored values never change.
+- **Show as number.** Right-click a column header › Show as number: thousands
+  separators, ÷100 (amounts kept in the smallest unit), ÷1,000, ÷1,000,000, exact for
+  integers, a badge on the header, the stored value kept in copies and beside the shown
+  text in exports; remembered per table and column; works on ƒ columns.
+- **Pick the databases of a folder by your own conditions.** Open Folder goes in three
+  steps - the folder, which files (optional conditions on the file name, path in the
+  folder, folder name, extension or size: is, is not, contains, starts / ends with, matches
+  `*` `?`, at least / at most; all or any of them), then Scan for databases, with a line
+  saying beforehand what the scan will do. Files that do not match are never opened, so a
+  scan of a whole users folder for the files named one way reads only those (890,000 files
+  seen, 1,900 opened, in about a minute). The list fills as databases are found; a stopped
+  scan keeps them and offers Scan again; Tick shown only, and sort by any column.
+- **Drag the scrollbar anywhere in millions of rows.** The rows follow the thumb as it
+  moves (a 2.5-million-row table: every step of a drag shows the rows at the thumb), the
+  scrollbar spans the whole table at once (the row count is no longer held back behind
+  other work on the table), a jump draws about three times faster, and the status line
+  says 'reading rows' only when a read really keeps the view waiting.
+- **Triggers in plain words.** What each trigger does - deletes rows of another table,
+  deletes its own table's old rows, writes a change log, refuses a change, calls an app
+  function - above its SQL; per table, which triggers change it; a recovered record says
+  when its table's rows are deleted or logged by the database itself.
+- **The database as of any commit.** Open a WAL database as it was after any of its commits,
+  beside the live state; the banner says when a checkpoint already copied later commits
+  into the main file.
+- **A recovery says where it is.** The running step - looking for dropped tables,
+  comparing with the live rows of a table, reading the pages - with how far it is, the
+  time left in the step and the time elapsed.
+- **The window keeps up while the engine works.** A recovery or a row-history scan in
+  the background no longer makes scrolling or a tab switch stutter: while you click,
+  type or scroll, the interpreter hands over to the window within a fraction of a
+  millisecond, and back to full speed for the workers when you only watch.
+- **Search results scroll smoothly.** The results list draws only the lines that come
+  into view (a wheel step on a full window of results took 100-400 ms before); the
+  data grids paint the plain rows' stripes and grid lines as one image (about a sixth
+  less work per scroll step).
+- **An illustrated guide.** Help › Open the illustrated guide: one page, light and dark,
+  with diagrams of how a deleted row comes back, where a database keeps traces, what the
+  states and confidences mean, the tabs, reports and the limits.
+
+### Recovery
+
+- A dedicated Recovered Records view: tables overview, records in their table's own columns,
+  a record panel with dates read as dates, Copy / Open / Row history; recovery runs by itself
+  after opening a small database.
+- Recovered: records whose first bytes a freeblock header overwrote (their rowid inferred,
+  and said, when the page leaves one possibility or one live row agrees in every column but
+  one; at most medium confidence); records cut by a newer, shorter one (partial,
+  low confidence); rows written before ALTER TABLE ADD COLUMN; deleted index entries; older
+  cells between the live cells of a page; overflow chains past a freelist trunk; UTF-16
+  databases; hot rollback journals.
+- New states: inserted again (deleted, and the same values are live under another rowid -
+  the record names it), older version also for a row replaced through its UNIQUE key
+  (INSERT OR REPLACE).
+- Fewer false "deleted": a copy of a live row with parts zeroed is a live copy, not an older
+  version; a record whose rowid was overwritten is matched to its live row through the
+  table's UNIQUE index, also in tables too large to compare in memory.
+- Fewer misreadings: a freeblock of a live page is read only as its own table's record;
+  sqlite_sequence holds only a name and a number; a guessed end with a blob or broken text in
+  a text or number column is not a record.
+- Missing row numbers: gaps in a table's rowids, after the last row up to sqlite_sequence,
+  cross-checked with the recovered records.
+- Files that look encrypted are said to be so - also those whose header carries another
+  product's name instead of 'SQLite format 3' (an encrypted database format): an error banner,
+  the warning count, and 'encrypted' in the Overview instead of 0 tables and 0 rows.
+- Search with 'Recovered records' recovers for at most search_recover_seconds (5 minutes by
+  default) per database, shows the pages it is on, keeps its clock running, and says when it
+  stopped at the limit (the Forensics tab recovers without it).
+- Recovery is faster on large phone databases (a 15 MB, 176-table one: 139 s to 55 s), with
+  identical results.
+
+### Browse, Search, Timeline, SQL
+
+- Date columns open as dates when their name and values say so (the stored value kept, the
+  choice remembered); exports add a '(date, UTC)' column beside the stored value.
+- BLOB pictures as thumbnails in the grid; the BLOB inspector opens a decoded value level by
+  level.
+- Search covers recovered records (freeblocks, unallocated space, freed and unreferenced
+  pages, the rollback journal) when asked, and says what it left out; previews start near the
+  match. Every result line says what it is - a live row, a WAL version, a recovered record
+  (with its page and offset, tinted) - and the Kind filter uses the same words.
+- Fields inside a BLOB / JSON column become new columns of the Browse grid (named ƒ field, remembered per table name,
+  in their own colour, said in the status line): sort, filter, copy and export them like any
+  column; the stored value stays untouched.
+- A recovered record's detail window shows its state, where its bytes are (file, page,
+  offset in the page, byte offset in the file, length, WAL frame), why it was read so, every
+  value (copy with a right-click or Ctrl+C, view whole, pretty JSON), and the bytes
+  themselves in a hex view with the record highlighted; Copy ▾ and Save ▾ give the record as
+  JSON, CSV, text or its bytes. Recovered records in Forensics and Browse carry a Byte offset
+  column; reports carry the file path and byte offset of every record.
+- The Query tab: a column's tooltip shows sample values, a card's menu opens the first rows
+  of its table, the column list keeps the actions used most (the rest under More ▾).
+- The navigator marks tables whose rows have older versions (⟲ n) once Forensics counted
+  them - by itself soon after a database with a WAL or journal opens - and a 'Has history'
+  chip lists the databases that have them.
+- Every list's header text sits over its values (left-aligned, right-aligned over numbers).
+- Identifying facts whole, everywhere: databases with the same file name are named by the
+  folders that tell them apart ('History (anu)', 'History (bob)' - never '#2' unless the paths
+  are identical); the Overview shows each database's full path and whole SHA-256, hover
+  repeats them, right-click copies the hash or the line, and Export ▾ copies or saves every
+  database's facts (path, size in bytes, tables, rows, WAL, SHA-256, dates, links, triggers,
+  warnings) as CSV, JSON or text; the search scope dialog shows each database's path.
+- Links between databases: the same column of a same-named table in another database (ten
+  Chrome profiles' meta.key) is a copy of that table, counted as 'the same table in N
+  databases' and never drawn as a link.
+- The HTML forensic report reads for analysis: the records table leads with the state,
+  table, rowid, confidence and a preview; the whole record and its provenance open in the
+  drawer; the recovery's numbers are words; audit findings' details are lists.
+- Timeline and column filters draw the busy part of the dates, with the far ones counted at
+  the ends; 0 and -1 are 'not set', never 1970.
+- SQL completion for tables, columns, keywords and functions; result columns that hold dates
+  are shown as dates.
+
+### Cases, Overview, Relationships
+
+- A new case lands on the Overview with its largest database active; the date range shown is
+  the span most date columns share; links between databases show their progress; a Triggers
+  column per database.
+- The relationship diagram opens readable; a table's panel lists its triggers.
+- A row window opened while the links are still being worked out gets its Related (N)
+  buttons once they are known; it opens faster (one window fewer for each line).
+- The Limits window groups every limit by area; Help starts with Getting started.
+
+### Fixes
+
+- A date column holding one date in the future (an end time, an expiry) is no longer read
+  in another format decades away: the reading with most dates in the past and nearest to
+  now wins (a Core Data end time: 2025-2030, not 1994-1999).
+- A row window's date says which reading it shows and why ('found for the whole column',
+  as the Timeline reads it); 'Read as: 1 other ▾' lists what the same number would mean in
+  another format.
+- The WAL tab is always there: a database without a -wal file gets a plain statement of
+  that, why, which databases of the case have one, and how a WAL is read when there is
+  one (the tab no longer comes and goes, and switching the active database no longer
+  jumps to the SQL tab).
+- Forensics: the record panel's buttons are never cut off in a narrow panel; the facts
+  at the top of the Bytes window and the recovered record window (page, byte offset,
+  path, state) are selectable and copyable.
+- The window no longer freezes for seconds while a recovery builds the live index of a
+  very large table (the issue counter waited on the scan's lock); grids reset on a tab
+  switch without a layout pass.
+- Forensics: with recovered records shown the panes no longer resize in a loop (the
+  records grid redrew without end and the tab felt stuck).
+- Relationships diagram: Auto-arrange of a large case keeps the cards readable (fitted
+  whole, every card was drawn empty); Fit still shows everything.
+- Closing the window with a database open asks first, and says the evidence is checked
+  once more on closing.
+- The window comes to the front when the tool starts (it could appear behind the window
+  it was started from, until clicked).
+- Row detail: a wide text lost its last letter and a long one its end (a field sized by
+  character count); values are measured now and a long one wraps whole.
+- Relationships diagram: Auto-arrange packs the blocks of tables beside a tall one
+  instead of in rows under it (a third less height on a six-database case).
+- Clearer counts and names: the navigator has column headings and a database's total
+  waits for the exact count; empty tables say 0, not ~0; values show SQLite type names
+  everywhere; Search filters are named like the list's headings; a table card counts
+  links and tables; the Scope dialog says what each number counts; the Overview and
+  Timeline say what their figures are; Row History explains where a version was seen.
+- Many layout fixes at small sizes and high scaling, dark theme contrast (tagged rows, WAL
+  windows), and wording that says when a list or result was cut off.
+- Searchable dropdown lists close when another program takes the focus (they no longer float
+  over it).
+
+### Windows builds
+
+- The portable build is the zip of the program folder; there is no self-extracting single
+  file any more (such files, which unpack a Python runtime into a temporary folder on each
+  start, are what some virus scanners flag by heuristics). The installer wraps the same
+  folder. PyInstaller's start-up code is compiled for each release instead of the shared
+  prebuilt one, and no TLS code is bundled (the program never opens a connection).
+- The installer and the portable folder carry LICENSE and THIRD-PARTY-NOTICES (the
+  bundled software and its licenses).
+
 ## 2.1.0
 
 A large update: a new look with light and dark themes, many databases opened as one case,

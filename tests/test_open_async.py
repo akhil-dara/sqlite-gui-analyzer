@@ -2,6 +2,7 @@
 after the other, each joins the case (and the navigator) as soon as it is open, a progress
 window with Stop shows when it takes a while, and Close or a new open abandons the rest."""
 
+import os
 import threading
 import time
 
@@ -56,7 +57,10 @@ class OpenAsyncTest(AppCase):
             main = threading.main_thread()
             self.assertEqual(len(threads), 16)
             self.assertTrue(all(t is not main for t in threads))
-            self.assertIs(app.case.active, list(app.case)[0])
+            # a new case shows its largest database first (not the one that sorts first)
+            biggest = max(app.case, key=lambda m: os.path.getsize(m.path))
+            self.assertIs(app.case.active, biggest)
+            self.assertIs(app._nb.nametowidget(app._nb.select()), app._overview)
             self.assertIn("16 databases", app._db_info.full_text())
             self.assertEqual(len(app._navigator.db_lines()), 16)
             self.assertEqual([j for j in app._jobs if "Opening" in j.title], [])

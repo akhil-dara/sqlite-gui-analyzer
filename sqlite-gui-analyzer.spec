@@ -7,7 +7,10 @@
 Keep DIST and WORK outside the source tree. The build produces, in DIST:
     SQLiteGUIAnalyzer/SQLiteGUIAnalyzer.exe    onedir build: starts fast; the installer and the
                                                portable zip are made from this folder
-    SQLiteGUIAnalyzer-<version>-portable.exe   onefile build: one self-extracting exe
+There is no onefile build: a self-extracting exe that unpacks a Python runtime into %TEMP% is
+what heuristic virus scanners flag most (the same program as a folder is not), and the folder
+starts faster. The release workflow builds PyInstaller's bootloader from source for the same
+reason: the prebuilt bootloader is shared by every PyInstaller program, good and bad.
 The version is VERSION in src/constants.py; the Windows version resource is generated from it.
 """
 
@@ -49,6 +52,8 @@ EXCLUDES = [
     "pkg_resources", "ensurepip", "venv", "idlelib", "turtle", "turtledemo", "tkinter.test",
     "test", "xmlrpc", "numpy", "IPython", "matplotlib", "PyQt5", "PyQt6", "PySide2", "PySide6",
     "PIL._avif",
+    # the app never opens a connection: no TLS module (nor its DLL) in the bundle
+    "ssl", "_ssl",
 ]
 
 a = Analysis(
@@ -92,16 +97,6 @@ EXE_OPTIONS = dict(
 )
 
 # onefile: SQLiteGUIAnalyzer-<version>-portable.exe
-portable_exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name="%s-%s-portable" % (APP_ID, VERSION),
-    runtime_tmpdir=None,
-    **EXE_OPTIONS
-)
 
 # onedir: SQLiteGUIAnalyzer/SQLiteGUIAnalyzer.exe (+ _internal/)
 onedir_exe = EXE(

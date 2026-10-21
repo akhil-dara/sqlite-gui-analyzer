@@ -37,7 +37,7 @@ from grid import Runner
 from jobs import manifest_text, write_export_manifest
 from utils import write_allowed
 from widgets import SearchBox, release_variables
-from widgets import fit_geometry
+from widgets import fit_geometry, wrap_to_width
 
 POLL_MS = 80
 FORMATS = (("markdown", "Markdown"), ("json", "JSON"), ("sql", "SQL"))
@@ -848,7 +848,9 @@ class DatabaseMapWindow(_Window):
         ttk.Label(self, text="%s: %s" % ("Active database" if self.multi else "Database",
                                          dm.database_name(s)), style="B.TLabel").pack(
             anchor="w", pady=(12, 0), **pad)
-        ttk.Label(self, text=s.evidence.main, style="M.TLabel").pack(anchor="w", **pad)
+        # the whole path, wrapped (a long evidence path was cut at the window's edge)
+        wrap_to_width(ttk.Label(self, text=s.evidence.main, style="M.TLabel")).pack(
+            fill="x", anchor="w", **pad)
         if self.multi:
             # a case of several databases: the active one, or all of them in one map
             rel = self.manager._rel()
@@ -902,6 +904,8 @@ class DatabaseMapWindow(_Window):
         self.stage.pack(fill="x", pady=(14, 2), **pad)
         self.bar = ttk.Progressbar(self, mode="determinate", maximum=1.0)
         self.bar.pack(fill="x", **pad)
+        self.bar.pack_forget()          # shown while an export runs (an empty band otherwise)
+        self._bar_pad = pad
         self.status = ttk.Label(self, text="", style="M.TLabel", anchor="w", wraplength=690,
                                 justify="left")
         self.status.pack(fill="x", pady=(6, 0), **pad)
@@ -1015,6 +1019,7 @@ class DatabaseMapWindow(_Window):
             self.stop_btn.pack_forget()
             self.export_btn.configure(state="normal")
             self.bar.configure(value=0)
+            self.bar.pack_forget()
             if error is not None:
                 self.stage.configure(text="")
                 self.status.configure(text="Failed: %s" % error)
@@ -1052,6 +1057,8 @@ class DatabaseMapWindow(_Window):
         self.export_btn.configure(state="disabled")
         self.stop_btn.pack(side="left", padx=3)
         self.stage.configure(text="Starting…")
+        if not self.bar.winfo_manager():
+            self.bar.pack(fill="x", after=self.stage, **self._bar_pad)
         self.status.configure(text="Writing %s" % path)
         self.run("map", work, done)
         return True
@@ -1072,6 +1079,48 @@ class DatabaseMapWindow(_Window):
         if self.result_path:
             self.clipboard_clear()
             self.clipboard_append(self.result_path)
+
+
+# the areas the Limits window groups the limits under: (title, name prefixes or names), the
+# first that fits a limit's name; what fits none is under 'Other'
+LIMIT_AREAS = (
+    ("Opening and the evidence", ("ram_overlay_", "auto_recover_", "hash_", "verify_",
+                                  "live_hash_", "folder_scan_", "wal_", "schema_", "native_",
+                                  "btree_", "issues_")),
+    ("Cases of several databases", ("case_",)),
+    ("Browse grid and lists", ("grid_", "cell_", "checkpoint", "position_", "clipboard_",
+                               "value_", "preview_", "lookup_", "filter_", "dropdown_",
+                               "palette_", "ui_stall_")),
+    ("SQL and Query tabs", ("sql_", "query_", "blob_fields_")),
+    ("Forensics (deleted records, history)", ("carve_", "forensics_", "journal_", "audit_",
+                                              "missing_keys_", "live_index_", "history_")),
+    ("Timeline and Overview", ("timeline_", "overview_")),
+    ("Relationships and links", ("relations_", "crossdb_", "related_", "diagram_")),
+    ("Decoding BLOBs (plists, protobuf, compressed)", ("decode_", "protobuf_", "typedstream_",
+                                                       "summary_")),
+    ("Database Map", ("map_",)),
+    ("Exports and tags", ("html_", "markdown_", "tag_")),
+)
+
+
+def limit_area(name):
+    for title, prefixes in LIMIT_AREAS:
+        if name.startswith(prefixes):
+            return title
+    return "Other"
+
+
+def limit_display(name, value):
+    """A limit's value as the list shows it: 268,435,456 - and for a size in bytes
+    '268,435,456 (256 MB)'; text that is not a whole number as typed."""
+    try:
+        v = int(str(value).strip().replace(",", ""))
+    except ValueError:
+        return str(value)
+    if "bytes" in name and v >= 1024:
+        from utils import fmtb
+        return "%s (%s)" % (format(v, ","), fmtb(v))
+    return format(v, ",")
 
 
 class LimitsWindow(tk.Toplevel):
@@ -1122,8 +1171,8 @@ class LimitsWindow(tk.Toplevel):
         self.tree = ttk.Treeview(outer, columns=("value", "status", "what"), show="tree headings",
                                  selectmode="browse")
         for col, text, width, stretch in (("#0", "Limit", 220, False),
-                                          ("value", "Value", 110, False),
-                                          ("status", "", 190, False),
+                                          ("value", "Value", 170, False),
+                                          ("status", "", 150, False),
                                           ("what", "What it limits", 320, True)):
             self.tree.heading(col, text=text, anchor="w")
             self.tree.column(col, width=width, stretch=stretch, anchor="w")
@@ -1137,11 +1186,19 @@ class LimitsWindow(tk.Toplevel):
         self.vars = {}
         self._rows = {}                 # name -> (tree item, what it limits)
         self._status = {}               # name -> (text, colour) beside its value
+        # grouped by area (a title row each, open), the limits A-Z inside
+        self.tree.tag_configure("area", font=F["body_bold"])
+        titles = [t for t, _p in LIMIT_AREAS] + ["Other"]
+        used = set(limit_area(n) for n in lim.LIMITS)
+        self._areas = collections.OrderedDict(
+            (t, self.tree.insert("", "end", text=t, open=True, tags=("area",)))
+            for t in titles if t in used)
         for name in sorted(lim.LIMITS):
             default, lo, hi, what = lim.LIMITS[name]
             var = tk.StringVar(self, value=str(current[name]))
             text = "%s (%s to %s)" % (what, format(lo, ","), format(hi, ","))
-            iid = self.tree.insert("", "end", text=name, values=(var.get(), "", text))
+            iid = self.tree.insert(self._areas[limit_area(name)], "end", text=name,
+                                   values=(limit_display(name, var.get()), "", text))
             self.vars[name] = var
             self._rows[name] = (iid, text)
             var.trace_add("write", lambda *_a, n=name: self._mark(n))
@@ -1151,7 +1208,7 @@ class LimitsWindow(tk.Toplevel):
         self.tree.bind("<Double-1>", lambda e: self._edit_now())
         self.tree.bind("<Return>", lambda e: self._edit_now())
         self.entry.bind("<Return>", lambda e: (self.tree.focus_set(), "break")[1])
-        first = self.tree.get_children()
+        first = self.shown_items()
         if first:
             self.tree.selection_set(first[0])
             self.tree.focus(first[0])
@@ -1180,7 +1237,7 @@ class LimitsWindow(tk.Toplevel):
         iid = self._rows[name][0]
         if not self.tree.exists(iid):
             return
-        if iid not in self.tree.get_children():
+        if iid not in self.shown_items():
             self.find_var.set("")
         self.tree.selection_set(iid)
         self.tree.see(iid)
@@ -1226,13 +1283,14 @@ class LimitsWindow(tk.Toplevel):
         if problem:
             text, colour, tag = "not valid: %s" % problem.split(": ", 1)[1], C["red"], "bad"
         elif v != default:
-            text, colour, tag = ("changed (default %s)" % format(default, ","), C["orange"],
-                                 "changed")
+            text, colour, tag = ("changed (default %s)" % limit_display(name, default),
+                                 C["orange"], "changed")
         else:
-            text, colour, tag = "default %s" % format(default, ","), C["text2"], ""
+            text, colour, tag = "default", C["text2"], ""     # the value beside says it
         self._status[name] = (text, colour)
         try:
-            self.tree.item(iid, values=(self.vars[name].get(), text, what),
+            self.tree.item(iid, values=(limit_display(name, self.vars[name].get()), text,
+                                        what),
                            tags=(tag,) if tag else ())
         except tk.TclError:
             pass
@@ -1243,19 +1301,32 @@ class LimitsWindow(tk.Toplevel):
         """Names of the limits whose value differs from the default now."""
         return [n for n in self.vars if self._check_one(n)[0] not in (None, lim.DEFAULTS[n])]
 
+    def shown_items(self):
+        """The tree items of the limits listed now (under their areas), in list order."""
+        return [i for a in self.tree.get_children() for i in self.tree.get_children(a)]
+
     def _filter(self):
-        """Show the limits whose name or description holds the Find text."""
+        """Show the limits whose name or description holds the Find text (an area with
+        none of them is left out)."""
         q = self.find_var.get().strip().lower()
         n = 0
+        kept = dict((a, 0) for a in self._areas)
         for name in sorted(self._rows):
             iid, what = self._rows[name]
-            show = not q or q in name.lower() or q in what.lower()
+            area = limit_area(name)
+            show = not q or q in name.lower() or q in what.lower() or q in area.lower()
             if show:
-                self.tree.move(iid, "", n)          # reattached, in name order
+                self.tree.move(iid, self._areas[area], kept[area])   # reattached, A-Z
+                kept[area] += 1
                 n += 1
             else:
                 self.tree.detach(iid)
-        shown = self.tree.get_children()
+        for k, (area, aiid) in enumerate(self._areas.items()):
+            if kept[area]:
+                self.tree.move(aiid, "", k)
+            else:
+                self.tree.detach(aiid)
+        shown = self.shown_items()
         if shown and not set(self.tree.selection()) & set(shown):
             self.tree.selection_set(shown[0])
             self.tree.focus(shown[0])

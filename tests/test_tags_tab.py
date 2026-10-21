@@ -9,7 +9,8 @@ from unittest import mock
 from tests.helpers import TempDirTest, tk_root
 from engine import tags as T
 from engine.schema import Locator
-from engine.tags import TagStore, entry_from_db_row, tint
+from engine.tags import TagStore, entry_from_db_row
+from tagging import row_tint as tint
 
 N_ROWS = 12000          # well past the old 5,000-line cap
 
@@ -146,6 +147,27 @@ class TagsTabTest(TempDirTest):
         tab.refresh()
         self.assertEqual(tab.grid.row_count(), 10)
         self.assertEqual(len(tab.scope_entries("filtered")[0]), 10)
+
+
+class RowTintTest(unittest.TestCase):
+    """A tagged row's background is read under the theme's text: light on the light theme
+    (lighter than a selection), dark on the dark theme (it was a light wash under light text)."""
+
+    @staticmethod
+    def luminance(color):
+        r, g, b = (int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    def test_both_themes(self):
+        import tokens
+        from tagging import row_tint
+        saved = tokens.current_theme()
+        self.addCleanup(tokens.set_theme, saved)
+        for color in ("#1f6feb", "#8250df", "#d29922", "#cf222e"):
+            tokens.set_theme("light")
+            self.assertGreater(self.luminance(row_tint(color)), 0.8, color)
+            tokens.set_theme("dark")
+            self.assertLess(self.luminance(row_tint(color)), 0.3, color)
 
 
 if __name__ == "__main__":

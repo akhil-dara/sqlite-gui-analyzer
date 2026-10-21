@@ -158,16 +158,18 @@ def id_values(values):
     return len(set(ints)) >= get(MIN_FOUND) and any(not -1 <= v <= 9 for v in ints)
 
 
-def profile_integers(key, session, cancel=None, problems=None):
+def profile_integers(key, session, cancel=None, problems=None, only=None):
     """[IntProfile] of the integer id columns of one database: each table's key (INTEGER
     PRIMARY KEY, or an INTEGER column id / _id / Z_PK) and the INTEGER columns with an id-like
-    name (chat_row_id, contact_id), whose samples pass id_values()."""
+    name (chat_row_id, contact_id), whose samples pass id_values(). only: these tables."""
     out = []
     m = relation_map(session)
     m.build()
     for t in m.tables:
         if cancel is not None and cancel():
             break
+        if only is not None and t not in only:
+            continue
         try:
             info = session.info(t)
             if session.source(t) == "unavailable":
@@ -212,7 +214,7 @@ def profile_integers(key, session, cancel=None, problems=None):
     return out
 
 
-def integer_pairs(profiles, maps, min_shared=None):
+def integer_pairs(profiles, maps, min_shared=None, same=None):
     """[(profile a, profile b, shared sampled values, rule)] of integer id columns of different
     databases that are named as one (see the module doc), whose value ranges overlap and
     whose samples share at least min_shared values. For a key and a column naming its table,
@@ -232,6 +234,9 @@ def integer_pairs(profiles, maps, min_shared=None):
         shared = len(set(a.values) & set(b.values))
         if shared >= min_shared:
             seen.add(pair)
+            if same_table(a, b):
+                note_same(same, a, b)   # a copy of the table, not a link
+                return
             out.append((a, b, shared, rule))
 
     local = set(p.key for p in profiles if maps[p.db].name_target(p.column) is not None)
@@ -262,12 +267,14 @@ def integer_pairs(profiles, maps, min_shared=None):
     return out
 
 
-def profile_database(key, session, cancel=None, progress=None, problems=None):
+def profile_database(key, session, cancel=None, progress=None, problems=None, only=None):
     """[Profile] of the identifier-like text columns of one database (key names it).
     Columns declared INTEGER or REAL are skipped; a column qualifies when at least
-    IDENTIFIER_SHARE of its sampled text looks like identifiers and MIN_DISTINCT do."""
+    IDENTIFIER_SHARE of its sampled text looks like identifiers and MIN_DISTINCT do.
+    only: these tables (the Query tab asks about the tables of a query)."""
     out = []
-    tables = [n for n in session.schema.names("table") if not n.lower().startswith("sqlite_")]
+    tables = [n for n in session.schema.names("table") if not n.lower().startswith("sqlite_")
+              and (only is None or n in only)]
     for i, t in enumerate(tables):
         if cancel is not None and cancel():
             break
@@ -318,10 +325,27 @@ def profile_database(key, session, cancel=None, progress=None, problems=None):
     return out
 
 
-def candidate_pairs(profiles, min_shared=None):
+def same_table(a, b):
+    """True when a and b are the same column of the same-named table in two databases: a
+    copy of one app's table (another profile or user of the app), never a reference from
+    one to the other."""
+    return a.db != b.db and a.table.lower() == b.table.lower() and \
+        a.column.lower() == b.column.lower()
+
+
+def note_same(same, a, b):
+    """Count a same-table pair under its (table, column), per database."""
+    if same is not None:
+        key = (a.table, a.column)
+        same.setdefault(key, set()).update((a.db, b.db))
+
+
+def candidate_pairs(profiles, min_shared=None, same=None):
     """[(profile a, profile b, shared sampled values)] for columns of different databases
     whose samples share at least min_shared values, most shared first. A value found in
-    more than crossdb_common_value_columns columns (a default, a placeholder) links nothing."""
+    more than crossdb_common_value_columns columns (a default, a placeholder) links nothing.
+    The same column of a same-named table in two databases is not a candidate (a copy of the
+    table, see same_table): it is counted in `same` {(table, column): databases} instead."""
     if min_shared is None:
         min_shared = get(MIN_SHARED)
     common = get("crossdb_common_value_columns")
@@ -341,7 +365,14 @@ def candidate_pairs(profiles, min_shared=None):
                     continue
                 k = (owners[x], owners[y])
                 shared[k] = shared.get(k, 0) + 1
-    out = [(profiles[i], profiles[j], n) for (i, j), n in shared.items() if n >= min_shared]
+    out = []
+    for (i, j), n in shared.items():
+        if n < min_shared:
+            continue
+        if same_table(profiles[i], profiles[j]):
+            note_same(same, profiles[i], profiles[j])
+            continue
+        out.append((profiles[i], profiles[j], n))
     out.sort(key=lambda t: (-t[2], t[0].key, t[1].key))
     return out
 
@@ -474,6 +505,7 @@ class CrossResult(object):
     def __init__(self):
         self.links, self.profiles, self.problems = [], {}, []
         self.int_profiles = {}      # database key -> integer id columns profiled
+        self.same_tables = {}       # (table, column) -> databases holding a copy of it
         self.candidates = 0
         self.unchecked = 0          # candidate pairs left out by the crossdb_max_pairs limit
         self.profile_seconds = self.check_seconds = 0.0
@@ -481,6 +513,18 @@ class CrossResult(object):
 
     def confident(self):
         return [l for l in self.links if l.confident]
+
+    def same_text(self, most=5):
+        """'the same table in several databases (copies of one app's tables, listed apart,
+        not links): meta.key in 10 databases, urls.url in 10 databases, …' or ''."""
+        if not self.same_tables:
+            return ""
+        items = sorted(self.same_tables.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        parts = ["%s.%s in %d databases" % (t, c, len(dbs)) for (t, c), dbs in items[:most]]
+        more = len(items) - most
+        return ("the same table in several databases (copies of one app's tables, listed "
+                "apart, not links): %s%s" % (", ".join(parts),
+                                             " and %d more" % more if more > 0 else ""))
 
     def limits_text(self):
         """What the limits left out or how the columns were sampled, in plain words."""
@@ -492,9 +536,11 @@ class CrossResult(object):
         return "; ".join(out)
 
 
-def find_links(databases, cancel=None, progress=None):
+def find_links(databases, cancel=None, progress=None, tables=None):
     """Links between the given databases [(key, session)], checked by their values (see the
-    module doc). progress(step, done, total) with step 'profile' or 'check'."""
+    module doc). progress(step, done, total) with step 'profile' or 'check'. tables:
+    {key: set of table names} to look at only those tables of a database."""
+    tables = tables or {}
     res = CrossResult()
     t0 = time.perf_counter()
     profiles, ints, maps = [], [], {}
@@ -506,17 +552,19 @@ def find_links(databases, cancel=None, progress=None):
         if progress is not None:
             progress("profile", i, len(databases))
         uiyield.pause()
-        got = profile_database(key, session, cancel, problems=res.problems)
+        got = profile_database(key, session, cancel, problems=res.problems,
+                               only=tables.get(key))
         res.profiles[key] = len(got)
         profiles.extend(got)
         maps[key] = relation_map(session)
-        got = profile_integers(key, session, cancel, problems=res.problems)
+        got = profile_integers(key, session, cancel, problems=res.problems,
+                               only=tables.get(key))
         res.int_profiles[key] = len(got)
         ints.extend(got)
     res.profile_seconds = time.perf_counter() - t0
     t1 = time.perf_counter()
-    pairs = [(a, b, n, "") for a, b, n in candidate_pairs(profiles)]
-    pairs.extend(integer_pairs(ints, maps))
+    pairs = [(a, b, n, "") for a, b, n in candidate_pairs(profiles, same=res.same_tables)]
+    pairs.extend(integer_pairs(ints, maps, same=res.same_tables))
     pairs.sort(key=lambda t: (-t[2], t[0].key, t[1].key))    # the most shared first
     res.candidates = len(pairs)
     cap = get(MAX_PAIRS)

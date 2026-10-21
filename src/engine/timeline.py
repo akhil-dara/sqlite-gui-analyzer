@@ -115,6 +115,18 @@ def name_tokens(name):
     return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
 
 
+_LONG_POS = tuple(w for w in _POS if len(w) >= 5)
+
+
+def _compound_date(tok):
+    """One run-together word that names a date: an all-capitals Core Data name gives no word
+    breaks, so ZCREATEDAT is 'createdat' - a date word then 'at'/'on' (createdat, updatedon),
+    or ending in a long date word (lastmodified, firstseen is 'seen': too short, left out)."""
+    if len(tok) > 4 and tok[-2:] in ("at", "on") and tok[:-2] in _POS:
+        return True
+    return any(tok.endswith(w) and len(tok) > len(w) for w in _LONG_POS)
+
+
 def name_hint(name, decl_type=""):
     """'strong' when a name or declared type says date/time, 'weak' for start/end/last...,
     'never' for names that say what else the column holds (ending in id, count, size, number,
@@ -130,6 +142,8 @@ def name_hint(name, decl_type=""):
     if "DATE" in decl or "TIME" in decl:
         return "strong"
     if any(t in _POS for t in toks) or re.search(r"date|time|stamp", low):
+        return "strong"
+    if any(_compound_date(t) for t in toks):
         return "strong"
     if any(t in _WEAK for t in toks):
         return "weak"
@@ -274,6 +288,17 @@ def format_dt(dt, fmt="iso", custom=""):
     return fmt_time(dt)
 
 
+def utc_text(when):
+    """A decoded date's text with its zone: 'YYYY-MM-DD HH:MM:SS UTC' (unchanged when it
+    already names one, or says 'not set')."""
+    if not when or "not set" in when:
+        return when
+    tail = when.rstrip()
+    if tail.endswith(("UTC", "Z", "GMT")) or tail[-6:-5] in ("+", "-") and tail[-3:-2] == ":":
+        return when
+    return when + " UTC"
+
+
 def formatter(kind, fmt="iso", custom=""):
     """fn(value) -> the value as a date text in the display format, or None when it is no
     date of that kind. Sentinel values (-1, 0, ...) are not dates: they read '0 (not set)',
@@ -406,6 +431,32 @@ def _as_number(v):
     return None
 
 
+def is_unset(raw):
+    """0, -1 and empty text in a date column mean 'not set', never a date at the epoch."""
+    if raw is None or isinstance(raw, bool):
+        return False
+    if isinstance(raw, str) and not raw.strip():
+        return True
+    n = _as_number(raw)
+    return n is not None and n in (0, -1)
+
+
+def _count_unset(unset, table, column):
+    if unset is not None:
+        unset[(table, column)] = unset.get((table, column), 0) + 1
+
+
+def unset_note(unset):
+    """One note for the values left out as 'not set' ({(table, column): n})."""
+    if not unset:
+        return None
+    total = sum(unset.values())
+    parts = ", ".join("%s.%s (%s)" % (t, c, format(n, ",")) for (t, c), n in
+                      sorted(unset.items(), key=lambda x: -x[1]))
+    return "%s unset date value%s (0, -1 or empty) left out: %s" % (
+        format(total, ","), "" if total == 1 else "s", parts)
+
+
 class Guess(object):
     """What the detector concluded about one column's values."""
     __slots__ = ("kind", "score", "matched", "considered", "unset", "first", "last", "hint",
@@ -502,7 +553,11 @@ def judge(name, values, decl_type="", now=None, lo_year=LO_YEAR, hi_year=HI_YEAR
         else:
             fut = from_utc(now + timedelta(days=366), kind)
             past = sum(1 for n in hits if n <= fut)
-        scored.append(((len(hits), past, -abs((median - now).total_seconds()), -rank),
+        # 'mostly in the past' (three quarters or more), then the nearest to now: a single
+        # date in the future (an end time, an expiry) must not hand the column to a reading
+        # decades away (a Core Data end-time column: Cocoa 2025-2030, not Unix 1994-1999)
+        mostly_past = past * 4 >= len(hits) * 3
+        scored.append(((len(hits), mostly_past, -abs((median - now).total_seconds()), -rank),
                        kind, hits, dts))
     if not scored:
         g.reason = "%s; none of %d sampled values reads as a date %d-%d" % (
@@ -830,6 +885,7 @@ class EventSet(object):
     def __init__(self):
         self.events, self.notes, self.counts, self.capped = [], [], {}, []
         self.seconds, self.cancelled = 0.0, False
+        self.unset = {}                 # {(table, column): values left out as 'not set'}
 
 
 def _short(v):
@@ -842,8 +898,92 @@ def _short(v):
     return s if len(s) <= DESC_CHARS else s[:DESC_CHARS] + "…"
 
 
-def describe(columns, values):
-    return ", ".join("%s=%s" % (c, _short(v)) for c, v in zip(columns, values) if v is not None)
+def describe(columns, values, links=None):
+    """'url=3 (https://example.org/), title=Home': each describing value, with the value it
+    stands for in a linked table when links ({column: {stored value: linked text}}) has it."""
+    out = []
+    for c, v in zip(columns, values):
+        if v is None:
+            continue
+        text = "%s=%s" % (c, _short(v))
+        hit = links.get(c) if links else None
+        if hit:
+            shown = hit.get(_link_key(v))
+            if shown is not None:
+                text += " (%s)" % _short(shown)
+        out.append(text)
+    return ", ".join(out)
+
+
+def _link_key(v):
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return v if isinstance(v, (int, str)) else None
+
+
+_SHOW_NAMES = re.compile(r"(?:^|_)(?:display_?name|full_?name|name|title|subject|label|url|"
+                         r"nickname|description|text|address|email|number)$", re.I)
+
+
+def link_lookups(session, descriptions, cancel=None):
+    """{table: {column: {stored value: linked text}}} for the describing columns that have a
+    trusted link out to another table's key (engine.relations: a declared foreign key or one
+    verified by values), shown by the linked table's name / title / url-like text column; and
+    notes (a linked table read only in part, limit lookup_rows). Only tables SQLite reads."""
+    from .relations import ROWID, relation_map
+    out, notes = {}, []
+    try:
+        rmap = relation_map(session)
+        rmap.build()
+    except Exception:                   # noqa: BLE001 - no links: plain descriptions
+        return out, notes
+    cap = limits.get("lookup_rows")
+    for table, cols in (descriptions or {}).items():
+        for col in cols:
+            if cancel is not None and cancel():
+                return out, notes
+            try:
+                rels = rmap.confident(table, col, cancel) or []
+            except Exception:           # noqa: BLE001 - this column stays plain
+                continue
+            rel = next((r for r in rels if r.direction == "out" and r.other != table), None)
+            if rel is None:
+                continue
+            other, key = rel.other, rel.other_column
+            try:
+                info = session.info(other)
+                if session.source(other) != "sql":
+                    continue
+                names = [c.name for c in info.columns if c.hidden != 1 and
+                         (key is ROWID or c.name.lower() != str(key).lower())]
+                show = next((n for n in names if _SHOW_NAMES.search(n)), None)
+                if show is None:
+                    continue
+                kexpr = info.rowid_name if key is ROWID else quote_ident(key)
+                if kexpr is None:
+                    continue
+                cur = session.conn().execute("SELECT %s, %s FROM %s LIMIT ?" % (
+                    kexpr, quote_ident(show), quote_ident(other)), (cap + 1,))
+                try:
+                    rows = cur.fetchall()
+                finally:
+                    _close_cursor(cur)
+            except (sqlite3.Error, KeyError, AttributeError):
+                continue
+            if len(rows) > cap:
+                rows = rows[:cap]
+                notes.append("%s.%s: linked values read for the first %s rows of %s only "
+                             "(limit lookup_rows)" % (table, col, format(cap, ","), other))
+            m = {}
+            for k, v in rows:
+                lk = _link_key(k)
+                if lk is not None and v is not None and lk not in m:
+                    m[lk] = v
+            if m:
+                out.setdefault(table, {})[col] = m
+    return out, notes
 
 
 def _range_sql(expr, kind, start, end, lo_year=LO_YEAR, hi_year=HI_YEAR):
@@ -869,7 +1009,8 @@ def _in_range(dt, start, end, lo_year=LO_YEAR, hi_year=HI_YEAR):
     return lo_year <= dt.year <= hi_year
 
 
-def _sql_column_events(session, tc, kind, desc, start, end, cap, cancel):
+def _sql_column_events(session, tc, kind, desc, start, end, cap, cancel, unset=None,
+                       links=None):
     t = session.info(tc.table)
     if t.without_rowid:
         lead = [quote_ident(t.columns[i].name) for i in t.pk_columns]
@@ -909,6 +1050,9 @@ def _sql_column_events(session, tc, kind, desc, start, end, cap, cancel):
                 break
             for r in chunk:
                 raw = r[n]
+                if is_unset(raw):
+                    _count_unset(unset, tc.table, tc.column)
+                    continue
                 dt = to_utc(raw, kind) if not tc.text_numbers else to_utc(_as_number(raw), kind)
                 if not _in_range(dt, start, end):
                     continue
@@ -927,11 +1071,12 @@ def _sql_column_events(session, tc, kind, desc, start, end, cap, cancel):
     for dt, _k, r in heap:
         loc = Locator("rowid", r[0]) if not t.without_rowid else Locator("pk", tuple(r[:n]))
         out.append(Event(dt, tc.table, tc.column, kind, loc, loc.display(),
-                         describe(desc, r[n + 1:]), "DB", r[n]))
+                         describe(desc, r[n + 1:], links), "DB", r[n]))
     return out, capped
 
 
-def _native_column_events(session, tc, kind, desc, start, end, cap, cancel):
+def _native_column_events(session, tc, kind, desc, start, end, cap, cancel, unset=None,
+                          links=None):
     t = session.info(tc.table)
     cols = t.column_names
     ci = cols.index(tc.column)
@@ -942,6 +1087,9 @@ def _native_column_events(session, tc, kind, desc, start, end, cap, cancel):
             raise Cancelled()
         vals = row.values
         raw = vals[ci] if ci < len(vals) else None
+        if is_unset(raw):
+            _count_unset(unset, tc.table, tc.column)
+            continue
         dt = to_utc(raw if not tc.text_numbers else _as_number(raw), kind)
         if not _in_range(dt, start, end):
             continue
@@ -955,7 +1103,7 @@ def _native_column_events(session, tc, kind, desc, start, end, cap, cancel):
     out = []
     for dt, _n, loc, raw, dvals in heap:
         out.append(Event(dt, tc.table, tc.column, kind, loc, loc.display() if loc else "",
-                         describe([d for d in desc if d in cols], dvals), "DB", raw))
+                         describe([d for d in desc if d in cols], dvals, links), "DB", raw))
     return out, capped
 
 
@@ -971,7 +1119,7 @@ def column_groups(columns, descriptions):
 
 
 def build_events(session, columns, descriptions=None, start=None, end=None, column_cap=COLUMN_CAP,
-                 total_cap=TOTAL_CAP, cancel=None, progress=None):
+                 total_cap=TOTAL_CAP, cancel=None, progress=None, lookups=None):
     """Events of the enabled TimeColumns between start and end (naive UTC datetimes, inclusive;
     None: no limit), newest `column_cap` per column, at most `total_cap` in all."""
     t0 = time.time()
@@ -997,7 +1145,7 @@ def build_events(session, columns, descriptions=None, start=None, end=None, colu
             if src == "sql":
                 try:
                     got = _sql_column_events(session, tc, kind, desc, start, end, column_cap,
-                                             cancel)
+                                             cancel, res.unset, (lookups or {}).get(tc.table))
                 except sqlite3.Error as e:
                     if _is_interrupt(e):
                         raise Cancelled()
@@ -1007,7 +1155,7 @@ def build_events(session, columns, descriptions=None, start=None, end=None, colu
                                      % (tc.table, tc.column, e))
             if got is None:
                 got = _native_column_events(session, tc, kind, desc, start, end, column_cap,
-                                            cancel)
+                                            cancel, res.unset, (lookups or {}).get(tc.table))
         except Cancelled:
             res.cancelled = True
             break
@@ -1065,7 +1213,7 @@ def _value_key(v):
 
 
 def wal_events(records, columns, descriptions=None, start=None, end=None, live_values=None,
-               cancel=None, cap=COLUMN_CAP, live_checks=50000):
+               cancel=None, cap=COLUMN_CAP, live_checks=50000, unset=None, lookups=None):
     """Events of the row versions held in WAL frames that the database does not show: records
     are WALParser.recover_all_records() dicts (table, locator, values_dict, raw_values,
     frame_idx, page_num, category). Versions in 'current' frames are what the database shows
@@ -1119,6 +1267,9 @@ def wal_events(records, columns, descriptions=None, start=None, end=None, live_v
                 continue
             i = cols.index(col)
             raw = vals[i] if i < len(vals) else None
+            if is_unset(raw):
+                _count_unset(unset, table, col)
+                continue
             dt = to_utc(_as_number(raw) if text_numbers else raw, kind)
             if not _in_range(dt, start, end):
                 continue
@@ -1127,8 +1278,9 @@ def wal_events(records, columns, descriptions=None, start=None, end=None, live_v
                 continue
             per[(table, col)] = n + 1
             ev = Event(dt, table, col, kind, loc, "%s (WAL frame %s)" % (
-                loc.display() if loc is not None else "?", newest[0]),
-                describe(dcols, dvals), "WAL (%s)" % newest[2], raw, rec)
+                loc.display() if loc is not None else "?", newest[0] + 1),
+                describe(dcols, dvals, (lookups or {}).get(table)), "WAL (%s)" % newest[2],
+                raw, rec)
             events.append(ev)
     for (table, col), n in sorted(per.items()):
         if n >= cap:
@@ -1139,7 +1291,8 @@ def wal_events(records, columns, descriptions=None, start=None, end=None, live_v
     return events, notes
 
 
-def carved_events(records, columns, descriptions=None, start=None, end=None, cap=COLUMN_CAP):
+def carved_events(records, columns, descriptions=None, start=None, end=None, cap=COLUMN_CAP,
+                  unset=None, lookups=None):
     """Events of recovered records (engine.forensics Records of the Forensics carver) whose
     table has date columns. Returns (events, notes)."""
     wanted, desc = column_groups(columns, descriptions or {})
@@ -1158,6 +1311,9 @@ def carved_events(records, columns, descriptions=None, start=None, end=None, cap
                 continue
             i = cols.index(col)
             raw = vals[i] if i < len(vals) else None
+            if is_unset(raw):
+                _count_unset(unset, table, col)
+                continue
             dt = to_utc(_as_number(raw) if text_numbers else raw, kind)
             if not _in_range(dt, start, end):
                 continue
@@ -1166,7 +1322,8 @@ def carved_events(records, columns, descriptions=None, start=None, end=None, cap
                 continue
             per[(table, col)] = n + 1
             events.append(Event(dt, table, col, kind, loc, "%s @ %s" % (
-                "?" if rec.rowid is None else rec.rowid, where), describe(dcols, dvals),
+                "?" if rec.rowid is None else rec.rowid, where),
+                describe(dcols, dvals, (lookups or {}).get(table)),
                 "Recovered (%s, %s)" % (rec.prov.source, rec.confidence), raw, rec))
     for (table, col), n in sorted(per.items()):
         if n >= cap:

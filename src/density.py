@@ -6,7 +6,10 @@ DensityChart   a Canvas histogram of the events above the event grid: bars (spli
                database colour when asked), the busiest bin's count and the time axis; hover
                shows a bin's time and count; drag across the bars to select a range
                (on_range(start, end) filters the grid), click without dragging or the ×
-               clears it.
+               clears it; 'zoom in' draws only the selected range, finer. When a few far
+               dates (an expiry in 2035, a 1970 zero) stretch the axis, the chart opens on
+               the busy part (busy_range) and says how many events lie outside, each side
+               ('◀ 12 earlier', '3 later ▶'); a click on either shows every event.
 """
 
 import bisect
@@ -22,6 +25,25 @@ STEPS = [timedelta(minutes=1), timedelta(minutes=5), timedelta(minutes=15),
          timedelta(days=365)]
 STEP_NAMES = ["1 minute", "5 minutes", "15 minutes", "1 hour", "3 hours", "6 hours", "12 hours",
               "1 day", "1 week", "30 days", "quarter", "1 year"]
+
+
+FOCUS_TAIL = 0.005          # events left out at each end when the chart opens on the busy part
+FOCUS_SHARE = 0.5           # ... when that part spans less than this share of all the time
+FOCUS_MIN = 200             # events needed before the chart chooses a part
+
+
+def busy_range(times):
+    """(start, end) of the busy part of sorted times - all but FOCUS_TAIL of the events at
+    each end - when it spans less than FOCUS_SHARE of the whole range; else None."""
+    n = len(times)
+    if n < FOCUS_MIN:
+        return None
+    k = int(n * FOCUS_TAIL)
+    lo, hi = times[k], times[n - 1 - k]
+    full = (times[-1] - times[0]).total_seconds()
+    if full <= 0 or (hi - lo).total_seconds() >= FOCUS_SHARE * full:
+        return None
+    return lo, hi
 
 
 def nice_bins(start, end, most=120):
@@ -97,6 +119,10 @@ class DensityChart(tk.Canvas):
         self.split = True
         self.edges, self.totals, self.per, self.step, self.step_name = [], [], {}, None, ""
         self.selection = None          # (start, end) datetimes
+        self.view = None               # (start, end) drawn, or None: every event
+        self.view_auto = False         # the view is the busy part chosen on opening
+        self.outside = (0, 0)          # events before / after the view
+        self._sorted = []
         self._drag = None
         self._after = None
         self.bind("<Configure>", lambda e: self._later())
@@ -111,8 +137,22 @@ class DensityChart(tk.Canvas):
         self.keys = list(keys) if keys is not None else None
         self.colours = dict(colours or {})
         self.selection = None
+        self._sorted = sorted(t for t in self.times if t is not None)
+        busy = busy_range(self._sorted)
+        self.view, self.view_auto = (busy, True) if busy else (None, False)
         self._bin()
         self.redraw()
+
+    def set_view(self, start=None, end=None):
+        """Draw only start..end (None: every event)."""
+        self.view = (start, end) if start is not None and end is not None else None
+        self.view_auto = False
+        self._bin()
+        self.redraw()
+
+    def zoom_to_selection(self):
+        if self.selection is not None:
+            self.set_view(*self.selection)
 
     def set_split(self, on):
         self.split = bool(on)
@@ -121,8 +161,19 @@ class DensityChart(tk.Canvas):
     def _bin(self):
         w = max(200, self.winfo_width() - self.PAD_L - self.PAD_R)
         most = max(20, min(200, w // 6))
+        times, keys = self.times, self.keys
+        self.outside = (0, 0)
+        if self.view is not None:
+            lo, hi = self.view
+            self.outside = (bisect.bisect_left(self._sorted, lo),
+                            len(self._sorted) - bisect.bisect_right(self._sorted, hi))
+            keep = [i for i, t in enumerate(times) if t is not None and lo <= t <= hi]
+            times = [times[i] for i in keep]
+            keys = [keys[i] for i in keep] if keys is not None else None
         (self.edges, self.totals, self.per, self.step,
-         self.step_name) = bin_times(self.times, self.keys, most=most)
+         self.step_name) = bin_times(times, keys, most=most,
+                                     start=self.view[0] if self.view else None,
+                                     end=self.view[1] if self.view else None)
 
     def _later(self):
         if self._after is None:
@@ -158,6 +209,12 @@ class DensityChart(tk.Canvas):
         self.delete("all")
         W, H = self.winfo_width(), self.winfo_height()
         if W < 50 or H < 30:
+            return
+        if not self.totals and self.view is not None and self.times:
+            self.create_text(W / 2, H / 2 - 8, text="No events in this range",
+                             fill=K["muted_text"], font=F["small"])
+            self.create_text(W / 2, H / 2 + 8, text="show all", fill=K["primary"],
+                             font=F["small_bold"], tags=("outside", "show_all"))
             return
         if not self.totals:
             self.create_text(W / 2, H / 2, text="Build the timeline to see when the events "
@@ -198,7 +255,41 @@ class DensityChart(tk.Canvas):
                          anchor="se", fill=K["muted_text"], font=F["small"])
         self.create_text(W / 2, H - 2, text="%s per bar" % self.step_name if self.step_name
                          else "", anchor="s", fill=K["muted_text"], font=F["small"])
+        self._draw_outside()
         self._draw_selection()
+
+    def _draw_outside(self):
+        """'◀ 12 earlier' / '3 later ▶' when the view leaves events out (a click shows all);
+        'show all' after a zoom that leaves none out."""
+        if self.view is None:
+            return
+        before, after = self.outside
+        W = self.winfo_width()
+        y = self.PAD_T + 2
+        if before:
+            self.create_text(self.PAD_L + 4, y, anchor="nw", fill=K["primary"],
+                             font=F["small_bold"], tags=("outside", "show_all"),
+                             text="◀ %s earlier event%s" % (format(before, ","),
+                                                            "" if before == 1 else "s"))
+        if after:
+            self.create_text(W - self.PAD_R - 4, y, anchor="ne", fill=K["primary"],
+                             font=F["small_bold"], tags=("outside", "show_all"),
+                             text="%s later event%s ▶" % (format(after, ","),
+                                                          "" if after == 1 else "s"))
+        if not before and not after:
+            self.create_text(W - self.PAD_R - 4, y, anchor="ne", fill=K["primary"],
+                             font=F["small_bold"], tags=("outside", "show_all"),
+                             text="show all")
+        for item in self.find_withtag("outside"):   # readable over a tall bar
+            bb = self.bbox(item)
+            if bb:
+                r = self.create_rectangle(bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1,
+                                          fill=K["card"], outline="", tags=("show_all",))
+                self.tag_raise(item, r)
+        if self.view_auto:
+            self.outside_text = "the busy part is shown: %s earlier and %s later event%s " \
+                "outside it (click to show all)" % (format(before, ","), format(after, ","),
+                                                   "" if before + after == 1 else "s")
 
     def _draw_selection(self):
         self.delete("sel")
@@ -211,6 +302,9 @@ class DensityChart(tk.Canvas):
                               width=2, tags=("sel",))
         self.create_text(x1 - 2, self.PAD_T - 2, text="×", anchor="ne", fill=K["accent"],
                          font=F["body_bold"], tags=("sel", "sel_clear"))
+        if x1 - x0 > 70:
+            self.create_text(x1 - 16, self.PAD_T, text="zoom in", anchor="ne",
+                             fill=K["accent"], font=F["small_bold"], tags=("sel", "sel_zoom"))
 
     def _motion(self, e):
         self.delete("hover")
@@ -240,8 +334,15 @@ class DensityChart(tk.Canvas):
     def _press(self, e):
         if not self.edges:
             return
-        if self.find_withtag("current") and "sel_clear" in self.gettags("current"):
+        tags = self.gettags("current") if self.find_withtag("current") else ()
+        if "sel_clear" in tags:
             self.clear_selection()
+            return
+        if "sel_zoom" in tags:
+            self.zoom_to_selection()
+            return
+        if "show_all" in tags:
+            self.set_view(None, None)
             return
         self._drag = e.x
 

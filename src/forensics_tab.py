@@ -7,29 +7,35 @@ results are handed back to the Tk thread, and each job can be stopped.
 
 Freed Pages (shown only when the database has freed pages) lists the pages of the freelist and
 the records still on them as the Recovered Records carver recovers them: one confidence scale,
-with its reasons, everywhere (Search's 'Include freed pages' uses the same records).
+with its reasons, everywhere (Search's 'Recovered records' uses the same carver).
 """
 
+import re
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from browse_sources import ListSource
 from combobox import SearchableCombobox
-from constants import C
+from constants import C, VERSION
 from tokens import COLOR as K, FONT as F
 from database import RID
+from date_reading import date_reading
 from engine import limits
+from engine.search import value_type
+from engine.fileformat.record import InvalidText
 from engine.forensics import CARVE_SOURCES, CONFIDENCES
 from engine.tags import entry_from_record
 from grid import DataGrid, Runner, grid_search
 from hexview import HexView
+from recordui import (BytesWindow, RecordWindow, STATE_STYLE, record_state,  # noqa: F401
+                      where_text)
 from utils import fmtb, vb, write_allowed
 from widgets import (FlowFrame, SearchBox, ToolTip, TreeFilter, TreeviewTooltip, fit_geometry,
                      menu_button, wrap_to_width)
 
 SOURCE_LABELS = (("freeblock", "Freeblocks"), ("unallocated", "Unallocated space"),
-                 ("freelist", "Freed pages"), ("orphan", "Orphan pages"),
+                 ("freelist", "Freed pages"), ("orphan", "Unreferenced pages"),
                  ("wal", "WAL frames"), ("replaced", "Replaced pages"),
                  ("journal", "Rollback journal"))
 MIN_CONFIDENCE = (("All", CONFIDENCES), ("Medium and high", ("high", "medium")), ("High", ("high",)))
@@ -38,6 +44,7 @@ LEVEL_COLOURS = {"error": (K["danger_soft"], K["danger_text"]),
                  "warning": (K["warning_soft"], K["warning"]),
                  "info": (K["primary_soft"], K["primary"])}
 PREVIEW_CHARS = 160
+HOVER_CHARS = 600            # characters of a value in the record panel's hover (the rest: Open…)
 # why a recovery stopped before the end (engine.forensics.carve stats['stopped'])
 STOP_REASONS = {"cancelled": "Stop was pressed",
                 "time limit reached": "the time limit was reached",
@@ -46,6 +53,12 @@ CONFIDENCE_TEXT = ("Confidence says how sure the match of a record to its table 
                    "record's header and sizes fit the table exactly), medium (it fits, with "
                    "something rebuilt or guessed), low (bytes that decode, table uncertain). "
                    "Each record lists its reasons.")
+
+
+STATE_TEXT = ("State: deleted (a row the table no longer has), older version (the row is live "
+              "with other values), inserted again (deleted, and the same values are live "
+              "under another rowid), unreferenced page (on a page nothing references: "
+              "deleted, or a live row a damaged tree hides), index entry (a deleted entry of an index).")
 
 
 def stop_text(reason):
@@ -89,6 +102,32 @@ def parse_key(text):
         return s
 
 
+def _clock(seconds):
+    seconds = int(max(0, seconds))
+    h, rest = divmod(seconds, 3600)
+    m, sec = divmod(rest, 60)
+    return "%d:%02d:%02d" % (h, m, sec) if h else "%d:%02d" % (m, sec)
+
+
+def job_text(what, stage, elapsed):
+    """'Recovering deleted records - Reading the pages: 1,234 of 3,922 · 0:42, about 1:10
+    left' (the time left once the step has run a few seconds and has a total)."""
+    parts = [what]
+    if stage is not None:
+        name, done, total, since = stage
+        step = name
+        if done is not None and total:
+            step += ": %s of %s" % (format(done, ","), format(total, ","))
+        elif done is not None:
+            step += ": %s" % format(done, ",")
+        parts.append(step)
+        ran = time.time() - since
+        if done and total and ran > 3 and done < total:
+            parts.append("about %s left in this step" % _clock(ran * (total - done) / done))
+    text = " \u2014 ".join(parts)
+    return "%s \u00b7 %s elapsed" % (text, _clock(elapsed))
+
+
 class ForensicsTab(ttk.Frame):
     """The Forensics tab of App. app gives db, BlobViewer and RowWin access."""
 
@@ -106,6 +145,7 @@ class ForensicsTab(ttk.Frame):
         self._summary_keys, self._summary_shown = [], []
         self._version_values = []
         self._busy = False
+        self._scanned = False            # a recovery ran on this database
         self._freed = []                 # Records recovered from freed pages
         self._freed_pages = ([], [])     # (trunk, leaf) page numbers of the freelist
         self._build()
@@ -139,6 +179,9 @@ class ForensicsTab(ttk.Frame):
         self.stop()
         self._records, self._dropped, self._findings, self._history = [], [], None, None
         self.carve_grid.set_source(None)
+        if hasattr(self, "rec_tree"):
+            self._show_record_panel(None)
+            self.carve_overview.delete(*self.carve_overview.get_children())
         self.drop_grid.set_source(None)
         self.journal_grid.set_source(None)
         for tree in (self.keys_tree, self.versions_tree, self.values_tree, self.drop_tree,
@@ -158,11 +201,18 @@ class ForensicsTab(ttk.Frame):
     def on_open(self):
         """A database was opened: fill the table choices and the journal summary."""
         self.reset()
+        self._scanned = False
+        self._overview_table = None
+        self._fill_overview()
+        self._schedule_auto_recover()
+        self._schedule_auto_history()
         tables = self.db.tables() if self.db.ok else []
         self.carve_table.configure(values=["All tables"] + tables)
         self.carve_table.set("All tables")
         self.history_table.configure(values=tables)
         self._hist_labels = {}              # combobox label -> table (with its counts)
+        self._hist_values = (list(tables), [])     # (the lists of the database shown)
+        self._all_history = []
         self._hist_overview_for = None
         self.journal_table.configure(values=tables)
         if tables:
@@ -181,6 +231,20 @@ class ForensicsTab(ttk.Frame):
 
     def stop(self):
         """Stop the running job (its statement is interrupted by the app's worker shutdown)."""
+        aid = getattr(self, "_auto_after", None)
+        hid = getattr(self, "_auto_hist_after", None)
+        if hid is not None:
+            try:
+                self.after_cancel(hid)
+            except tk.TclError:
+                pass
+            self._auto_hist_after = None
+        if aid is not None:                 # a recovery planned on opening: not any more
+            try:
+                self.after_cancel(aid)
+            except tk.TclError:
+                pass
+            self._auto_after = None
         self._stop = True
         self._runner.cancel()
 
@@ -193,6 +257,7 @@ class ForensicsTab(ttk.Frame):
         self._stop = False
         self._progress = (0, 0)
         started = time.time()
+        self._job_what, self._job_started = what, started
         status.configure(text="%s…" % what)
         self.job_lbl.configure(text="%s…" % what)
         self.bar.configure(value=0, maximum=1)
@@ -233,9 +298,21 @@ class ForensicsTab(ttk.Frame):
         if not getattr(self, "_busy", False):
             return
         done, total = self._progress
-        if total:
+        stage = None
+        try:
+            fx = self.db.session.__dict__.get("_forensics") if self.db.ok else None
+            stage = fx.stage if fx is not None else None
+        except Exception:               # noqa: BLE001 - the job line keeps its name then
+            stage = None
+        if stage is not None and stage[2]:
+            self.bar.configure(maximum=stage[2], value=min(stage[1] or 0, stage[2]))
+        elif total:
             self.bar.configure(maximum=total, value=done)
-        self._progress_after = self.after(150, self._poll_progress)
+        what = getattr(self, "_job_what", "")
+        if what:
+            self.job_lbl.configure(text=job_text(what, stage, time.time() -
+                                                 getattr(self, "_job_started", time.time())))
+        self._progress_after = self.after(250, self._poll_progress)
 
     def destroy(self):
         aid = getattr(self, "_progress_after", None)
@@ -366,13 +443,450 @@ class ForensicsTab(ttk.Frame):
                                                     style="M.TLabel"))
         self.carve_status.pack(fill="x", padx=4)
         ToolTip(self.carve_conf, CONFIDENCE_TEXT)
-        self.carve_grid = DataGrid(f, frozen=1, on_open_row=self._open_record,
-                                   on_context_menu=self._carve_menu)
-        self.carve_grid.pack(fill="both", expand=True, padx=4, pady=4)
+        # overview of the tables | the records | the selected record, side by side
+        pane = ttk.Panedwindow(f, orient="horizontal")
+        pane.pack(fill="both", expand=True, padx=4, pady=4)
+        left = ttk.Frame(pane)
+        pane.add(left, weight=0)
+        box, self.carve_overview = self._tree(
+            left, (("table", "Table"), ("live", "Live rows"), ("rec", "Recovered"),
+                   ("high", "High")), (150, 72, 72, 48), height=12, noun="table")
+        box.pack(fill="both", expand=True)
+        self.carve_overview.tag_configure("found", foreground=K["danger_text"])
+        self.carve_overview.tag_configure("empty", foreground=K["muted_text"])
+        self.carve_overview.bind("<<TreeviewSelect>>", self._on_overview)
+        ToolTip(self.carve_overview, "Every table with its live rows and the records recovered "
+                                     "for it (High: of them, high confidence). Click one to "
+                                     "list only its records, in its own columns.")
+        self._overview_table = None
+        mid = ttk.Frame(pane)
+        pane.add(mid, weight=3)
+        self.carve_grid = DataGrid(mid, frozen=1, on_open_row=self._open_record,
+                                   on_context_menu=self._carve_menu,
+                                   row_style=self._carve_row_style,
+                                   on_selection=lambda _s: self._show_selected_record())
+        self.carve_grid.pack(fill="both", expand=True)
+        right = ttk.Frame(pane)
+        pane.add(right, weight=1)
+        self._build_record_panel(right)
+        # the panes start at what they ask for, and the record panel asks for much (its
+        # columns and buttons): the records - the tab's subject - were left ~190 px. Once
+        # shown, the records get the room and the record panel a readable third at most
+        self._carve_pane = pane
+        self._carve_left = left
+        self._carve_dragged = False     # a sash moved by hand: kept as it is
+        pane.bind("<Configure>", self._size_carve_panes, add="+")
+        pane.bind("<ButtonRelease-1>", lambda e: setattr(self, "_carve_dragged", True),
+                  add="+")
         self.carve_search = grid_search(frow, self.carve_grid, width=36,
                                         placeholder="Find records (words, all must match)…")
         self.carve_search.pack(side="left", padx=4, fill="x", expand=True)
         self.carve_filter = self.carve_search.var
+
+    def _size_carve_panes(self, _e=None):
+        """The tables list as wide as its columns (Table, Live rows, Recovered, High) up to
+        a third, the record panel up to 400 px, the records the rest; again when the pane's
+        width changes, until a sash is moved by hand. Only on a new width: setting the
+        sashes re-wraps the record panel's buttons, its requested size changes and the pane
+        is laid out again - re-setting the sashes then would never end."""
+        pane = self._carve_pane
+        if self._carve_dragged:
+            return
+        w = pane.winfo_width()
+        if w < 600:
+            return                      # not laid out yet: the next resize does it
+        if w == getattr(self, "_carve_sized_w", None):
+            return                      # the panes' own re-layout, not a new width: setting
+        self._carve_sized_w = w         # the sashes again would loop (see the docstring)
+        try:
+            left = min(self._carve_left.winfo_reqwidth(), int(w * 0.34))
+            right = min(400, int(w * 0.30))
+            pane.sashpos(0, left)
+            pane.sashpos(1, max(left + 280, w - right))
+        except tk.TclError:
+            pass
+
+    # -- recovery on open ----------------------------------------------------------------
+    AUTO_DELAY_MS = 3000            # after opening: the first screens first
+
+    def _schedule_auto_recover(self):
+        """Recover the deleted records in the background soon after a database opens (when
+        it is no larger than the limit auto_recover_bytes), so Browse, Search and this tab can
+        show them without anyone pressing a button."""
+        old = getattr(self, "_auto_after", None)
+        if old is not None:
+            try:
+                self.after_cancel(old)
+            except tk.TclError:
+                pass
+        self._auto_after = None
+        if not self.db.ok:
+            return
+        size = self._evidence_size()
+        cap = limits.get("auto_recover_bytes")
+        if not cap or size is None or size > cap:
+            if cap and size is not None:
+                self.carve_status.configure(
+                    text="Not recovered on opening: the database is %s, more than the limit "
+                         "auto_recover_bytes (%s) \u2014 press \u2018Recover deleted "
+                         "records\u2019." % (fmtb(size), fmtb(cap)))
+            return
+        session = self.db.session
+        self.carve_status.configure(text="Deleted records are recovered in the background "
+                                         "in a moment (limit auto_recover_bytes)\u2026")
+        self._auto_after = self.after(self.AUTO_DELAY_MS, lambda: self._auto_recover(session))
+
+    AUTO_HISTORY_RETRY_MS = 4000    # the overview waits for the auto recovery to finish
+
+    def _schedule_auto_history(self):
+        """Count the rows with history (older versions in the WAL / journal) by itself soon
+        after a database opens that has a WAL or a rollback journal, so the navigator can
+        mark the tables and the Row History page is ready; it waits while another job runs."""
+        old = getattr(self, "_auto_hist_after", None)
+        if old is not None:
+            try:
+                self.after_cancel(old)
+            except tk.TclError:
+                pass
+        self._auto_hist_after = None
+        if not self.db.ok:
+            return
+        try:
+            wanted = self.db.has_wal or self.db.journal_info() is not None
+        except Exception:               # noqa: BLE001 - no journal then
+            wanted = self.db.has_wal
+        if not wanted:
+            return
+        session = self.db.session
+        self._auto_hist_after = self.after(self.AUTO_DELAY_MS + 1500,
+                                           lambda: self._auto_history(session))
+
+    def _auto_history(self, session):
+        self._auto_hist_after = None
+        if not self.db.ok or self.db.session is not session:
+            return
+        if getattr(self, "_hist_overview_for", None) is session:
+            return                      # done (or running) already
+        if self._busy:
+            self._auto_hist_after = self.after(self.AUTO_HISTORY_RETRY_MS,
+                                               lambda: self._auto_history(session))
+            return
+        self.start_history_overview()
+
+    def _auto_recover(self, session):
+        self._auto_after = None
+        if not self.db.ok or self.db.session is not session or self._busy or self._scanned:
+            return
+        self.start_carve()
+
+    def _evidence_size(self):
+        try:
+            import os
+            total = 0
+            base = getattr(self.db, "_path", None)
+            for p in (base, base + "-wal", base + "-journal"):
+                if os.path.exists(p):
+                    total += os.path.getsize(p)
+            return total
+        except (OSError, TypeError, AttributeError):
+            return None
+
+    # -- the table overview and the record panel ----------------------------------------
+    def _fill_overview(self):
+        """Every table: live rows (the row counts), records recovered (and how many high)."""
+        tree = self.carve_overview
+        keep = self._overview_table
+        tree.delete(*tree.get_children())
+        if not self.db.ok:
+            return
+        counts = getattr(self.app, "_count_cache", None) or {}
+        by = {}
+        for r in self._records:
+            n, high = by.get(r.table or "(unknown)", (0, 0))
+            by[r.table or "(unknown)"] = (n + 1, high + (r.confidence == "high"))
+        total = len(self._records)
+        tree.insert("", "end", iid="__all__", values=(
+            "All tables", "", format(total, ",") if self._records or self._scanned else "-",
+            format(sum(h for _n, h in by.values()), ",") if self._records else ""))
+        names = list(self.db.tables())
+        names += sorted(t for t in by if t not in names)
+        # the tables with recovered records first, then the others
+        names.sort(key=lambda t: (-by.get(t, (0, 0))[0], t.lower()))
+        for t in names:
+            live = counts.get(t)
+            n, high = by.get(t, (0, 0))
+            tags = ("found",) if n else (("empty",) if live == 0 else ())
+            tree.insert("", "end", iid="t:" + t, tags=tags, values=(
+                t, format(live, ",") if isinstance(live, int) else (live or ""),
+                format(n, ",") if n else ("0" if self._scanned else "-"),
+                format(high, ",") if high else ""))
+        found = [t for t in by if t != "(unknown)"]
+        if keep is None and len(found) == 1 and len(by) == 1 and (
+                getattr(self, "_auto_table_for", None) is not self._records):
+            # one table holds every record: show it in its own columns at once (once per
+            # recovery: choosing All tables afterwards stays)
+            self._auto_table_for = self._records
+            keep = self._overview_table = found[0]
+            self.after_idle(self._show_records)
+        want = "__all__" if keep is None else "t:" + keep
+        if tree.exists(want):
+            tree.selection_set(want)
+            tree.see(want)
+
+    def _on_overview(self, _e=None):
+        sel = self.carve_overview.selection()
+        table = None
+        if sel and sel[0].startswith("t:"):
+            table = sel[0][2:]
+        if table != self._overview_table:
+            self._overview_table = table
+            self._show_records()
+
+    def _build_record_panel(self, f):
+        """The selected record: its columns and values as a table, where it was found, and
+        what can be done with it."""
+        self.rec_title = wrap_to_width(ttk.Label(f, text="Select a record", style="B.TLabel"))
+        self.rec_title.pack(fill="x", padx=4, pady=(0, 2))
+        self.rec_where = wrap_to_width(ttk.Label(f, text="", style="M.TLabel"))
+        self.rec_where.pack(fill="x", padx=4)
+        # what an index entry is, and what the database's triggers do to this table's rows:
+        # shown only when it applies
+        self.rec_note = wrap_to_width(ttk.Label(f, text="", style="M.TLabel"))
+        self._rec_note_shown = False
+        self._rec_where_widget = self.rec_where
+        # the buttons first, at the bottom: a narrow panel wraps them to two lines and the
+        # column list above gives way (packed after them), so no button is ever cut off
+        btns = FlowFrame(f)
+        btns.pack(side="bottom", fill="x", padx=2, pady=(2, 0))
+        self.rec_buttons = {}
+        for key, text, cmd in (("copy_value", "Copy value", self._rec_copy_value),
+                               ("copy_row", "Copy row", self._rec_copy_row),
+                               ("open", "Open\u2026", self._rec_open),
+                               ("bytes", "Bytes\u2026", self._rec_bytes),
+                               ("history", "Row history", self._rec_history)):
+            b = btns.add(ttk.Button(btns, text=text, style="Small.TButton", command=cmd), gap=2)
+            b.state(["disabled"])
+            self.rec_buttons[key] = b
+        box, self.rec_tree = self._tree(f, (("col", "Column"), ("value", "Value"),
+                                            ("date", "Date (UTC)")), (120, 260, 200),
+                                        height=12, noun="column")
+        box.pack(fill="both", expand=True, padx=2, pady=2)
+        from parts import HoverCard
+        HoverCard(self.rec_tree, self._rec_hover)   # a narrow panel cuts values: whole here
+        self.rec_tree.bind("<Double-1>", self._rec_open_value)
+        self.rec_tree.bind("<Button-3>", self._rec_menu)
+        self._panel_record = None
+
+    def _show_selected_record(self):
+        sel = self.carve_grid.selected_rows()
+        rec = None
+        if sel:
+            data = self.carve_grid.row_data(sel[0])
+            rec = self._record_at(data[0]) if data else None
+        self._show_record_panel(rec)
+
+    def _show_record_panel(self, rec):
+        self._panel_record = rec
+        tree = self.rec_tree
+        tree.delete(*tree.get_children())
+        for b in self.rec_buttons.values():
+            b.state(["!disabled"] if rec is not None else ["disabled"])
+        if rec is None:
+            self.rec_title.configure(text="Select a record")
+            self.rec_where.configure(text="")
+            self._set_rec_note("")
+            return
+        self._set_rec_note(self._record_note(rec))
+        if rec.table is None or rec.rowid is None:
+            self.rec_buttons["history"].state(["disabled"])
+        self.rec_title.configure(text="%s \u2014 %s, %s confidence" % (
+            getattr(rec, "label", rec.table) or "(unknown table)", record_state(rec),
+            rec.confidence))
+        bits = [where_text(self.db, rec)]
+        if rec.rowid is not None:
+            bits.append("rowid %s" % rec.rowid)
+        if rec.reasons:
+            bits.append("; ".join(rec.reasons))
+        self.rec_where.configure(text=" \u00b7 ".join(bits))
+        for i, (c, v) in enumerate(zip(rec.columns, rec.values)):
+            tree.insert("", "end", iid=str(i), values=(c, vb(v),
+                                                       date_reading(self.db, rec.table, c, v)))
+        self._fit_rec_columns()
+
+    def _rec_hover(self, iid):
+        """A line of the record panel, whole: column, value (up to HOVER_CHARS), date."""
+        if not iid:
+            return None
+        col, value, date = (self.rec_tree.item(iid, "values") or ("", "", ""))[:3]
+        text = str(value)
+        if len(text) > HOVER_CHARS:
+            text = text[:HOVER_CHARS] + "… (%s characters: Open… shows all)" % format(
+                len(text), ",")
+        return "%s\n%s%s" % (col, text, "\n" + date if date else "")
+
+    REC_COLUMN_BASE = {"col": 70, "value": 80, "date": 90}   # px; Tk stretches them to fit
+
+    def _fit_rec_columns(self):
+        """The record's columns fill the panel: the Date column only when a value reads as a
+        date (else Value takes its room). Small base widths that Tk stretches - never sized
+        from the panel's width on <Configure> (that re-lays the panel without end), and wide
+        fixed widths put the Date column past a narrow panel's edge."""
+        tree = self.rec_tree
+        dated = any(tree.set(i, "date") for i in tree.get_children())
+        want = ("col", "value", "date") if dated else ("col", "value")
+        if tuple(tree["displaycolumns"]) != want:
+            tree.configure(displaycolumns=want)
+        if not getattr(self, "_rec_base_set", False):
+            for c, w in self.REC_COLUMN_BASE.items():
+                tree.column(c, width=w, minwidth=40, stretch=True)
+            self._rec_base_set = True
+
+    def _set_rec_note(self, text):
+        self.rec_note.configure(text=text)
+        if text and not self._rec_note_shown:
+            self.rec_note.pack(fill="x", padx=4, pady=(2, 0), after=self._rec_where_widget)
+        elif not text and self._rec_note_shown:
+            self.rec_note.pack_forget()
+        self._rec_note_shown = bool(text)
+
+    def _trigger_map(self):
+        """The database's triggers (live, and dropped ones once recovered), kept until the
+        recovered schema changes."""
+        session = getattr(self.db, "session", None)
+        if session is None:
+            return None
+        fx = session.__dict__.get("_forensics")
+        key = (id(session), id((getattr(fx, "_cache", None) or {}).get("dropped")))
+        if getattr(self, "_tmap_key", None) != key:
+            from engine.triggers import for_session
+            try:
+                self._tmap = for_session(session)
+            except Exception:           # noqa: BLE001 - no note then
+                self._tmap = None
+            self._tmap_key = key
+        return self._tmap
+
+    def _record_note(self, rec):
+        """Plain words on what this record is (an index entry) and on what the database's
+        triggers do to its table's rows; '' when there is nothing to say."""
+        parts = []
+        if getattr(rec, "index", None) is not None:
+            parts.append("An entry of index %s: it shows that a row of %s with these values "
+                         "existed%s. An index keeps only its own columns, so the row's other "
+                         "columns are not in it." % (
+                             rec.index, rec.table or "its table",
+                             " (rowid %s)" % rec.rowid if rec.rowid is not None else ""))
+        tmap = self._trigger_map() if rec.table else None
+        if tmap is not None:
+            from engine.triggers import DELETES, INSERTS, action_text
+            dels = tmap.changing(rec.table, DELETES)
+            if dels:
+                txt = "; ".join("%s (%s, it %s)" % (t.name, t.event_text(), action_text(a, t))
+                                for t, a in dels[:2])
+                more = " +%d more" % (len(dels) - 2) if len(dels) > 2 else ""
+                parts.append("The database deletes rows of %s by itself - %d trigger%s: %s%s. "
+                             "This row may have gone that way, not by a direct delete." % (
+                                 rec.table, len(dels), "" if len(dels) == 1 else "s", txt, more))
+            logs = [(t, a) for t in tmap.on(rec.table) if t.event in ("DELETE", "UPDATE")
+                    for a in t.actions if a.verb == INSERTS and a.uses_old and a.table and
+                    a.table.lower() != rec.table.lower()]
+            if logs:
+                where = sorted(set(a.table for _t, a in logs))
+                names = sorted(set(t.name for t, _a in logs))
+                shown = ", ".join(names[:3]) + (" +%d more" % (len(names) - 3)
+                                                if len(names) > 3 else "")
+                parts.append("When rows of %s are deleted or changed, trigger%s %s add%s a row "
+                             "to %s with the old values: a copy or a log line of this row may be "
+                             "live there." % (
+                                 rec.table, "" if len(names) == 1 else "s", shown,
+                                 "s" if len(names) == 1 else "", ", ".join(where)))
+        return "\n".join(parts)
+
+    def _rec_value(self):
+        rec = self._panel_record
+        sel = self.rec_tree.selection()
+        if rec is None or not sel:
+            return None, None
+        i = int(sel[0])
+        return rec.columns[i], rec.values[i]
+
+    def _rec_copy_value(self):
+        col, v = self._rec_value()
+        if col is None and self._panel_record is not None and self._panel_record.values:
+            col, v = self._panel_record.columns[0], self._panel_record.values[0]
+        if col is not None:
+            from engine.export import csv_cell
+            self.clipboard_clear()
+            self.clipboard_append(csv_cell(v))
+
+    def _rec_copy_row(self):
+        rec = self._panel_record
+        if rec is None:
+            return
+        from engine.export import csv_cell
+        self.clipboard_clear()
+        self.clipboard_append("\n".join("%s\t%s" % (c, csv_cell(v))
+                                         for c, v in zip(rec.columns, rec.values)))
+
+    def _rec_open(self):
+        if self._panel_record is not None:
+            RecordWindow(self, self._panel_record, self.app)
+
+    def _rec_history(self):
+        rec = self._panel_record
+        if rec is not None and rec.table and rec.rowid is not None:
+            self.app.show_row_history(rec.table, rec.rowid)
+
+    def _rec_bytes(self):
+        if self._panel_record is not None:
+            BytesWindow(self, self.app, self.db, self._panel_record)
+
+    def _rec_open_value(self, _e=None):
+        col, v = self._rec_value()
+        if col is None:
+            return
+        if isinstance(v, (bytes, bytearray)) and not isinstance(v, InvalidText):
+            self.app.open_blob(bytes(v), col, "%s (recovered, %s)" % (
+                col, self._panel_record.prov.where()))
+        else:
+            from value_viewer import ValueViewer
+            ValueViewer(self, v, "%s \u2014 recovered record, %s" % (
+                col, self._panel_record.prov.where()))
+
+    def _rec_menu(self, e):
+        iid = self.rec_tree.identify_row(e.y)
+        if not iid:
+            return
+        self.rec_tree.selection_set(iid)
+        rec = self._panel_record
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Copy value", command=self._rec_copy_value)
+        m.add_command(label="Copy column name", command=lambda: (
+            self.clipboard_clear(), self.clipboard_append(self._rec_value()[0] or "")))
+        m.add_command(label="Copy row (column, value per line)", command=self._rec_copy_row)
+        m.add_command(label="Copy where (page, byte offset, file)", command=lambda: (
+            self.clipboard_clear(), self.clipboard_append(where_text(self.db, rec))))
+        m.add_separator()
+        v = self._rec_value()[1]
+        blob = isinstance(v, (bytes, bytearray)) and not isinstance(v, InvalidText)
+        m.add_command(label="Inspect BLOB\u2026" if blob else "View value\u2026",
+                      command=self._rec_open_value)
+        m.add_command(label="Open the record\u2026", command=self._rec_open)
+        m.add_command(label="Bytes\u2026", command=self._rec_bytes)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+
+    def _carve_row_style(self, _row, values, _flags):
+        """Each record's row in the colour of its state."""
+        src = self.carve_grid.source
+        try:
+            i = src.columns().index("State")
+        except (AttributeError, ValueError):
+            return None, None
+        bg, mark = STATE_STYLE.get(values[i] if i < len(values) else None, (None, None))
+        return (K.get(bg) if bg else None), (K.get(mark) if mark else None)
 
     def _update_look_label(self):
         """'Look in ▾' says how many places are ticked when not all of them are."""
@@ -395,7 +909,7 @@ class ForensicsTab(ttk.Frame):
         menu.add_separator()
         if len(picked) == 1:
             rec = picked[0]
-            menu.add_command(label="Open row detail", command=lambda: RecordWindow(self, rec, self.app))
+            # (the grid's own menu already offers Open row detail)
             if rec.table and rec.rowid is not None:
                 menu.add_command(label="Row history (every version)",
                                  command=lambda: self.app.show_row_history(rec.table, rec.rowid))
@@ -449,7 +963,17 @@ class ForensicsTab(ttk.Frame):
                 st.get("pages", "?"), seconds,
                 "" if complete else " — STOPPED EARLY: %s; the records found until then are "
                                     "listed" % stop_text(st.get("stopped"))) + live_check_text(st))
+            self._scanned = True
+            if tables is None and complete:
+                db.set_recovered(self._records, sources)     # Search reuses them
+            self._fill_overview()
             self._show_records()
+            refresh = getattr(self.app, "_refresh_browse_recovered", None)
+            if refresh is not None:
+                refresh()               # Browse offers the table's recovered records
+            query = getattr(self.app, "_query", None)
+            if query is not None:
+                query._fill_tables()    # the Query tab lists them as recovered_<table>
         self._run("carve", work, done, self.carve_status, "Recovering deleted records")
 
     def _shown_records(self):
@@ -457,17 +981,64 @@ class ForensicsTab(ttk.Frame):
         return [r for r in self._records if r.confidence in allowed]
 
     def _show_records(self):
+        """The records listed: every table's with a Values column, or with one table chosen
+        (in the overview) that table's own columns, each value in its column."""
+        recs = self._shown_records()
+        table = self._overview_table
+        if table is not None:
+            recs = [r for r in recs if (r.table or "(unknown)") == table]
         rows = []
-        for i, r in enumerate(self._shown_records()):
-            p = r.prov
-            rows.append(([i + 1, r.confidence, getattr(r, "label", r.table) or "(unknown)",
-                          "" if r.rowid is None else r.rowid, p.source, p.where(),
-                          ", ".join(sorted(r.flags)), values_preview(r.columns, r.values)],
-                         ()))
-        self._record_view = self._shown_records()
-        src = ListSource([RID, "Confidence", "Table", "Row ID", "Source", "Where", "Flags",
-                          "Values"], rows, note="")
+        if table is not None and recs:
+            cols = []
+            for r in sorted(recs, key=lambda r: -len(r.columns)):
+                for c in r.columns:
+                    if c not in cols:
+                        cols.append(c)
+            head = [RID, "State", "Confidence", "Row ID", "Source", "Where", "Byte offset"]
+            for i, r in enumerate(recs):
+                vals = dict(zip(r.columns, r.values))
+                rows.append(([i + 1, record_state(r), r.confidence,
+                              "" if r.rowid is None else r.rowid, r.prov.source,
+                              r.prov.where(), self._byte_offset(r)]
+                             + [vals.get(c) for c in cols], ()))
+            src = ListSource(head + cols, rows, note="")
+        else:
+            for i, r in enumerate(recs):
+                p = r.prov
+                rows.append(([i + 1, record_state(r), r.confidence,
+                              getattr(r, "label", r.table) or "(unknown)",
+                              "" if r.rowid is None else r.rowid, p.source, p.where(),
+                              self._byte_offset(r), ", ".join(sorted(r.flags)),
+                              values_preview(r.columns, r.values)], ()))
+            src = ListSource([RID, "State", "Confidence", "Table", "Row ID", "Source", "Where",
+                              "Byte offset", "Flags", "Values"], rows, note="")
+        self._record_view = recs
         self.carve_grid.set_source(src)
+        # the record's own columns must be in view: the columns about the record stay narrow
+        for name, w in (("State", 96), ("Confidence", 80), ("Table", 150), ("Row ID", 60),
+                        ("Source", 86), ("Where", 150), ("Byte offset", 92), ("Flags", 110)):
+            if name in src.columns():
+                self.carve_grid.set_column_width(src.columns().index(name), w)
+        self._show_record_panel(None)
+        if recs:                        # the first record is selected: its values show at once
+            self.after_idle(self._select_first_record)
+
+    def _byte_offset(self, rec):
+        """The record's byte offset in its file (the Byte offset column), or None."""
+        from recordui import file_offset
+        return file_offset(self.db, rec.prov)
+
+    def _select_first_record(self, tries=20):
+        g = self.carve_grid
+        try:
+            if g.selected_rows() or self._panel_record is not None:
+                return                  # a choice made meanwhile stays
+            if g.row_count() > 0:
+                g.set_current_cell(0, None)
+            elif tries:
+                self.after(50, lambda: self._select_first_record(tries - 1))
+        except (tk.TclError, AttributeError):
+            pass
 
     def _record_at(self, values):
         try:
@@ -624,7 +1195,6 @@ class ForensicsTab(ttk.Frame):
         if rec is None:
             return
         menu.add_separator()
-        menu.add_command(label="Open row detail", command=lambda: RecordWindow(self, rec, self.app))
         self.app.tag_menu(menu, lambda: [entry_from_record(rec)], label="Tag record")
 
     # -- row history -------------------------------------------------------------
@@ -651,17 +1221,33 @@ class ForensicsTab(ttk.Frame):
                                      variable=self.history_show_all,
                                      command=lambda: self.start_history_summary()), gap=8)
         ToolTip(cb, "List every row in the table with its history status, not just changed rows")
+        self.history_only_with = tk.BooleanVar(value=True)
+        self._hist_values = ([], [])        # (every table's label, those with history)
+        ob = row.add(ttk.Checkbutton(row, text="Only tables with history",
+                                     variable=self.history_only_with,
+                                     command=self._hist_list_choice), gap=8, visible=False)
+        self._hist_only_cb = ob
+        ToolTip(ob, "The table list shows only the tables that have rows with older versions "
+                    "(counted when this page opens); untick to pick any table")
         self.history_status = wrap_to_width(ttk.Label(f, text="", style="M.TLabel"))
         self.history_status.pack(fill="x", padx=4)
         pane = ttk.Panedwindow(f, orient="vertical")
         pane.pack(fill="both", expand=True, padx=4, pady=4)
         top = ttk.Frame(pane)
         pane.add(top, weight=1)
-        box, self.keys_tree = self._tree(top, (("key", "Row"), ("versions", "Versions"),
+        box, self.keys_tree = self._tree(top, (("table", "Table"), ("key", "Row"),
+                                                ("versions", "Versions"),
                                                 ("deleted", "Deleted"), ("reuse", "Key reused"),
                                                 ("walonly", "Only in WAL"), ("span", "Seen in")),
-                                         (160, 80, 70, 260, 90, 260))
+                                         (160, 110, 70, 70, 160, 90, 260))
+        self.keys_tree.column("versions", anchor="e", stretch=False)
+        self.keys_tree.column("span", stretch=True)
         box.pack(fill="both", expand=True)
+        wrap_to_width(ttk.Label(top, style="M.TLabel", text=(
+            "Seen in: the oldest \u2192 newest place a version of the row was found - journal "
+            "(before the last transaction), stale (an earlier use of the WAL file), main (the "
+            "main file), committed (the WAL up to its last commit), uncommitted (written "
+            "after it; SQLite never shows these)."))).pack(fill="x", padx=4, pady=(2, 0))
         self.keys_tree.bind("<<TreeviewSelect>>", self._on_key)
         mid = ttk.Frame(pane)
         pane.add(mid, weight=1)
@@ -676,15 +1262,72 @@ class ForensicsTab(ttk.Frame):
         low = ttk.Frame(pane)
         pane.add(low, weight=1)
         box, self.values_tree = self._tree(low, (("col", "Column"), ("value", "Value"),
-                                                 ("type", "Type")), (180, 520, 80))
+                                                 ("type", "Type"), ("date", "Date (UTC)")),
+                                           (180, 420, 80, 240))
         box.pack(fill="both", expand=True)
         self.values_tree.tag_configure("changed", background=K["highlight"])
         self.values_tree.bind("<Double-1>", self._on_history_value)
+        self.values_tree.bind("<Button-3>", self._history_value_menu)
+        vbar = FlowFrame(low)
+        vbar.pack(fill="x", pady=(2, 0))
+        for text, cmd in (("Copy value", self._history_copy_value),
+                          ("Copy this version", self._history_copy_version),
+                          ("Copy every version (CSV)", self._history_copy_all),
+                          ("Save versions…", self._history_save_versions),
+                          ("Save changed rows…", self._history_save_list),
+                          ("Open row", self._history_open_row)):
+            vbar.add(ttk.Button(vbar, text=text, style="Small.TButton", command=cmd), gap=2)
+
+    def _hist_list(self):
+        """The table list as chosen: only the tables with history, or every table."""
+        every, with_hist = self._hist_values
+        return with_hist if self.history_only_with.get() and with_hist else every
+
+    def _hist_list_choice(self):
+        values = self._hist_list()
+        self.history_table.configure(values=values)
+        if self.history_table.get() not in values and values:
+            self.history_table.set(values[0])
+            self.start_history_summary()
+
+    def show_table_history(self, table):
+        """Row History with this table chosen (its changed rows listed); counts the tables
+        first when that has not happened yet."""
+        if not self.db.ok:
+            return
+        self.nb.select(self._history_page)
+        labels = getattr(self, "_hist_labels", {})
+        label = next((lbl for lbl, t in labels.items() if t == table), None)
+        if label is None:
+            if getattr(self, "_hist_overview_for", None) is not self.db.session and \
+                    not self._busy:
+                self._hist_want = table
+                self.start_history_overview()
+                return
+            label = table
+        self.history_only_with.set(False) if label not in self._hist_list() else None
+        self.history_table.configure(values=self._hist_list())
+        self.history_table.set(label)
+        self.start_history_summary()
 
     def _hist_table(self):
-        """The table chosen in Row History (its list shows counts beside the names)."""
+        """The table chosen in Row History (its list shows counts beside the names);
+        '__all__' for All tables."""
         label = self.history_table.get()
-        return getattr(self, "_hist_labels", {}).get(label, label)
+        known = getattr(self, "_hist_labels", {}).get(label)
+        if known is not None:
+            return known
+        # a label with counts that is not (or no longer) in the list of the database shown:
+        # read as what it names, never passed on as a table name
+        if label.startswith("All tables"):
+            return "__all__"
+        m = re.match(r"^(.+?)  \([\d,]+ changed\)$", label)
+        return m.group(1) if m else label
+
+    def _row_table(self, iid):
+        """The table of a line of the changed-rows list (its own in All tables)."""
+        vals = self.keys_tree.item(iid, "values")
+        return vals[0] if vals and vals[0] else self._hist_table()
 
     def start_history_overview(self):
         """Which tables have rows with more than one version (or deleted / reused keys):
@@ -716,15 +1359,27 @@ class ForensicsTab(ttk.Frame):
                 except Exception:       # noqa: BLE001 - a table that cannot be read
                     sm = None
                 keys = list(sm.keys) if sm is not None else []
-                out.append((t, sum(1 for k in keys if k.versions > 1 or k.deleted or k.reuse)))
+                changed = [k for k in keys if k.versions > 1 or k.deleted or k.reuse]
+                out.append((t, len(changed), changed))
             return out
 
         def done(counts, seconds):
             if counts is None:
                 return
+            if self.db is not db or getattr(self, "_hist_overview_for", None) is not db.session:
+                return                  # counted for a database no longer shown
+            self._all_history = [(t, k) for t, _n, ks in counts for k in ks]
+            counts = [(t, n) for t, n, _ks in counts]
             with_hist = sorted([c for c in counts if c[1]], key=lambda c: (-c[1], c[0]))
+            nav, member = getattr(self.app, "_navigator", None), self.app.case.active
+            if nav is not None and member is not None and member.db is db:
+                nav.set_history(member.uid, dict(with_hist))    # the tables get a mark
             without = [c for c in counts if not c[1]]
             labels, values = {}, []
+            if with_hist:
+                label = "All tables  (%s changed)" % format(len(self._all_history), ",")
+                labels[label] = "__all__"
+                values.append(label)
             for t, n in with_hist:
                 label = "%s  (%s changed)" % (t, format(n, ","))
                 labels[label] = t
@@ -733,8 +1388,15 @@ class ForensicsTab(ttk.Frame):
                 labels[t] = t
                 values.append(t)
             self._hist_labels = labels
-            self.history_table.configure(values=values)
-            if with_hist:
+            self._hist_values = (values, values[:len(with_hist) + 1] if with_hist else [])
+            row = self._hist_only_cb.master
+            row.show(self._hist_only_cb, bool(with_hist) and len(with_hist) < len(counts))
+            self.history_table.configure(values=self._hist_list())
+            want = getattr(self, "_hist_want", None)
+            self._hist_want = None
+            if want and want in labels.values():
+                self.show_table_history(want)
+            elif with_hist:
                 self.history_table.set(values[0])
                 self.start_history_summary()
                 self.history_status.configure(
@@ -753,6 +1415,9 @@ class ForensicsTab(ttk.Frame):
     def start_history_summary(self):
         table = self._hist_table()
         if not table or not self.db.ok:
+            return
+        if table == "__all__":
+            self._show_all_history()
             return
         self._history_summary_for = table
         db = self.db
@@ -773,7 +1438,7 @@ class ForensicsTab(ttk.Frame):
             cap = limits.get("forensics_history_keys")
             for i, k in enumerate(interesting[:cap]):
                 tree.insert("", "end", iid=str(i), values=(
-                    k.locator.display(), k.versions, "yes" if k.deleted else "",
+                    table, k.locator.display(), k.versions, "yes" if k.deleted else "",
                     "; ".join(k.reuse), "yes" if k.wal_only else "",
                     "%s → %s" % (k.first or "", k.last or "")))
             self._summary_shown = interesting[:cap]
@@ -813,46 +1478,77 @@ class ForensicsTab(ttk.Frame):
             rows = []
         self._summary_shown = []
         cap = limits.get("forensics_history_keys")
-        for i, r in enumerate(rows[:cap]):
-            rid = r[0]
-            disp = str(rid)
+        # the live rows, plus the rows only the history knows (deleted, WAL only), in key order
+        live = [str(r[0]) for r in rows]
+        seen = set(live)
+        keys = live + [d for d in changed_map if d not in seen]
+
+        def order(d):
+            try:
+                return (0, int(d), "")
+            except (TypeError, ValueError):
+                return (1, 0, d)
+        keys.sort(key=order)
+        for i, disp in enumerate(keys[:cap]):
             k = changed_map.get(disp)
             if k is not None:
                 self._summary_shown.append(k)
-                vals = (k.locator.display(), k.versions, "yes" if k.deleted else "",
+                vals = (table, k.locator.display(), k.versions, "yes" if k.deleted else "",
                         "; ".join(k.reuse), "yes" if k.wal_only else "",
                         "%s \u2192 %s" % (k.first or "", k.last or ""))
             else:
                 # Unchanged row: single current version
                 self._summary_shown.append(None)
-                vals = (disp, 1, "", "", "", "current only")
+                vals = (table, disp, 1, "", "", "", "current only")
             tree.insert("", "end", iid=str(i), values=vals)
         n_changed = len([k for k in changed_map.values() if k.versions > 1 or k.deleted or k.reuse])
         n_deleted = len([k for k in changed_map.values() if k.deleted])
         total_txt = format(total, ",") if total is not None else "?"
         text = ("%s: %s total rows, %d with changes (%d deleted) \u2014 click a row "
                 "to see every version.") % (table, total_txt, n_changed, n_deleted)
-        if len(rows) >= cap:
-            text += " (showing first %s)" % format(cap, ",")
+        if len(rows) >= cap or len(keys) > cap:
+            text += " (showing the first %s: limit forensics_history_keys)" % format(cap, ",")
+        self.history_status.configure(text=text)
+
+    def _show_all_history(self):
+        """Every changed row of every table in one list (found by the overview)."""
+        rows = getattr(self, "_all_history", None) or []
+        tree = self.keys_tree
+        tree.delete(*tree.get_children())
+        cap = limits.get("forensics_history_keys")
+        self._summary_shown = []
+        for i, (t, k) in enumerate(rows[:cap]):
+            self._summary_shown.append(k)
+            tree.insert("", "end", iid=str(i), values=(
+                t, k.locator.display(), k.versions, "yes" if k.deleted else "",
+                "; ".join(k.reuse), "yes" if k.wal_only else "",
+                "%s \u2192 %s" % (k.first or "", k.last or "")))
+        tables = len(set(t for t, _k in rows))
+        text = "%s changed rows in %d tables \u2014 click a row to see every version." % (
+            format(len(rows), ","), tables)
+        if len(rows) > cap:
+            text += " The first %s are listed (limit forensics_history_keys)." % format(cap, ",")
         self.history_status.configure(text=text)
 
     def _on_key(self, _e=None):
         sel = self.keys_tree.selection()
         if sel:
             k = self._summary_shown[int(sel[0])]
+            table = self._row_table(sel[0])
             if k is None:
                 # Unchanged row in "show all" mode: look up by the displayed rowid
                 vals = self.keys_tree.item(sel[0], "values")
-                self.show_history(self._hist_table(), parse_key(vals[0]))
+                self.show_history(table, parse_key(vals[1]), keep_list=True)
             else:
-                self.show_history(self._hist_table(), k.locator)
+                self.show_history(table, k.locator, keep_list=True)
 
-    def show_history(self, table, key):
-        """Show every version of one row (key: a Locator, a rowid or a key text)."""
+    def show_history(self, table, key, keep_list=False):
+        """Show every version of one row (key: a Locator, a rowid or a key text). keep_list:
+        picked from the changed-rows list (All tables stays chosen)."""
         if not table or key in (None, "") or not self.db.ok:
             return
         self.nb.select(self._history_page)
-        if self._hist_table() != table:
+        if self._hist_table() != table and not keep_list:
             self.history_table.set(table)
         db = self.db
 
@@ -873,7 +1569,7 @@ class ForensicsTab(ttk.Frame):
                 tags = ("gone",) if not v.present else ("current",) if v.current else ()
                 tree.insert("", "end", iid=str(i), tags=tags, values=(
                     i + 1, ("deleted" if not v.present else v.era), v.where(),
-                    "" if v.commit_group is None else v.commit_group,
+                    "" if v.commit_group is None else v.commit_group + 1,
                     ", ".join(v.changed), v.note))
             state = "deleted" if history.deleted else "present"
             notes = list(getattr(history, "notes", ()) or ())
@@ -893,12 +1589,140 @@ class ForensicsTab(ttk.Frame):
         tree = self.values_tree
         tree.delete(*tree.get_children())
         if v.values is None:
-            tree.insert("", "end", values=("(row deleted here)", "", ""))
+            tree.insert("", "end", values=("(row deleted here)", "", "", ""))
             return
         self._version_values = list(v.values)
         for i, (c, val) in enumerate(zip(self._history.columns, v.values)):
             tree.insert("", "end", iid=str(i), tags=("changed",) if c in v.changed else (),
-                        values=(c, vb(val), type(val).__name__ if val is not None else "NULL"))
+                        values=(c, vb(val), value_type(val),
+                                date_reading(self.db, self._history.table, c, val)))
+
+    def _history_value_at(self):
+        sel = self.values_tree.selection()
+        if not sel or self._history is None:
+            return None, None
+        try:
+            i = int(sel[0])
+            return self._history.columns[i], self._version_values[i]
+        except (AttributeError, IndexError, ValueError):
+            return None, None
+
+    def _history_copy_value(self):
+        col, v = self._history_value_at()
+        if col is not None:
+            from engine.export import csv_cell
+            self.clipboard_clear()
+            self.clipboard_append(csv_cell(v))
+
+    def _history_copy_version(self):
+        if self._history is None or not getattr(self, "_version_values", None):
+            return
+        from engine.export import csv_cell
+        self.clipboard_clear()
+        self.clipboard_append("\n".join("%s\t%s" % (c, csv_cell(v)) for c, v in
+                                         zip(self._history.columns, self._version_values)))
+
+    def _history_rows(self):
+        """(header, rows) of every version of the row: version, state, where, commit (from
+        1, as the WAL tab), then the columns."""
+        h = self._history
+        from engine.export import csv_cell
+        head = ["version", "state", "where", "commit"] + list(h.columns)
+        rows = []
+        for i, v in enumerate(h.versions):
+            rows.append([i + 1, "deleted" if not v.present else v.era, v.where(),
+                         "" if v.commit_group is None else v.commit_group + 1] +
+                        [csv_cell(x) for x in (v.values or [None] * len(h.columns))])
+        return head, rows
+
+    @staticmethod
+    def _csv_text(head, rows):
+        import csv
+        import io as _io
+        out = _io.StringIO()
+        w = csv.writer(out, lineterminator="\n")
+        w.writerow(head)
+        w.writerows(rows)
+        return out.getvalue()
+
+    def _history_copy_all(self):
+        """Every version of the row as CSV (version, where, commit, then the columns)."""
+        if self._history is None:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(self._csv_text(*self._history_rows()))
+
+    def _save_csv(self, name, head, rows, source):
+        """Write a CSV the examiner chose, with its manifest (tool, evidence, what it holds);
+        never inside an evidence folder. Returns the path, or None."""
+        path = filedialog.asksaveasfilename(parent=self, defaultextension=".csv",
+                                            initialfile=name,
+                                            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if not write_allowed(path):
+            return None
+        from engine.export import evidence_record, provenance, write_manifest
+        protected = getattr(getattr(self.app, "case", None), "is_protected", None)
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(self._csv_text(head, rows))
+            files = evidence_record(self.db.evidence, wait=False)
+            info = provenance(VERSION, [(self.db.evidence.main, files)], source,
+                              columns=head, rows=len(rows))
+            write_manifest(path, info, [path], True, protected)
+        except (OSError, ValueError) as e:
+            self.history_status.configure(text="Could not save %s: %s" % (path, e))
+            return None
+        self.history_status.configure(text="Saved %s rows to %s (with its .manifest.json)"
+                                           % (format(len(rows), ","), path))
+        return path
+
+    def _history_save_versions(self):
+        h = self._history
+        if h is None:
+            self.history_status.configure(text="Choose a row first: its versions are saved.")
+            return None
+        head, rows = self._history_rows()
+        key = getattr(h.locator, "display", lambda: "row")()
+        return self._save_csv("%s_row_%s_history.csv" % (h.table, key), head, rows,
+                              "Row history of %s row %s (every version)" % (h.table, key))
+
+    def _history_save_list(self):
+        """The changed-rows list as shown (table, key, versions, deleted, reuse, WAL only,
+        span)."""
+        tree = self.keys_tree
+        head = [tree.heading(c, "text") or c for c in tree["columns"]]
+        rows = [list(tree.item(i, "values")) for i in tree.get_children()]
+        if not rows:
+            self.history_status.configure(text="The list is empty: nothing to save.")
+            return None
+        return self._save_csv("row_history_changed_rows.csv", head, rows,
+                              "Row history: rows with changes (%s)" % self.history_table.get())
+
+    def _history_open_row(self):
+        """The row's live version in the row window (a deleted row has none: said)."""
+        h = self._history
+        if h is None or h.locator is None:
+            return
+        if h.deleted:
+            self.history_status.configure(text="This row is deleted: its versions are listed "
+                                               "here; there is no live row to open.")
+            return
+        from dialogs import RowWin
+        RowWin.show(self.app, self.db, h.table, h.locator)
+
+    def _history_value_menu(self, e):
+        iid = self.values_tree.identify_row(e.y)
+        if not iid:
+            return
+        self.values_tree.selection_set(iid)
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Copy value", command=self._history_copy_value)
+        m.add_command(label="Copy this version", command=self._history_copy_version)
+        m.add_command(label="Copy every version (CSV)", command=self._history_copy_all)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
 
     def _on_history_value(self, _e=None):
         sel = self.values_tree.selection()
@@ -1065,7 +1889,8 @@ class ForensicsTab(ttk.Frame):
                 not getattr(self, "_busy", False):
             if getattr(self, "_hist_overview_for", None) is not self.db.session:
                 self.start_history_overview()       # which tables have rows with history
-            elif getattr(self, "_history_summary_for", None) != self._hist_table() and                     not getattr(self, "_hist_no_sources", False):
+            elif getattr(self, "_history_summary_for", None) != self._hist_table() and \
+                    not getattr(self, "_hist_no_sources", False):
                 self.start_history_summary()
 
     def start_audit(self):
@@ -1160,94 +1985,3 @@ class ForensicsTab(ttk.Frame):
                                                               manifest_text(manifest, why)),
                 parent=self)
         self._run("report", work, done, status, "Writing the report")
-
-
-class RecordWindow(tk.Toplevel):
-    """One recovered record: its values, where it was found and how sure the match is."""
-
-    def __init__(self, parent, record, app):
-        tk.Toplevel.__init__(self, parent)
-        self.record, self.app = record, app
-        r, p = record, record.prov
-        self.title("Row detail — recovered record, %s" % (r.table or "unknown table"))
-        fit_geometry(self, 820, 560)
-        self.configure(bg=C["bg"])
-        conf_bg, conf_fg = {"high": (K["success_soft"], K["success_text"]),
-                           "medium": (K["warning_soft"], K["warning"]),
-                           "low": (K["danger_soft"], K["danger_text"]),
-                           }.get(r.confidence, (C["bg"], K["text"]))
-        head = tk.Frame(self, bg=conf_bg, padx=10, pady=6)
-        head.pack(fill="x")
-        what = "table %s" % (r.table or "(unknown)")
-        if getattr(r, "index", None) is not None:
-            what = "index entry of %s (table %s)" % (r.index, r.table)
-        tk.Label(head, text="%s   |   %s   |   rowid %s   |   %s confidence" % (
-                     p.where(), what, "unknown" if r.rowid is None else r.rowid,
-                     r.confidence), bg=conf_bg, fg=conf_fg, font=F["heading"],
-                 anchor="w").pack(fill="x")
-        extra = list(r.reasons)
-        if r.flags:
-            extra.append("flags: " + ", ".join(sorted(r.flags)))
-        if len(r.candidates or ()) > 1:
-            extra.append("also fits: " + ", ".join(c for c in r.candidates if c != r.table))
-        if r.copies:
-            extra.append("also found at: " + "; ".join(c.where() for c in r.copies[:8]))
-        tk.Label(head, text="\n".join(extra), bg=conf_bg, fg=conf_fg, anchor="w",
-                 justify="left", wraplength=780, font=F["small"]).pack(fill="x")
-        fbar = ttk.Frame(self)
-        fbar.pack(fill="x", padx=8, pady=(6, 0))
-        self.find = SearchBox(fbar, placeholder="Find a column or value…", delay=100,
-                              primary=True, width=30)
-        self.find.pack(side="left", fill="x", expand=True)
-        box = ttk.Frame(self)
-        box.pack(fill="both", expand=True, padx=8, pady=6)
-        self.tree = ttk.Treeview(box, columns=("col", "value", "type"), show="headings")
-        for c, text, w in (("col", "Column", 180), ("value", "Value", 500), ("type", "Type", 90)):
-            self.tree.heading(c, text=text)
-            self.tree.column(c, width=w, stretch=(c == "value"))
-        ysb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=ysb.set)
-        ysb.pack(side="right", fill="y")
-        self.tree.pack(fill="both", expand=True)
-        for i, (c, v) in enumerate(zip(r.columns, r.values)):
-            self.tree.insert("", "end", iid=str(i),
-                             values=(c, vb(v), type(v).__name__ if v is not None else "NULL"))
-        self.filter = TreeFilter(self.tree, self.find, "column", "columns")
-        self.tree.bind("<Double-1>", self._open_value)
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=8, pady=6)
-        if r.table and r.rowid is not None:
-            ttk.Button(btns, text="Row history", command=self._history).pack(side="left")
-        tag_btn = ttk.Button(btns, text="Tag ▾")
-        tag_btn.configure(command=lambda: self._tag_popup(tag_btn))
-        tag_btn.pack(side="left", padx=4)
-        ttk.Button(btns, text="Copy as JSON", command=self._copy_json).pack(side="left", padx=4)
-        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
-
-    def _open_value(self, _e=None):
-        sel = self.tree.selection()
-        if not sel:
-            return
-        i = int(sel[0])
-        v = self.record.values[i]
-        if isinstance(v, bytes):
-            self.app.open_blob(v, self.record.columns[i], "%s.%s (recovered, %s)" % (
-                self.record.table or "?", self.record.columns[i], self.record.prov.where()))
-
-    def _history(self):
-        self.app.show_row_history(self.record.table, self.record.rowid)
-        self.destroy()
-
-    def _tag_popup(self, button):
-        menu = tk.Menu(self, tearoff=0)
-        self.app.tag_menu(menu, lambda: [entry_from_record(self.record)], label="Tag this record")
-        try:
-            menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
-        finally:
-            menu.grab_release()
-
-    def _copy_json(self):
-        import json
-        self.clipboard_clear()
-        self.clipboard_append(json.dumps(self.record.as_dict(), indent=2, ensure_ascii=False,
-                                         default=str))

@@ -11,6 +11,7 @@ import time
 import unittest
 
 import tests.helpers  # noqa: F401 - puts src/ on sys.path
+from tests.helpers import within  # noqa: E402
 from engine.decode import zstd
 
 try:
@@ -548,7 +549,7 @@ class HandBuilt(unittest.TestCase):
         data = frame(block(b"abc", btype=0), fhd=0xE0, header=b"\xff" * 8)
         t = time.perf_counter()
         out, status, reason, end, info = zstd.decompress(data, BIG)
-        self.assertLess(time.perf_counter() - t, 0.5)
+        within(self, time.perf_counter() - t, 0.5, "a small frame's decompression")
         self.assertEqual((out, status), (b"abc", "ok"))
         self.assertEqual(info["problems"],
                          ["frame declares %d bytes of content, decoded 3" % ((1 << 64) - 1)])
@@ -577,7 +578,7 @@ class HandBuilt(unittest.TestCase):
         data = frame(*([one] * 64 + [block(b"", btype=0)]), wd=0x38)  # 128 KiB window
         t = time.perf_counter()
         out, status, reason, end, info = zstd.decompress(data, 300000)
-        self.assertLess(time.perf_counter() - t, 1.0)
+        within(self, time.perf_counter() - t, 1.0, "a capped decompression")
         self.assertEqual((len(out), status), (300000, "capped"))
         self.assertEqual(zstd.decompress(data, BIG)[0], b"q" * (64 << 17))
 

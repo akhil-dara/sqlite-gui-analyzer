@@ -49,11 +49,15 @@ any other SQLite file. One Python file, the standard library only, read-only by 
 |---|---|
 | **Never touches the evidence** | Opened with SQLite's `immutable` mode, the WAL merged in memory, SHA-256 at open and on close. No copy, no `-shm`, nothing written next to the file. |
 | **Finds what other viewers miss** | Rows only in the WAL, overwritten versions, deleted records carved from freed pages, freeblocks and index entries, a table as it was before the journaled transaction. |
+| **Analyse without SQL** | The Query tab joins tables on their links; tick columns, filter with month bars, value lists and number ranges, summarise and group - and see the SQL it runs. |
+| **Fields inside BLOBs and JSON, as columns** | A payment's sender, receiver and amount out of a plist, NSKeyedArchiver, protobuf or JSON value: new columns you sort, filter, join on and export. |
+| **Formulas of your own** | Right-click a column › Calculate from…: `round(x / 100, 2)`, `date(x, "ms")`, `json(x, "to.name")`, `size(x)` - a new column checked live on real rows; nothing stored changes. |
+| **Pick the databases you need** | Open Folder with your own conditions (file name, path, folder, extension, size): every `History` and `places.sqlite` of every user and profile in one scan, the other files never opened. |
 | **Fast on huge databases** | 5 GB, 270 tables, millions of rows: scrolling stays instant, search runs in parallel across tables and databases. |
 | **Decodes the hard parts** | bplist / NSKeyedArchiver, protobuf, typedstream, gzip, zlib, LZ4, LZFSE, zstd BLOBs; Unix, WebKit, Cocoa, FILETIME and other timestamps with a format you choose. |
 | **Many databases as one case** | Open a folder of 30–60 databases: one navigator, one search, a timeline across all of them, links found between databases. |
 | **Safe with hostile files** | Every input is treated as crafted by an adversary: fuzzed parsers, size and time budgets, a Safe parse mode where SQLite's C code never reads the file. |
-| **No install needed** | Installer or portable exe for Windows; `python sqlite_gui_analyzer.py` anywhere with Python 3.8+. |
+| **No install needed** | Installer or portable zip for Windows; `python sqlite_gui_analyzer.py` anywhere with Python 3.8+. |
 
 ---
 
@@ -66,7 +70,6 @@ They include Python, Tcl/Tk and Pillow, so nothing else needs to be installed.
 |------|-----------|
 | `SQLiteGUIAnalyzer-<version>-setup.exe` | Install. It asks whether to install for you only (no administrator rights) or for all users, and adds a Start menu entry, an optional desktop icon, optional "Open with" entries for `.db`, `.sqlite`, `.sqlite3` and `.db3` files, and an uninstaller. |
 | `SQLiteGUIAnalyzer-<version>-portable.zip` | Run without installing: unzip anywhere (for example a USB drive) and start `SQLiteGUIAnalyzer.exe`. |
-| `SQLiteGUIAnalyzer-<version>-portable.exe` | Run without installing, as one file. It unpacks itself to a temporary folder on every start, so it starts more slowly than the zip. |
 | `SHA256SUMS.txt` | Check a download: `Get-FileHash <file> -Algorithm SHA256` in PowerShell. |
 
 - Unattended install: `SQLiteGUIAnalyzer-<version>-setup.exe /VERYSILENT /CURRENTUSER`
@@ -82,14 +85,15 @@ On macOS and Linux, [run from source](#run-from-source).
 
 ## Screenshots
 
-All screenshots show an invented demo case (a chat app, an address book and a browser
-history); no real data.
+All screenshots show invented demo cases (a chat app, a payments app, an address book and
+a browser history); no real data.
 
 | | |
 |---|---|
-| ![Search across every table of three databases](docs/screenshots/search.png) **Search** every table of every database at once — one line per row, grouped by database. | ![Deleted records recovered from freed pages and the WAL](docs/screenshots/recovered.png) **Recover deleted records** from freed pages, freeblocks, the WAL and index entries, each with a confidence. |
+| ![Search across every table of three databases](docs/screenshots/search.png) **Search** every table of every database at once — one line per row, grouped by database. | ![Recovered records: a message deleted and inserted again, with where it was found and why](docs/screenshots/recovered.png) **Recover deleted records** from freed pages, freeblocks, the WAL and index entries: each says what it is (deleted, older version, inserted again…), where it was found and how sure the match is. |
+| ![Query tab joining three tables without SQL](docs/screenshots/query.png) **Query without SQL**: add tables, they join on their links; tick columns, filter, summarise — "What you'll get" says it in words. | ![A trigger explained in plain words above its SQL](docs/screenshots/triggers.png) **Triggers in plain words**: what the database does by itself — deletes, prunes, logs changes — above the trigger's SQL. |
 | ![Row History lists the rows with more than one version](docs/screenshots/row_history.png) **Row History** finds the rows with several versions in every table and shows each version. | ![Timeline with a density chart across three databases](docs/screenshots/timeline.png) **Timeline** of every dated row of every database, with a density chart and named time zones. |
-| ![Relationships diagram of the message table](docs/screenshots/diagram.png) **Relationships** found from foreign keys and from the values themselves, drawn as a diagram. | ![Overview of a case of three databases](docs/screenshots/overview.png) **Overview** of a case: date range, biggest tables, links between databases, evidence hashes. |
+| ![Relationships diagram of the message table](docs/screenshots/diagram.png) **Relationships** found from foreign keys and from the values themselves, drawn as a diagram. | ![Overview of a case of three databases](docs/screenshots/overview.png) **Overview** of a case: date range, biggest tables, links between databases, triggers, evidence hashes. |
 | ![Row detail with timestamps decoded](docs/screenshots/row_detail.png) **Row detail**: every value selectable, dates decoded, Copy as UTC / Unix / WebKit. | ![Date format chooser with examples](docs/screenshots/date_format.png) **Date formats** shown with your own value as the example, or write your own pattern. |
 | ![BLOB inspector showing a decoded bplist as an XML property list](docs/screenshots/blob_inspector.png) **BLOB inspector**: bplist, protobuf and compressed BLOBs decoded, each in the view that suits it (XML plist, protobuf fields, JSON), searchable. | ![Excel-style column filter with value counts](docs/screenshots/column_filter.png) **Column filters** like a spreadsheet: values with counts, conditions, chips, undo. |
 
@@ -101,6 +105,10 @@ history); no real data.
 ![Timeline in the dark theme](docs/screenshots/timeline_dark.png)
 ![Relationships diagram in the dark theme](docs/screenshots/diagram_dark.png)
 ![BLOB inspector in the dark theme](docs/screenshots/blob_inspector_dark.png)
+![Overview in the dark theme](docs/screenshots/overview_dark.png)
+![Recovered records in the dark theme](docs/screenshots/recovered_dark.png)
+![Query tab in the dark theme](docs/screenshots/query_dark.png)
+![A trigger explained in the dark theme](docs/screenshots/triggers_dark.png)
 
 </details>
 
@@ -126,8 +134,11 @@ results stream in live.
   in BLOBs, Byte pattern (hex)) and schema (Column Name)
 - **One line per row**: a row matching in several columns is listed once ("Matched in: a, b"),
   with its matching cells underneath; untick the option to list every cell
-- Per-table row counts; filter results by database (in a case), source (DB / WAL / Freed
-  pages), table, column or data type
+- **Every line says what it is**: `Live row` (with `· WAL ×n` when WAL frames hold copies),
+  `WAL version · stale` (a version the database no longer shows), or `Recovered · p.1318 @ 690`
+  (a recovered record, tinted, with its page and offset); the Kind filter uses the same words
+- Per-table row counts; filter results by database (in a case), kind, table, column or data
+  type
 - Regex engine with automatic LIKE pre-filtering for fast pattern matching
 - Max rows/table (100 / 500 / 1,000 / 5,000 / All): one matching row more is read, so only a
   table that had more is named in the status ("stopped at 100 matching rows … urls") and marked
@@ -137,7 +148,7 @@ results stream in live.
   one database or, in a case, each database's tables under its name
 - **Include views** (off by default, since views repeat rows of their tables): views are
   searched too, their lines are marked "(view)" and open the matched view row in its row detail
-- **Include WAL row versions** and **Include freed pages** (offered only when a searched
+- **Include WAL row versions** and **Recovered records** (offered only when a searched
   database has them) search those with the same matching rules: a row version copied into many WAL frames
   is one result listing all its frames, and a WAL copy identical to a matching database row is
   shown on that row's line ("DB + WAL x65") instead of being repeated
@@ -150,8 +161,22 @@ results stream in live.
 An extraction usually holds many databases that belong together (a phone's WhatsApp, PhonePe,
 contacts, SMS and Chrome databases...). **Open ▾ › Open folder…** lists every file of a folder
 that starts with the SQLite header (size, WAL / journal, relative path; all ticked, a filter,
-Select all / none, optionally the subfolders); **Open ▾ › Add database(s)…** adds files from
-any folders. The workspace stays clear with 30, 60 databases:
+Select all / none / Tick shown only, columns that sort on a click, optionally the
+subfolders); **Open ▾ › Add database(s)…** adds files from any folders. The workspace stays
+clear with 30, 60 databases.
+
+The dialog goes in three steps: **1 Folder** (and its subfolders or not), **2 Which files**
+(optional conditions of your own: file name, path in the folder, folder name, extension or
+size, with is / is not / contains / does not contain / starts with / ends with / matches
+(`*` and `?`) / at least / at most; all or any of them), **3 Scan for databases**. Nothing is
+read before Scan, and the line beside it says what the scan will do. Files that do not match
+the conditions are never opened: for a users folder with many accounts and browser
+profiles, `File name is History` or `File name is places.sqlite` lists every such database of
+every profile (a scan of 890,000 files opened 1,900 of them). The scan lists databases as it
+finds them, with the files seen and Stop; a stopped scan keeps what it found and offers Scan
+again. Afterwards the conditions and the find box filter the list live (changed settings
+are said: Scan again looks with them). Then open them all and search or put them on one
+timeline: every result says which database it is from.
 
 - Each database is opened exactly like a single one: read-only, immutable, never copied, its own
   WAL overlay and SHA-256. The databases open one after the other on a worker thread, so the
@@ -284,6 +309,16 @@ grid keeps showing the rows drawn last, and the status line already shows the ne
   WebKit, FILETIME, HFS+, .NET, OLE, GPS or Off. Sorting, filters, copies of rows and exports
   keep the stored values; the tooltip, the row panel and 'Copy raw value' give them. The
   choice is kept per table
+- **Calculate from…**: right-click a column header for a new ƒ= column worked out from
+  the row by a formula of your own (`round(x / 100, 2)`, `x * qty + fee`,
+  `upper(left(name, 3))`, `x if x > 0 else 0`, `date(x, "ms")`, `json(x, "to.name")`)
+  or by steps, checked as you type with a live preview on real rows; sortable, filterable,
+  exported as its own column, remembered per table name; nothing stored changes
+- **Show as number**: right-click a column header to draw a stored number divided by 100
+  (amounts kept in the smallest unit: 34000 shows 340.00), 1,000 or 1,000,000, or with
+  thousands separators -- exact for integers, a '÷100' badge on the header; copies keep
+  the stored value, exports add 'amount (÷100)' beside it; remembered per table and
+  column, also on ƒ columns
 - Damaged and pre-ALTER rows are tinted and explained above the grid
 - CSV / JSON export of every row passing the filters; bulk BLOB export
 - WAL-only tables accessible from the Browse dropdown ("WAL: name"): read on a worker, with the
@@ -459,6 +494,33 @@ folder) with its tables and their row counts.
 - **Interactive HTML schema report** (Database ▾ > Schema report) -- with live search, copy
   buttons, constraint badges, and print layout
 
+### Query without SQL
+
+- **Query tab**: add tables and they join on their links (the strongest one per table, the
+  others a right-click away); tick the columns to show; "What you'll get" says the query in
+  words, and the SQL tab shows exactly what runs
+- **Conditions** on any column: month bars and calendars for dates, value lists with counts,
+  number ranges, every SQLite comparison; summaries per column (count, distinct, min, max,
+  sum, average); calculated columns; across the databases of a case and over recovered rows
+- **Fields inside values**: a BLOB or JSON column (plists, NSKeyedArchiver, protobuf, JSON)
+  lists the fields its values hold; tick them to get them as columns, or join another table on
+  one (a payment's sender to the contacts table). In Browse the same fields become new columns
+  of the grid, named `ƒ from.name`, `ƒ amount` (the full path, so the same key under two
+  parents gives two columns), drawn in their own colour and counted in the status line; sort,
+  filter, copy and export them like any column; the choice is remembered per table name
+
+### Triggers in plain words
+
+- Select a trigger in the navigator: what it does, read from its SQL (never run), above the
+  SQL -- "When a row is deleted from call_log: deletes rows of call_log_participant_v2 where
+  ..."; a table lists the triggers that fire on it or change it; the Overview counts each
+  database's triggers and how many delete rows by themselves
+
+### WAL time machine
+
+- Open a WAL database as it was after any of its commits, beside the current state, read-only;
+  the banner says when a checkpoint already copied later commits into the main file
+
 ### WAL Forensic Analysis
 
 Dedicated tab for analyzing SQLite Write-Ahead Log (WAL) files at the binary level. Recovers data that standard SQLite tools cannot see.
@@ -495,9 +557,18 @@ Dedicated tab for analyzing SQLite Write-Ahead Log (WAL) files at the binary lev
   why (Stop, the time limit, or the limit `carve_max_records`); a table or index too large to
   compare with its live rows (limits `live_hash_rows`, `live_index_entries`) is named in the
   status, since copies of live rows are then not told apart there
+- **What each record is**: index entry, unreferenced page (rows on pages nothing references,
+  listed apart: they may be live rows a damaged or manipulated tree hides), older version
+  (the row is live with other values, or its UNIQUE key is live under another rowid),
+  inserted again (deleted, and the same values are live under another rowid, which the
+  record names), or deleted. A record says what an index entry proves, and when the
+  database's own triggers delete or log rows of its table
+- **Missing row numbers** (right-click a table): the rowids a table no longer has -- gaps, and
+  with AUTOINCREMENT the numbers after the last row up to `sqlite_sequence` -- deleted rows
+  even when nothing of them can be recovered, cross-checked with the recovered records
 - **Freed Pages** (only for a database with freed pages): the pages of the freelist with the
   records still on them -- read by the same carver, so with the same confidence and reasons as
-  Recovered Records and Search's "Include freed pages" -- and each page's bytes
+  Recovered Records and Search's "Recovered records" -- and each page's bytes
 - **Deleted index entries**: entries of ordinary indexes (plain, composite, DESC, expression,
   UNIQUE and partial indexes, and the automatic indexes of UNIQUE / PRIMARY KEY constraints) are
   carved from the same places and attributed to their index and table: the indexed values and
@@ -522,8 +593,9 @@ Dedicated tab for analyzing SQLite Write-Ahead Log (WAL) files at the binary lev
 - A job that fails says why in its sub-tab and is logged under Issues; switching the active
   database says in each sub-tab that its results were cleared
 
-Tested against deleted-record test sets with known answers: every row still physically present
-in the file was recovered, with no false positives.
+Tested against deleted-record test sets with known answers (NIST CFTT, a public corpus of 141
+databases, published research scenarios): no live row is reported as deleted, and of the
+rows missed, all but a handful were checked byte by byte to be no longer in the files.
 
 ### Timeline
 
@@ -589,6 +661,15 @@ the table and the row.
   (5 fields)", "PNG 640×480") and opens in the BLOB Inspector
 - Copy row as JSON, CSV, or plain text -- every value whole (BLOBs as hex)
 - Search result highlighting -- scrolls to and highlights the matched column
+- **A recovered record** opens in its own window: a banner with its state (deleted, older
+  version, inserted again, unreferenced page, index entry), table, rowid, confidence and where
+  its bytes are (`page 1318 @ 690 · byte 5,395,122 (0x5252B2) of data.db · 1,471
+  bytes`), then Values (copy with a right-click or Ctrl+C, view whole with JSON pretty-printed),
+  Where found (file, page, offset in the page, byte offset in the file, length, WAL frame,
+  overflow pages, other places the same record was found, why it was read so) and Bytes (the
+  page as the file holds it, the record highlighted); Copy ▾ and Save ▾ give the record as
+  JSON with its provenance, CSV, text or its bytes. Recovered records in Forensics and Browse
+  carry a Byte offset column, and reports carry the file path and byte offset of every record
 
 ### BLOB Inspector
 
@@ -962,6 +1043,7 @@ src/
                              saved cases
     tag_export.py            Tagged rows as an HTML report, a CSV folder or JSON
     case.py                  Folder scan (SQLite header), database identity, names, colours
+    filematch.py             Conditions on the files of a folder (name, path, size...)
     crossdb.py               Links between the databases of a case, matched by value
     timeline.py              Date column detection, dated events (SQL / native), export
     linkgraph.py             The relationship diagram: layout and SVG
@@ -999,6 +1081,10 @@ src/
   jobs.py                    Long jobs with progress and Stop; the export dialog and writer
   timeline_tab.py            Timeline tab (date columns, events, exports)
   date_columns.py            Browse 'Show as date' column formats
+  number_display.py          Browse 'Show as number' (÷100, ÷1,000, separators)
+  calc_columns.py            Browse 'Calculate from…' (ƒ= columns by formula or steps)
+  engine/formula.py          Formulas: a closed expression language, nothing executed
+  guide.py                   The illustrated guide (one HTML page, Help / palette)
   appicons.py                The logo and illustrations (assets/, PNG read by Tk)
   assets/                    Logo sizes, welcome and empty-state illustrations
   datamap_ui.py              Copy with related, Export Database Map and Limits windows
@@ -1036,13 +1122,31 @@ tools/
   release.py                 Version, version resource, tag check, zip, checksums, release notes
   run_self_test.ps1          Runs a built exe's --self-test and checks its exit code
   build-requirements.txt     PyInstaller and Pillow versions for the Windows builds
-sqlite-gui-analyzer.spec     PyInstaller build (folder and single-file programs)
+sqlite-gui-analyzer.spec     PyInstaller build (the program folder)
 installer/
   sqlite-gui-analyzer.iss    Inno Setup script (per-user or all-users installer)
 .github/workflows/           CI (tests on Windows and Linux, Python 3.8-3.14) and Release
 CHANGELOG.md                 Changes per version (also the release notes)
 ```
 
+## Built on
+
+The program is the Python standard library and nothing else: Tkinter for the window,
+`sqlite3` for SQL on the databases it opens, and the library's own modules for files,
+hashing, threads, JSON and plists. Every reader of the bytes themselves (pages, cells, the
+write-ahead log, the rollback journal, freed pages, free space, index entries, the decoders
+for JSON, plists, archives and protobuf) is this project's own work.
+
+The Windows builds bundle Python, Tcl/Tk and Pillow (image previews) and are packaged
+with PyInstaller and Inno Setup; the licenses of each are listed in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+## Contributors
+
+Thanks to [digitalsleuth](https://github.com/digitalsleuth) for the packaging metadata, the
+PyInstaller specification, the icon and the version file, and to Sujay Adkesar for the
+first SQL editor and freelist recovery tabs.
+
 ## License
 
-MIT
+Released under the MIT License. © 2026 Akhil Dara.

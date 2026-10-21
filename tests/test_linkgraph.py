@@ -9,6 +9,7 @@ import unittest
 import xml.dom.minidom
 
 import tests.helpers  # noqa: F401 - puts src/ on sys.path
+from tests.helpers import within  # noqa: E402
 from engine import limits
 from engine.linkgraph import DB, Link, LinkGraph, overlaps, rects_overlap
 
@@ -109,7 +110,7 @@ class HubLayoutTest(unittest.TestCase, LayoutChecks):
         g = LinkGraph(hub_links())
         t0 = time.time()
         lay = g.layout((DB, "message"))
-        self.assertLess(time.time() - t0, 0.5)
+        within(self, time.time() - t0, 0.5, "the layout")
         self.check(lay)
         groups = [b for b in lay.boxes.values() if b.kind == "group"]
         self.assertEqual(len(groups), 1)
@@ -205,7 +206,7 @@ class OverviewTest(unittest.TestCase, LayoutChecks):
         t0 = time.time()
         lay = g.layout(None)
         took = time.time() - t0
-        self.assertLess(took, 0.5)
+        within(self, took, 0.5, "the layout")
         self.check(lay)
         self.assertEqual(self.signature(lay), self.signature(g.layout(None)))
 

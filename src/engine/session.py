@@ -118,8 +118,12 @@ class OpenCancelled(Exception):
 
 class Session(object):
     def __init__(self, path, ram_limit=DEFAULT_RAM_LIMIT, hash_evidence=True, safe_parse=False,
-                 cancel=None, progress=None):
+                 cancel=None, progress=None, as_of=None):
         """Open the evidence at `path` read-only.
+
+        as_of=k: the database as it was when the WAL's commit k (1 = the first) was written -
+        the frames after it are not applied (the WAL 'time machine'; SessionError when there
+        is no WAL or no such commit).
 
         safe_parse=True: only the built-in parser reads the file; SQLite never opens it (mode
         NATIVE, `safe_parse_reason` says why). It is also chosen automatically when SQLite
@@ -127,6 +131,7 @@ class Session(object):
         cancel() -> True stops a long open (OpenCancelled); progress(text) is told what is
         being read."""
         self.issues = IssueLog(cap=limits.get("issues_kept"))
+        self.as_of = as_of
         self.evidence = EvidenceSet(path)
         # memory the in-RAM view of the WAL may take: the database image is built once and
         # SQLite copies it, so about twice the database size is needed
@@ -168,7 +173,18 @@ class Session(object):
             self._step("schema")
             before = len(self.issues)
             self.schema = SchemaModel(SchemaModel.read_master(self.pager, self.issues), self.issues)
-            if safe_parse:
+            self.encrypted = self._encrypted_hint()
+            if self.encrypted:
+                self.issues.add("looks_encrypted", self.encrypted, "page 1", "error")
+            if getattr(self.pager.header, "signature_damaged", False):
+                # SQLite refuses the file; the built-in parser reads it, and it is said
+                self.issues.add("header_signature_damaged",
+                                "the 16-byte 'SQLite format 3' signature is damaged; the rest "
+                                "of the header and page 1 are intact, so the built-in parser "
+                                "reads the file", "header", "warning")
+                self._use_safe_parse("the file's 'SQLite format 3' signature is damaged "
+                                     "(SQLite would refuse it)")
+            elif safe_parse:
                 self._use_safe_parse("chosen when the database was opened")
             else:
                 damage = self._precheck(before)
@@ -193,9 +209,9 @@ class Session(object):
 
     @classmethod
     def open(cls, path, ram_limit=DEFAULT_RAM_LIMIT, hash_evidence=True, safe_parse=False,
-             cancel=None, progress=None):
+             cancel=None, progress=None, as_of=None):
         return cls(path, ram_limit=ram_limit, hash_evidence=hash_evidence,
-                   safe_parse=safe_parse, cancel=cancel, progress=progress)
+                   safe_parse=safe_parse, cancel=cancel, progress=progress, as_of=as_of)
 
     # -- setup -------------------------------------------------------------
     def _step(self, what):
@@ -207,9 +223,14 @@ class Session(object):
     def _open_wal(self):
         p = self.evidence.path("wal")
         if not p:
+            if self.as_of:
+                raise SessionError("This database has no WAL: there are no commits to go "
+                                   "back to.")
             return None
         try:
             if os.path.getsize(p) == 0:
+                if self.as_of:
+                    raise SessionError("The WAL is empty: there are no commits to go back to.")
                 return None        # an empty -wal is normal after a checkpoint: nothing to apply
             if self._progress is not None:
                 self._progress("reading the WAL")
@@ -218,10 +239,19 @@ class Session(object):
         except WalCancelled:
             raise OpenCancelled("opening stopped while the WAL was read")
         except (WalError, OSError) as e:
+            if self.as_of:
+                raise SessionError("The database cannot be shown as of commit %d: the WAL "
+                                   "cannot be read (%s)." % (self.as_of, e))
             self.wal_problem = (locks.sharing_advice(p) if isinstance(e, OSError)
                                 and locks.is_sharing_violation(e, p) else str(e))
             self.issues.add("wal_unreadable", self.wal_problem, p, "error")
             return None
+        if self.as_of:
+            try:
+                wal.as_of(self.as_of)
+            except WalError as e:
+                wal.close()
+                raise SessionError(str(e))
         if wal.frames_cut:
             self.issues.add("wal_frames_cut",
                             "the WAL holds %s frames; only the first %s were read (%s): later "
@@ -1230,8 +1260,77 @@ class Session(object):
                 yield row
 
     # -- reporting ---------------------------------------------------------
+    def _encrypted_hint(self):
+        """Why the file looks encrypted, or ''. An encrypted database (SQLCipher, as Signal,
+        Session and others use) may keep the 100-byte header readable and reserve bytes at
+        the end of each page for its keys; then page 1 - the schema table - does not decode:
+        its b-tree page type is not one SQLite writes. Nothing in such a file can be read or
+        recovered without the key."""
+        try:
+            h = self.pager.header
+            page1 = bytes(self.pager.page(1))
+        except Exception:               # noqa: BLE001 - an unreadable page 1 is said elsewhere
+            return ""
+        if self.schema.entries:
+            return ""
+        if getattr(h, "signature_damaged", False):
+            # not SQLite's own signature at all, and no table could be read: another
+            # product's database format over SQLite's layout - the encrypted formats write
+            # their own name there ('SQLitecrypt.com!') and keep the page size readable
+            sig = page1[:16]            # page 1 starts with the file header
+            try:
+                sig_text = sig.decode("ascii") if sig and all(32 <= b < 127 for b in sig) else ""
+            except Exception:           # noqa: BLE001
+                sig_text = ""
+            return ("This file is not a plain SQLite database: its header reads %s instead of "
+                    "'SQLite format 3', and no table can be read from it - an encrypted "
+                    "database format (its name is in the header). Without the key nothing in "
+                    "the file - tables or deleted rows - can be read.%s" % (
+                        repr(sig_text) if sig_text else "something else",
+                        " Every page ends with %d reserved bytes." % h.reserved
+                        if getattr(h, "reserved", 0) else ""))
+        if len(page1) < 101 or page1[100] in (2, 5, 10, 13):
+            return ""
+        if not getattr(h, "reserved", 0):
+            return ("Page 1 (the list of tables) is not a page SQLite writes: the file is "
+                    "damaged there, or encrypted with its header left readable. Without page 1 "
+                    "no table is known; Forensics can still look at the other pages.")
+        return ("This file looks encrypted: its SQLite header is readable, but page 1 (the "
+                "list of tables) is not a page SQLite writes%s. Encryption such as SQLCipher "
+                "(Signal, Session and other apps use it) keeps the header readable; without "
+                "the key nothing in the file - tables or deleted rows - can be read." % (
+                    ", and every page ends with %d reserved bytes (room for an encryption "
+                    "key's data)" % h.reserved))
+
+    def as_of_text(self):
+        """'As of commit 3 of 7 ...' for a time-machine session, else ''."""
+        info = getattr(self.wal, "as_of_commit", None) if self.wal is not None else None
+        if not info:
+            return ""
+        k, n, frames = info
+        text = ("As of commit %d of %d: the database as it was when that commit was written "
+                "(WAL frames 1-%s of %s applied; the later commits are not)."
+                % (k, n, format(self.wal.frames_total, ","), format(frames, ",")))
+        back = getattr(self.wal, "as_of_backfill", None)
+        if back is None:
+            text += (" No usable -shm beside the WAL: whether a checkpoint already copied "
+                     "later commits into the main file cannot be told - if one did, the pages "
+                     "they changed show that later state.")
+        elif back[0] and back[1] and back[1] > k:
+            text += (" A checkpoint already copied WAL frames 1-%s (to commit %d) into the "
+                     "main file: pages changed by commits %d-%d show their state at commit %d, "
+                     "not %d." % (format(back[0], ","), back[1], k + 1, back[1], back[1], k))
+        return text
+
     def banners(self):
         out = []
+        if self.as_of_text():
+            out.append(Banner("warning", self.as_of_text(), "As of commit %d of %d" %
+                              self.wal.as_of_commit[:2]))
+        if getattr(self, "encrypted", ""):
+            reserved = getattr(self.pager.header, "reserved", 0)
+            out.append(Banner("error", self.encrypted,
+                              "Encrypted" if reserved else "Page 1 unreadable"))
         wal = self.wal
         if self.mode == IMMUTABLE:
             out.append(Banner("info", "Read-only: evidence opened immutable; nothing is written.",

@@ -98,8 +98,9 @@ class StatusLine(ttk.Frame):
         self.body.delete("1.0", "end")
         self.body.insert("1.0", "\n".join(self._details))
         self.body.configure(state="disabled", height=max(1, min(len(self._details), 12)))
+        n = len(self._details)
         self.more.configure(text=("Details ▾" if self._open else "Details ▸")
-                            + (" (%d)" % len(self._details) if len(self._details) > 1 else ""))
+                            + (" (%d lines)" % n if n > 1 else ""))
 
     def toggle(self):
         self._open = not self._open
@@ -462,6 +463,11 @@ class Toolbar(FlowFrame):
 
     @staticmethod
     def _can_overflow(w):
+        try:                            # the primary action (Build timeline) stays in sight
+            if "Primary" in str(w.cget("style")) or str(w.cget("style")) == "P.TButton":
+                return False
+        except tk.TclError:
+            pass
         return isinstance(w, (ttk.Button, ttk.Checkbutton, ttk.Menubutton, _Rule)) or \
             w.winfo_class() in ("TButton", "TCheckbutton", "TMenubutton")
 

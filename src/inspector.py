@@ -454,6 +454,7 @@ class BlobInspector(tk.Toplevel):
         for child in kids:                              # open the chosen interpretations too
             self.tree.item(child, open=True)
             self._fill(child)
+        self._open_some(list(kids))
         # a decoded BLOB (bplist, protobuf, JSON...) opens on its decoded value, in the view
         # the user chose last; a BLOB nothing decodes opens on its bytes
         first = kids[0] if kids else None
@@ -468,6 +469,33 @@ class BlobInspector(tk.Toplevel):
             return
         self.tree.selection_set(iid)
         self.tree.focus(iid)
+
+    OPEN_ROWS = 40              # rows the tree may show opened on its own
+    OPEN_DEPTH = 4
+
+    def _open_some(self, level):
+        """Open the decoded value level by level while the tree stays under OPEN_ROWS rows
+        (an NSKeyedArchiver plist showed one closed 'nskeyedarchive' line: its fields - the
+        amount, the payer - were three clicks away)."""
+        shown = len(self.tree.get_children("")) + sum(
+            len(self.tree.get_children(i)) for i in self.tree.get_children(""))
+        for _depth in range(self.OPEN_DEPTH):
+            nxt = []
+            for iid in level:
+                for child in self.tree.get_children(iid):
+                    node = self._iid_node.get(child)
+                    if node is None or not node.children:
+                        continue
+                    n = len(node.children)
+                    if shown + n > self.OPEN_ROWS:
+                        return
+                    self._fill(child)
+                    self.tree.item(child, open=True)
+                    shown += n
+                    nxt.append(child)
+            if not nxt:
+                return
+            level = nxt
 
     def _insert(self, parent_iid, node, index):
         where = ""

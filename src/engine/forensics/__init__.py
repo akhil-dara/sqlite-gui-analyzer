@@ -9,6 +9,7 @@ are written only to a path the caller chooses outside the evidence folder.
     fx.carve()                      -> CarveResult (list of Record)
     fx.row_history(table, locator)  -> RowHistory
     fx.history_summary(table)       -> HistorySummary
+    fx.missing_keys(table)          -> MissingKeys (row numbers deleted, recovered or not)
     fx.dropped_schema()             -> [DroppedObject]
     fx.journal()                    -> Journal or None
     fx.journal_rows(table)          -> [(Locator, row, flags)] of the pre-transaction state
@@ -32,7 +33,8 @@ from .index_carve import (IndexCarver, LiveIndexEntries, index_specs, index_temp
 from .journal import Journal, open_journal
 from .live import LiveIndex
 from .pages import MainFileView, PageMap, WalTimeline
-from .provenance import (CARVE_SOURCES, CONFIDENCES, SOURCES, Provenance, Record, json_value)
+from .provenance import (CARVE_SOURCES, CONFIDENCES, JOURNAL_FILE, SOURCES, WAL_FILE,
+                         Provenance, Record, file_offset, json_value)
 from .report import FORMATS, ReportError, check_target, write_report as _write_report
 from .schema_recovery import DroppedObject, recover as _recover_schema
 from .templates import templates_for
@@ -60,6 +62,17 @@ class Forensics(object):
         self.issues = IssueLog()      # forensic scan problems (listed under Issues too)
         self._lock = threading.RLock()
         self._cache = {}
+        self.stage = None             # (what, done, total, since) of the long step running
+
+    def set_stage(self, what, done=None, total=None):
+        """The long step running now (read by the window to show it): what it is, how far
+        (done of total, either may be None) - the start time is kept per step."""
+        cur = self.stage
+        since = cur[3] if cur is not None and cur[0] == what else time.time()
+        self.stage = (what, done, total, since)
+
+    def clear_stage(self):
+        self.stage = None
 
     # -- shared structures (built on first use) ------------------------------
     def _get(self, name, make):
@@ -122,6 +135,35 @@ class Forensics(object):
             return open_journal(self.session.evidence, p.page_size, max_page, self.issues)
         return self._get("journal", make)
 
+    # -- where a record's bytes are ------------------------------------------------
+    def file_offset(self, prov):
+        """Byte offset of a record's first byte in its file (provenance.file_offset)."""
+        journal = self.journal() if prov.file == JOURNAL_FILE else None
+        return file_offset(prov, self.session.pager.page_size, journal)
+
+    def file_path(self, prov):
+        """The evidence file a record was read from: the main file, the WAL or the journal."""
+        ev = self.session.evidence
+        if prov.file == WAL_FILE:
+            return ev.path("wal")
+        if prov.file == JOURNAL_FILE:
+            return ev.path("journal")
+        return ev.main
+
+    def page_image(self, prov):
+        """The page image a record was read from, as the file holds it: the main file's page
+        (the WAL not applied - the record's bytes are in the file), the WAL frame's page, or
+        the journal's image; None when it cannot be read."""
+        try:
+            if prov.file == WAL_FILE:
+                return self.session.wal.page_data(prov.frame)
+            if prov.file == JOURNAL_FILE:
+                j = self.journal()
+                return j.page(prov.page) if j is not None else None
+            return bytes(self.main.page(prov.page))
+        except Exception:               # noqa: BLE001 - said by the caller
+            return None
+
     def journal_view(self):
         """Page view of the pre-transaction state (journal images over the main file)."""
         def make():
@@ -137,10 +179,27 @@ class Forensics(object):
         if tables is not None:
             wanted = set(tables)
             tpls = [t for t in tpls if t.name in wanted or t.kind == "master"]
+        more = []
         for t in tpls:
             if t.kind == "table" and not t.dropped:
                 t.learn_lengths(self._sample_rows(t.info))
-        return tpls
+                more.extend(self._shorter_templates(t))
+        return tpls + more
+
+    def _shorter_templates(self, t, sample=2000):
+        """Templates for records shorter than the table: only when live rows show such
+        records (an ALTER TABLE ADD COLUMN happened: the rows written before it have fewer
+        values), for each count of trailing columns that may have been added."""
+        k = t.added_candidates()
+        if not k or t.index_tree:
+            return []
+        try:
+            it = NativeTable(t.info, self.session.pager, IssueLog()).iter_all()
+            seen = any("pre_alter" in flags for _l, _r, flags in itertools.islice(it, sample))
+        except Exception:               # noqa: BLE001 - no evidence of an ALTER: no variants
+            seen = False
+        # a shape of fewer than 2 values (the rowid alias alone) carries no content
+        return [t.shorter(t.n - i) for i in range(1, k + 1) if t.n - i >= 2] if seen else []
 
     def _sample_rows(self, info, count=48):
         """A few live rows from both ends of a table (declared column order)."""
@@ -182,6 +241,7 @@ class Forensics(object):
         def stop():
             return (cancel is not None and cancel()) or \
                 (deadline is not None and time.time() > deadline)
+        self.set_stage("Looking for dropped tables")
         dropped = self.dropped_schema(cancel, 0.25 * time_limit if time_limit else None)
         hints = self.dropped_pages(dropped)
         specs = self.index_specs(tables, dropped) if index_entries else []
@@ -199,6 +259,7 @@ class Forensics(object):
             result = carver.run()
         finally:
             self.live.cancel = None
+            self.clear_stage()
         self._take_issues(carver.issues)
         if self.live.capped:
             # tables too large to hash: their recovered rows without a rowid were not compared
@@ -262,11 +323,13 @@ class Forensics(object):
         """Every log of problems the forensic scans met so far: shown with the database's
         Issues."""
         logs = [self.issues]
-        with self._lock:
-            for name in ("live", "live_index", "historian"):
-                obj = self._cache.get(name)
-                if obj is not None and getattr(obj, "issues", None) is not None:
-                    logs.append(obj.issues)
+        # read without the lock: a scan holds it while it builds the live index (minutes on
+        # a large database) and the window polls this - a snapshot of the dict is enough
+        cache = dict(self._cache)
+        for name in ("live", "live_index", "historian"):
+            obj = cache.get(name)
+            if obj is not None and getattr(obj, "issues", None) is not None:
+                logs.append(obj.issues)
         return logs
 
     def dropped_pages(self, dropped=None):
@@ -307,6 +370,13 @@ class Forensics(object):
     def row_history(self, table, locator, cancel=None):
         """Every version of one row (Locator('rowid', n) or Locator('pk', (...)))."""
         return self.historian.row_history(table, locator, cancel)
+
+    def missing_keys(self, table, records=()):
+        """The row numbers the table no longer has (gaps, and after the last row up to
+        sqlite_sequence): deleted rows, recovered or not (MissingKeys)."""
+        from .. import limits
+        from .missing import missing_keys
+        return missing_keys(self.session, table, limits.get("missing_keys_listed"), records)
 
     def history_summary(self, table, cancel=None):
         """Keys of a table with several versions, deleted keys and reused keys."""

@@ -32,6 +32,10 @@ _ALLOWED = {
     "NUMERIC": {NULL: True, INT: True, REAL: True, TEXT: False, BLOB: False},
     "TEXT": {NULL: True, TEXT: True, BLOB: False},
     "BLOB": {NULL: True, INT: True, REAL: True, TEXT: True, BLOB: True},
+    # sqlite_sequence is written by SQLite itself: (table name as text, last rowid as integer)
+    # and nothing else, though its columns declare no type
+    "SEQ_NAME": {TEXT: True},
+    "SEQ_VALUE": {INT: True},
 }
 
 
@@ -66,6 +70,8 @@ class Template(object):
         # WITHOUT ROWID primary key columns are NOT NULL whether declared so or not
         pk = set(info.pk_columns) if info.without_rowid else set()
         self.notnull = [bool(cols[i].notnull) or i in pk for i in order]
+        if info.name.lower() == "sqlite_sequence" and self.n == 2 and not dropped:
+            self.affinity, self.notnull = ["SEQ_NAME", "SEQ_VALUE"], [True, True]
         self.alias = order.index(info.rowid_alias) if info.rowid_alias is not None else None
         self.strict = bool(re.search(r"\)\s*(?:WITHOUT\s+ROWID\s*,\s*)?STRICT\b", info.sql or "",
                                      re.IGNORECASE))
@@ -182,10 +188,37 @@ class Template(object):
                     return False, 0, ["integral real in a %s column" % aff]
         return True, atypical, notes
 
+    def shorter(self, n):
+        """This template for records with only the first n values: rows written before an
+        ALTER TABLE ADD COLUMN (the added columns are not in their records)."""
+        import copy
+        t = copy.copy(self)
+        t.n = n
+        t.affinity, t.notnull = self.affinity[:n], self.notnull[:n]
+        t.length_prior, t.int_range = self.length_prior[:n], self.int_range[:n]
+        t._options = {}
+        t._assign_memo = None           # its own answers (fewer columns)
+        t._ovfl_memo = None
+        t.short_of = self
+        return t
+
+    def added_candidates(self):
+        """How many trailing columns could have been added by ALTER TABLE ADD COLUMN: those
+        that may be NULL (an added column cannot be NOT NULL without a default, and is never
+        the rowid or part of the primary key), at most 3."""
+        k = 0
+        for pos in range(self.n - 1, 0, -1):
+            if pos == self.alias or self.notnull[pos] or k >= 3:
+                break
+            k += 1
+        return k
+
     def learn_lengths(self, rows):
         """Remember text/blob lengths and integer ranges seen in live rows (storage order),
         used to choose between otherwise equal reconstructions."""
         order = self.info.storage_order
+        self._assign_memo = None        # cellparse._assign reads length_prior
+        self._ovfl_memo = None          # and _fixed_combos the size options
         for row in rows:
             for pos, ci in enumerate(order):
                 v = row[ci] if ci < len(row) else None

@@ -30,6 +30,7 @@ from tokens import COLOR, FAMILY, SEMIBOLD
 
 MIN_TEXT_PX = 6             # zoomed out further, text is hidden
 ROWS_MIN_SCALE = 0.55       # below this zoom a card shows only its header
+OPEN_MIN_SCALE = 0.85       # the diagram opens no smaller: its column names read (pan for the rest)
 ZOOM_MIN, ZOOM_MAX = 0.05, 3.0
 LAZY_CARDS = 80             # above this many cards, rows are drawn only for cards in view
 MINIMAP_W, MINIMAP_H = 180, 120
@@ -258,7 +259,10 @@ class ErdCanvas(ttk.Frame):
         self.layout = erd.arrange(self.model, self.metrics, self.linked_only, self._modes,
                                   self._full, self._expanded)
         self.redraw()
-        self.fit()
+        # as on opening: whole when it fits readably, else no smaller than where the cards'
+        # names and columns read (Fit shows everything at any size; the minimap and the
+        # wheel pan) - fitted whole, a large case drew every card empty
+        self.fit(initial=True)
         if self.on_positions is not None:
             self.on_positions(None)
 
@@ -722,7 +726,10 @@ class ErdCanvas(ttk.Frame):
         vw, vh = self._view_size()
         want = min(vw / max(1.0, x1 - x0), vh / max(1.0, y1 - y0))
         if initial:
-            want = min(1.0, max(want, ROWS_MIN_SCALE + 0.05))
+            # a table and its neighbours open readable; the whole database (no focus) opens
+            # whole, its cards down to their headers - the overview is what it is for
+            floor = OPEN_MIN_SCALE if self.focus is not None else ROWS_MIN_SCALE + 0.05
+            want = min(1.0, max(want, floor))
         want = max(ZOOM_MIN, min(ZOOM_MAX, want))
         if abs(want - self.scale) > 1e-6 or not self._body:
             self.scale = want

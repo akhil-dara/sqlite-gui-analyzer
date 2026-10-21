@@ -71,9 +71,12 @@ def _vars(which):
 LIGHT_VARS = _vars(0)
 DARK_VARS = _vars(1)
 
-CSS = (":root{" + LIGHT_VARS +
-       "--font:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,"
-       "sans-serif;--mono:ui-monospace,'Cascadia Mono',Consolas,'SF Mono',Menlo,monospace;"
+# the font stacks of every HTML page the tool writes (the guide takes them from here)
+FONT_VARS = ("--font:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',"
+             "Arial,sans-serif;--mono:ui-monospace,'Cascadia Mono',Consolas,'SF Mono',Menlo,"
+             "monospace;")
+
+CSS = (":root{" + LIGHT_VARS + FONT_VARS +
        "--shadow:0 1px 2px rgba(15,23,42,.06),0 4px 14px rgba(15,23,42,.05);"
        "--radius:12px;--topbar:52px;color-scheme:light}\n"
        "@media (prefers-color-scheme:dark){:root:not([data-theme=light]){" + DARK_VARS +

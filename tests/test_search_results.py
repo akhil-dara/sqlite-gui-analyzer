@@ -28,7 +28,7 @@ class GroupingTest(unittest.TestCase):
                              db_hit("t", 2, "a", [2, "hello", None]), db_hit("u", 1, "x", [1, "hi"])])
         self.assertEqual([(g.table, len(g.hits), g.columns) for g in groups],
                          [("t", 2, ["a", "b"]), ("t", 1, ["a"]), ("u", 1, ["x"])])
-        self.assertEqual(groups[0].source_label(), "DB")
+        self.assertEqual(groups[0].source_label(), "Live row")
 
     def test_wal_copy_identical_to_the_db_row_folds_into_it(self):
         row = [1, "hello", 2.0]
@@ -37,7 +37,7 @@ class GroupingTest(unittest.TestCase):
                              wal_hit("t", 1, "a", [1, "hello", 2], frames)])   # 2 == 2.0
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0].frames, frames)
-        self.assertEqual(groups[0].source_label(), "DB + WAL ×2")
+        self.assertEqual(groups[0].source_label(), "Live row · WAL ×2")
         self.assertEqual(len(groups[0].hits), 1)
 
     def test_a_changed_wal_version_is_its_own_group(self):
@@ -45,10 +45,10 @@ class GroupingTest(unittest.TestCase):
                              wal_hit("t", 1, "a", [1, "hello before"], [(4, 7, "stale"), (2, 7, "stale")]),
                              wal_hit("t", 5, "a", [5, "hello gone"], [(6, 8, "superseded")])])
         self.assertEqual([g.source for g in groups], ["DB", "WAL", "WAL"])
-        self.assertEqual(groups[1].source_label(), "WAL stale ×2")
+        self.assertEqual(groups[1].source_label(), "WAL version · stale ×2")
         self.assertEqual(groups[1].category, "stale")
-        self.assertEqual(groups[1].frames_label(), "#2 stale, #4 stale")
-        self.assertEqual(groups[2].source_label(), "WAL superseded")
+        self.assertEqual(groups[1].frames_label(), "#3 stale, #5 stale")
+        self.assertEqual(groups[2].source_label(), "WAL version · superseded")
 
     def test_value_types_must_match_to_fold(self):
         groups = group_hits([db_hit("t", 1, "a", [1, "1"]), wal_hit("t", 1, "a", [1, 1], [(1, 2, "current")])])
@@ -78,7 +78,7 @@ class GroupingTest(unittest.TestCase):
                              free(5, 300, "a"), free(9, 100, "a")])
         self.assertEqual([(g.source, len(g.hits)) for g in groups],
                          [("DB", 1), ("Freelist", 2), ("Freelist", 1), ("Freelist", 1)])
-        self.assertEqual(groups[1].source_label(), "Freelist p.5")
+        self.assertEqual(groups[1].source_label(), "Recovered · p.5 @ 100")
         self.assertEqual(source_kind(free(1, 1, "a")), "Freelist")
 
     def test_match_label_says_how_a_blob_matched(self):

@@ -100,6 +100,7 @@ LIGHT_COLOR = {
     "secondary": "#3b82f6",
     "primary_soft": "#dbeafe",
     "selection": "#dbeafe",
+    "chosen": "#e8f0fe",                # a ticked line (a column picked for the results)
     "ring": "#1e40af",
     # amber: highlights only (a search match, the current find, a drag range)
     "accent": "#d97706",
@@ -158,6 +159,7 @@ DARK_COLOR = {
     "secondary": "#60a5fa",
     "primary_soft": "#1e3a8a",
     "selection": "#1d4ed8",
+    "chosen": "#22375a",
     "ring": "#93c5fd",
     # amber: highlights only (a search match, the current find, a drag range)
     "accent": "#f59e0b",

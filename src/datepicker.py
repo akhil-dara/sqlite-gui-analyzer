@@ -699,6 +699,12 @@ class DateTimePicker(ttk.Frame):
         self._marked = False            # marked wrong from outside (a range's To < From)
 
         self.var = textvariable if textvariable is not None else tk.StringVar(self)
+        try:                            # wide enough for the hint uncut ('YYYY-MM-DD HH:MM:SS':
+            from tkinter import font as tkfont  # its capitals are wider than a digit)
+            f = tkfont.Font(font=FONT["body"])
+            width = max(width, -(-(f.measure(placeholder) + 12) // max(1, f.measure("0"))))
+        except tk.TclError:
+            pass
         self.entry = ttk.Entry(self, textvariable=self.var, width=width, style="TEntry")
         self.entry.grid(row=0, column=0, sticky="ew")
         self.button = tk.Canvas(self, width=22, height=22, highlightthickness=1,

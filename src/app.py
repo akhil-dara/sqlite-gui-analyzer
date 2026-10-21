@@ -25,7 +25,7 @@ from utils import (_q, fmtb, vb, _snippet, fmt_count, _int_count, plural, longes
                    _build_schema_html, set_write_guard, write_allowed, safe_filename,
                    export_row_blobs, flag_summary, plain_text, json_value, sql_first_keyword,
                    sql_reads_only)
-from database import DB
+from database import DB, RID, count_error_text
 from case import Case
 from case_ui import OpenFolderDialog
 from navigator import CaseNavigator, case_name, member_warnings, short_count
@@ -42,10 +42,16 @@ from widgets import (ElideLabel, FlowFrame, SearchBox, TextFind, ToolTip, TreeFi
                      menu_button, place_over, setup_theme, wrap_to_width)
 from dialogs import HelpDialog, ScopeDlg, BlobViewer, RowWin, TextWindow, ValuesWindow
 from search_results import ResultGrouper, is_wal, match_label, source_kind
+from search_results import SOURCE_FILTER, source_word  # noqa: E402
 from forensics_tab import ForensicsTab, RecordWindow
 from timeline_tab import TimelineTab
+from query_tab import QueryTab
 from date_columns import BrowseDates
+from number_display import BrowseNumbers
+from calc_columns import BrowseCalcs
+from fastlist import FastTree
 from lookups import BrowseLookups
+from fields_ui import BrowseFields
 from engine import limits, uiyield
 from engine.decode import timestamps
 from engine.evidence import is_network_path
@@ -56,6 +62,7 @@ from jobs import (Job, ask_path, blob_export_done, evidence_records, export_opti
                   export_protected, export_rows, multi_table_options, write_export_manifest)
 from browse_sources import ListSource, TableSource
 from tagging import Tagging
+from engine.fileformat.wal import frame_no
 from wal_tab import WalTab, open_wal_record
 from tags_tab import TagsTab
 from relations_view import RelationWindows
@@ -85,6 +92,17 @@ _UI_SCALE_FACTORS = dict((k, f) for k, _label, f in UI_SCALES)
 
 # ── Combobox type-ahead helper ────────────────────────────────────────────
 # ── Main Application ─────────────────────────────────────────────────────
+
+def _rows_weight(n):
+    """A table's row count for ranking (exact, '~n' estimated; 0 when unknown)."""
+    if isinstance(n, bool):
+        return 0
+    if isinstance(n, int):
+        return n
+    if isinstance(n, str) and n.startswith("~") and n[1:].isdigit():
+        return int(n[1:])
+    return 0
+
 class App(tk.Tk):
     def __init__(self, initial_path=None):
         from widgets import enable_dpi_awareness
@@ -189,6 +207,9 @@ class App(tk.Tk):
         self.datamap = DataMapUI(self)
         self._browse_dates = BrowseDates(self)      # 'Show as date' of the Browse columns
         self._browse_lookups = BrowseLookups(self)  # 'Show value from linked table'
+        self._browse_numbers = BrowseNumbers(self)  # 'Show as number' (÷100…)
+        self._browse_fields = BrowseFields(self)    # 'Fields inside…' (session only)
+        self._browse_calcs = BrowseCalcs(self)      # 'Calculate from…' (ƒ= columns)
         # which databases each feature covers (one scope control everywhere)
         self.scopes = Scopes(lambda: list(self.case))
         self.scopes.listeners.append(lambda features: self._save_case())
@@ -214,6 +235,13 @@ class App(tk.Tk):
         self._issues_win = None
         self._verify_close_win = None    # the window of the re-hash on close, while it runs
         self._poll_issue_count()
+        uiyield.serve()              # the interpreter switches finely while the user interacts
+        # the user's own events only (a <Configure> fires for every widget that data
+        # resizes, and kept the fine interval on while nobody touched the window)
+        for seq in ("<ButtonPress>", "<ButtonRelease>", "<B1-Motion>", "<KeyPress>",
+                    "<MouseWheel>", "<Shift-MouseWheel>"):
+            self.bind_all(seq, lambda e: uiyield.active(), add="+")
+        self._nb.bind("<<NotebookTabChanged>>", lambda e: uiyield.active(), add="+")
         self._ui_beat()
         self._warm_tabs()
 
@@ -497,6 +525,23 @@ class App(tk.Tk):
                 self.attributes("-alpha", 1.0)
             except tk.TclError:
                 pass
+            self._raise_window()
+
+    def _raise_window(self):
+        """Bring the window to the front and give it the focus when it appears: a window
+        mapped while transparent (the warm-up) was left behind the window the tool was
+        started from. The brief 'topmost' is what makes Windows allow it; it is taken off at
+        once, so nothing stays on top of other programs."""
+        if self._windowingsystem != "win32":
+            return
+        try:
+            self.lift()
+            self.attributes("-topmost", True)
+            self.focus_force()
+            self.after(150, lambda: self.attributes("-topmost", False)
+                       if self.winfo_exists() else None)
+        except tk.TclError:
+            pass
 
     # ── The active database of the case ──────────────────────────────
     @property
@@ -623,7 +668,9 @@ class App(tk.Tk):
                                                                  self._open_btn))
         self._open_btn.pack(side="right", padx=(XS, 0))
         # the command palette: every database, table, column, tab and action
-        self._palette_btn = ttk.Button(inner, text="Go to…  Ctrl+K", style="Subtle.TButton",
+        # the same style as its neighbours (Open, Database, View, Help): the subtle style
+        # stood out lighter than them in the dark theme
+        self._palette_btn = ttk.Button(inner, text="Go to…  Ctrl+K",
                                        command=self.open_palette)
         self._palette_btn.pack(side="right", padx=(XS, 0))
 
@@ -741,7 +788,7 @@ class App(tk.Tk):
                 text += " · %d WAL merged" % merged
             safe = modes.get(mode_label("safe-parse"), 0)
             if safe:
-                text += " · %d Safe parse" % safe
+                text += " · %d with Safe parse" % safe
         else:
             text = "Read-only · %s" % mode_label(ms[0].db.mode)
         self._evidence_chip.set(text=text)
@@ -821,6 +868,10 @@ class App(tk.Tk):
         self._sql_frame = ttk.Frame(self._nb)
         self._nb.add(self._sql_frame, text="SQL")
 
+        # Query tab: a SELECT built from tables, columns, joins and conditions, no SQL typed
+        self._query = QueryTab(self._nb, self)
+        self._nb.add(self._query, text="Query")
+
         # Forensics tab (deleted records, row history, dropped tables, journal, audit)
         self._forensics = ForensicsTab(self._nb, self)
         self._nb.add(self._forensics, text="Forensics")
@@ -835,7 +886,7 @@ class App(tk.Tk):
         # the tabs that work on one database say which in a breadcrumb bar at their top
         from breadcrumb import Breadcrumb
         self._crumbs = [self._browse_crumb]
-        for frame in (self._sql_frame, self._forensics, self._wal_frame):
+        for frame in (self._sql_frame, self._query, self._forensics, self._wal_frame):
             kids = frame.pack_slaves()
             crumb = Breadcrumb(frame, self)
             if kids:
@@ -855,6 +906,68 @@ class App(tk.Tk):
         if table:
             self._browse_table_var.set(table)
             self._load_browse_table()
+
+    def open_as_of(self, member, commit_no, wait=False):
+        """The WAL time machine: open member's files again, read-only, as the database was
+        when WAL commit `commit_no` was written; it joins the case beside the current state
+        (named '... @ commit k of n'). The same commit already open is just made active."""
+        if member is None or member not in self.case.members or not member.db.ok:
+            return None
+        for m in self.case:
+            if m.path == member.path and m.as_of and m.as_of[0] == commit_no:
+                self.activate_member(m)
+                return m
+        path = member.path
+        out = []
+
+        def work(job):
+            job.status = "Reading %s as of commit %d…" % (os.path.basename(path), commit_no)
+            db = DB()
+            t0 = time.time()
+            db.open(path, safe_parse=self._safe_for(path), cancel=lambda: job.cancelled,
+                    as_of=commit_no)
+            db.tables()
+            if db.session is not None:
+                db.session.release_thread_connection()
+            return db, time.time() - t0
+
+        def done(result, error, cancelled):
+            if error is not None or cancelled or result is None:
+                if result is not None:
+                    result[0].close()
+                if error is not None:
+                    messagebox.showerror("Time machine", "The database could not be opened "
+                                         "as of commit %d: %s" % (commit_no, error), parent=self)
+                return
+            db, secs = result
+            m = self.case.add_db(db)
+            m.load_time, m.opened_utc = secs, utc_text()
+            tables = m.db.tables()
+            m.scope_tables = list(tables)
+            m.counts = dict((t, "?") for t in tables)
+            self._start_counts(m)
+            self.tags.add_member(m)
+            self.activate_member(m)
+            self._case_changed()
+            out.append(m)
+        job = Job(self, "Time machine: commit %d" % commit_no, work, done, total=1,
+                  unit="databases", show_after=0.5)
+        if wait:
+            job.wait()
+            for _ in range(50):
+                if out:
+                    break
+                self.update()
+                time.sleep(0.02)
+            return out[0] if out else None
+        return None
+
+    def show_missing_rows(self, member, table):
+        """'Missing row numbers…' of a table: the rowids it no longer has (deleted rows)."""
+        from missing_ui import MissingRowsWindow
+        if member is None or member not in self.case.members or not member.db.ok:
+            return None
+        return MissingRowsWindow(self, member, table)
 
     def search_in_table(self, member, table):
         self._schema_ctx_search(table, member)
@@ -880,6 +993,13 @@ class App(tk.Tk):
     def _populate_schema(self):
         """List the case in the navigator again."""
         self._navigator.rebuild()
+
+    def _open_guide(self):
+        """The illustrated guide, written to the tool's data folder and opened in the
+        browser (guide.py)."""
+        from guide import open_guide
+        path = open_guide(self)
+        self.activity("guide", what="guide opened", path=path)
 
     def _schema_export_html(self):
         """Export full schema report as HTML."""
@@ -1004,7 +1124,7 @@ class App(tk.Tk):
                                                        variable=self._search_wal_var),
                                        gap=M, visible=False)
         self._search_free_var = tk.BooleanVar(value=False)
-        self._search_free_cb = opts.add(ttk.Checkbutton(opts, text="Freed pages",
+        self._search_free_cb = opts.add(ttk.Checkbutton(opts, text="Recovered records",
                                                         variable=self._search_free_var),
                                         gap=S, visible=False)
         self._limit_var = tk.StringVar(value="500")
@@ -1042,7 +1162,7 @@ class App(tk.Tk):
 
         # what the chosen mode matches (only for the modes that need saying)
         self._hint_label = wrap_to_width(ttk.Label(sf, text="", style="Muted.TLabel"))
-        self._hint_label.pack(fill="x", padx=M + XS, pady=(0, XS))
+        # packed (above the progress) by _show_hint only while it has something to say
 
         # Progress (a thin bar), and the status: one line, the details folded away
         prog_f = ttk.Frame(sf)
@@ -1076,10 +1196,10 @@ class App(tk.Tk):
             return lbl, combo
         self._sr_db_lbl, self._sr_db_filter = dropdown("Database", 16, visible=False, gap=0)
         self._sr_source_lbl, self._sr_source_filter = dropdown(
-            "Source", 11, ["All", "DB", "WAL", source_name("Freelist")])
+            "Kind", 17, ["All"] + [w for w, _k in SOURCE_FILTER])
         _l, self._sr_table_filter = dropdown("Table", 30)
-        _l, self._sr_col_filter = dropdown("Column", 20)
-        _l, self._sr_type_filter = dropdown("Type", 8)
+        self._sr_col_lbl, self._sr_col_filter = dropdown("Matched in", 20)
+        self._sr_type_lbl, self._sr_type_filter = dropdown("Match", 8)
 
         # One line per row (its matching cells and WAL copies listed under it), or one per cell
         self._sr_group_var = tk.BooleanVar(value=True)
@@ -1102,14 +1222,16 @@ class App(tk.Tk):
         border_frame = tk.Frame(sf, relief="flat", bd=0, bg=K["border"], padx=1, pady=1)
         border_frame.pack(fill="both", expand=True, padx=M, pady=(XS, XS))
 
-        cols = ("#", "Source", "Table", "Column", "RowID", "Matched Value", "Type")
-        self._search_tree = ttk.Treeview(border_frame, columns=cols, show="tree headings",
-                                         selectmode="browse")
+        cols = ("#", "Kind", "Table", "Column", "RowID", "Matched Value", "Type")
+        # a list that scrolls by copying the screen (fastlist): a Treeview repainted every
+        # visible cell on each wheel step (100-400 ms for a window of results)
+        self._search_tree = FastTree(border_frame, columns=cols, show="tree headings",
+                                     selectmode="browse")
         for c in cols:
             self._search_tree.heading(c, text=c)
         self._search_tree.column("#0", width=24, minwidth=24, stretch=False)   # expand arrow
         self._search_tree.column("#", width=50, minwidth=40, stretch=False)
-        self._search_tree.column("Source", width=120, minwidth=70, stretch=False)
+        self._search_tree.column("Kind", width=170, minwidth=90, stretch=False)
         self._search_tree.column("Table", width=200, minwidth=120, stretch=True)
         self._search_tree.column("Column", width=160, minwidth=100, stretch=True)
         self._search_tree.column("RowID", width=70, minwidth=50, stretch=False)
@@ -1171,6 +1293,19 @@ class App(tk.Tk):
                 foreground=C["purple"])
         else:
             self._hint_label.configure(text="")
+        self._show_hint()
+
+    def _show_hint(self):
+        """The mode's hint line takes room only when it says something."""
+        try:
+            if self._hint_label.cget("text"):
+                if not self._hint_label.winfo_manager():
+                    self._hint_label.pack(fill="x", padx=M + XS, pady=(0, XS),
+                                          before=self._search_prog_f)
+            else:
+                self._hint_label.pack_forget()
+        except tk.TclError:
+            pass
 
     def _do_search(self):
         term = self._search_var.get()
@@ -1180,6 +1315,7 @@ class App(tk.Tk):
             check_term(term, search_mode_key(self._search_mode_var.get()))
         except ValueError as e:        # a malformed hex pattern or regular expression
             self._hint_label.configure(text="Cannot search: %s" % e, foreground=C["red"])
+            self._show_hint()
             return
         self._on_mode_change()
         # a search still finishing is stopped and ignored (its generation is old): its hits
@@ -1214,6 +1350,7 @@ class App(tk.Tk):
         self._search_view_names = set()
         work = [(m, self._search_scope_names(m)) for m in self._search_members()]
         self._search_work = work
+        self._search_places = (wal, freelist)
         self._search_tables = [(m.uid, t) for m, tables in work for t in tables]
         total = len(self._search_tables)
 
@@ -1226,6 +1363,7 @@ class App(tk.Tk):
                                               wal),
             daemon=True)
         self._search_thread.start()
+        self._after_safe(1000, self._search_clock, self._search_gen)
         self._search_top.show(self._stop_btn, True)
         self.activity("search", term=term, mode=search_mode_key(mode),
                       limit=limit if limit is not None else "all", databases=[
@@ -1269,17 +1407,43 @@ class App(tk.Tk):
         n += self._limit_var.get() != "500"
         self._search_adv_btn.configure(text="Advanced (%d) ▾" % n if n else "Advanced ▾")
 
+    def _search_skipped_text(self):
+        """What the last search left out, in words: ['live rows only: WAL row versions and
+        recovered records not searched (tick them to include)', details...], [] when it
+        looked everywhere it could."""
+        wal, freelist = getattr(self, "_search_places", (True, True))
+        members = [m for m, _t in getattr(self, "_search_work", [])]
+        places, details = [], []
+        if not wal:
+            with_wal = [m for m in members if m.db.has_wal]
+            if with_wal:
+                places.append("WAL row versions")
+                for m in with_wal:
+                    details.append("%s: %s WAL frames not searched" % (
+                        m.name, format(len(m.db.wal.frames), ",")))
+        if not freelist and any(m.db.ok for m in members):
+            places.append("recovered (deleted) records")
+            for m in members:
+                cached = getattr(m.db, "_recovered_cache", None)
+                if cached is not None and cached[0] is m.db.session and cached[1]:
+                    details.append("%s: %s recovered records not searched" % (
+                        m.name, format(len(cached[1]), ",")))
+        if not places:
+            return []
+        return ["live rows only: %s not searched (tick %s to include)" % (
+            " and ".join(places), "them" if len(places) > 1 else "it")] + details
+
     def _update_search_options(self):
-        """'Include WAL row versions' and 'Include freed pages' are offered only when a
-        searched database has WAL frames / freed pages."""
+        """'WAL row versions' is offered only when a searched database has WAL frames;
+        'Recovered records' for every database (deleted rows can be anywhere in the file)."""
         members = self._search_members()
         has_wal = any(m.db.has_wal for m in members)
         self._search_opts.show(self._search_wal_cb, has_wal)
         if not has_wal:
             self._search_wal_var.set(False)
-        has_free = any(m.db.freelist_count() > 0 for m in members)
-        self._search_opts.show(self._search_free_cb, has_free)
-        if not has_free:
+        has_db = any(m.db.ok for m in members)
+        self._search_opts.show(self._search_free_cb, has_db)
+        if not has_db:
             self._search_free_var.set(False)
         self._update_scope_chip()
 
@@ -1358,6 +1522,7 @@ class App(tk.Tk):
             (m.uid, [0, len(t), "waiting"]) for m, t in work)
         last = [0.0]
         wal_hits = OrderedDict((m.uid, []) for m, _t in work)
+        partial = self._search_partial_recovery = []    # (uid, why the recovery stopped)
 
         def tick():
             now = time.time()
@@ -1410,22 +1575,34 @@ class App(tk.Tk):
                 wal_hits[m.uid].extend(got)
                 results.extend(got)
 
-            # Deleted records still held by freed pages
-            if freelist and db.freelist_count() > 0 and not cancel():
-                prog[2] = "freed pages"
+            # Deleted records the main file still holds (freeblocks, unallocated space,
+            # freed and unreferenced pages), recovered first when not done yet
+            if freelist and not cancel():
+                prog[2] = "recovering records"
                 tick()
                 got = []
+
+                def carving(done_pages, total_pages):
+                    prog[2] = "recovering records: page %s of %s" % (
+                        format(done_pages, ","), format(total_pages, ","))
+                    tick()
                 try:
+                    db.recovered_stopped = None
                     for result in db.search_freelist(term, mode, limit=probe, deep_blob=deep,
-                                                     cancel=cancel, decoded=decoded):
+                                                     cancel=cancel, decoded=decoded,
+                                                     progress=carving):
                         if cancel():
                             break
                         result["dbid"], result["database"] = m.uid, m.name
                         got.append(result)
                 except Exception as e:
-                    errors.append(f"{prefix}freed pages: {e}")
+                    errors.append(f"{prefix}recovered records: {e}")
+                stopped = getattr(db, "recovered_stopped", None)
+                if stopped:
+                    partial.append((m.uid, stopped))
                 got = keep(m, source_name("Freelist"), got,
-                           lambda h: (h.get("page"), h.get("cell_offset")))
+                           lambda h: ((h.get("provenance") or {}).get("record_id"),
+                                      h.get("column")))
                 wal_hits[m.uid].extend(got)          # after the tables, in order
                 results.extend(got)
             prog[2] = "stopped" if cancel() else "done"
@@ -1460,7 +1637,19 @@ class App(tk.Tk):
 
         self._after_safe(0, self._finalize_search, total)
 
+    def _search_clock(self, gen):
+        """While the search runs, the status clock moves even when no table finished for a
+        while (a recovery of deleted records can take minutes)."""
+        if gen != self._search_gen or self._search_thread is None or \
+                not self._search_thread.is_alive():
+            return
+        last = getattr(self, "_search_last_progress", None)
+        if last is not None:
+            self._update_search_ui(*last)
+        self._after_safe(1000, self._search_clock, gen)
+
     def _update_search_ui(self, done, total):
+        self._search_last_progress = (done, total)
         self._sr_ingest()
         elapsed = time.time() - self._search_start_time
         text = (f"Found {len(self._search_results):,} matches in {len(self._sr_grouper.groups):,} rows"
@@ -1544,11 +1733,15 @@ class App(tk.Tk):
         if removed:                     # databases removed from the case since the search
             details.append("The results of %s were removed with %s" % (
                 ", ".join(removed), "it" if len(removed) == 1 else "them"))
-        capped = self._search_capped_text()
+        capped = " ".join(t for t in (self._search_capped_text(), self._search_partial_text()) if t)
         if capped:
             text += " · stopped at Max rows/table in %s" % plural(
                 len(getattr(self, "_search_capped", [])), "place")
             details.append(capped)
+        skipped = self._search_skipped_text()
+        if skipped:
+            text += " · " + skipped[0]
+            details.extend(skipped[1:])
         self._search_status.set(text, details)
         # the navigator's 'Has hits' filter and the scope's 'With hits' preset
         hits = {}
@@ -1559,6 +1752,7 @@ class App(tk.Tk):
         self._refresh_search_errors()
         self._search_progress.configure(value=total)
         self._search_progress.pack_forget()
+        self._search_prog_f.configure(height=1)     # an emptied frame keeps its size otherwise
         # Update filter combos — table filter shows per-table row counts
         tbl_labels = list(labels)
         columns = sorted(set(r["column"] for r in ordered))
@@ -1592,6 +1786,19 @@ class App(tk.Tk):
             col_px = max(170, min(longest_col_px + 30, 400))
             self._search_tree.column("Column", width=col_px)
         self._filter_search_results()
+
+    def _search_partial_text(self):
+        """Which databases' recovery of deleted records stopped at the limit ('' when none):
+        the search covered what was recovered by then."""
+        partial = getattr(self, "_search_partial_recovery", [])
+        if not partial:
+            return ""
+        from engine import limits
+        names = [self.member_label(self.case.find(uid)) for uid, _why in partial]
+        return ("Recovered records of %s: the recovery stopped at %s s (limit "
+                "search_recover_seconds), so only the records found by then were searched; "
+                "the Forensics tab recovers without this limit, and a later search uses what "
+                "it found." % (", ".join(names), format(limits.get("search_recover_seconds"), ",")))
 
     def _search_capped_text(self):
         """Which tables stopped at 'Max rows/table' ('' when none did). The limit is the
@@ -1647,7 +1854,8 @@ class App(tk.Tk):
 
     def _sr_filter_tests(self):
         """(group test, hit test) for the Database/Source/Table/Col/Type filters."""
-        src_f = source_key(self._sr_source_filter.get())     # 'Freed pages' -> 'Freelist'
+        src_f = dict(SOURCE_FILTER).get(self._sr_source_filter.get(),
+                                        source_key(self._sr_source_filter.get()))
         tbl_f = self._sr_table_filter.get()
         col_f = self._sr_col_filter.get()
         type_f = self._sr_type_filter.get()
@@ -1681,9 +1889,29 @@ class App(tk.Tk):
     def result_source_label(self, g):
         """A result line's Source text: 'DB', 'WAL current ×2'...; in a case 'wa.db · DB'."""
         label = g.source_label()
+        if g.source == "WAL":
+            if g.gone is None:
+                g.gone = self._row_gone(g)
+            if g.gone:
+                label = "deleted now · " + label    # the database has no such row any more
         if self.case.multi and getattr(g, "database", ""):
             return "%s · %s" % (g.database, label)
         return label
+
+    def _row_gone(self, g):
+        """True when a WAL result's row (by its key) is not in the database now; False when
+        it is, or when that cannot be told (no key, table not in the schema, read error)."""
+        loc = g.locator
+        if getattr(loc, "kind", None) not in ("rowid", "pk"):
+            return False
+        member = self.case.find(g.dbid) if g.dbid is not None else None
+        db = member.db if member is not None else self.db
+        try:
+            if not db.ok or g.table not in db.tables():
+                return False
+            return db.session.row(g.table, loc) is None
+        except Exception:               # noqa: BLE001 - unknown: not said to be deleted
+            return False
 
     def _filter_search_results(self):
         group_ok, hit_ok = self._sr_filter_tests()
@@ -1711,16 +1939,21 @@ class App(tk.Tk):
              ("Type", "Type"))
         for col, text in headings:
             tree.heading(col, text=text)
+        # the filters are named like the headings they filter
+        if getattr(self, "_sr_col_lbl", None) is not None:
+            self._sr_col_lbl.configure(text="Matched in" if grouped else "Column")
+            self._sr_type_lbl.configure(text="Match" if grouped else "Type")
         for i, item in enumerate(page):
             idx = start + i + 1
             if grouped:
                 self._insert_result_group(tree, idx, i, item, term, mkey)
                 continue
             r = item
-            tag = self._wal_row_tag(r) or ("odd" if i % 2 else "even")
+            tag = self._wal_row_tag(r) or ("sr_recovered" if source_kind(r) == "Freelist"
+                                           else "odd" if i % 2 else "even")
             val = _snippet(r["value"], term, mkey) if term else r["value"]
             iid = "h%d" % idx
-            src = r.get("source", "DB")
+            src = source_word(r.get("source", "DB"))
             if self.case.multi and r.get("database"):
                 src = "%s · %s" % (r["database"], src)
             tree.insert("", "end", iid=iid, values=(idx, src,
@@ -1742,7 +1975,7 @@ class App(tk.Tk):
         """One line per row; its matching cells and the WAL frames holding it underneath."""
         first = g.first
         tag = ("wal_" + g.category) if g.source == "WAL" and g.category in WAL_STATES else \
-            ("odd" if i % 2 else "even")
+            "sr_recovered" if g.source == "Freelist" else ("odd" if i % 2 else "even")
         n = len(g.hits)
         preview = _snippet(first["value"], term, mkey) if term else first["value"]
         iid = "g%d" % idx
@@ -1938,12 +2171,12 @@ class App(tk.Tk):
             frames = [(result["frame_idx"], result.get("page_num"), result.get("category", ""))]
         if len(frames) == 1:
             fi, pn, st = frames[0]
-            menu.add_command(label=f"Go to WAL frame #{fi} ({st})",
+            menu.add_command(label=f"Go to WAL frame #{fi + 1} ({st})",
                              command=lambda fi=fi, pn=pn: goto(fi, pn))
         elif frames:
             sub = tk.Menu(menu, tearoff=0)
             for fi, pn, st in frames[:40]:
-                sub.add_command(label=f"Frame #{fi}  (page {pn}, {st})",
+                sub.add_command(label=f"Frame #{fi + 1}  (page {pn}, {st})",
                                 command=lambda fi=fi, pn=pn: goto(fi, pn))
             if len(frames) > 40:
                 sub.add_command(label=f"... {len(frames) - 40} more (see the WAL tab)",
@@ -2061,8 +2294,8 @@ class App(tk.Tk):
                     i + 1, source_name(r.get("source", "DB")), r["table"], r["column"],
                     loc if loc is not None and getattr(loc, "kind", "") != "ordinal"
                     else r.get("rowid"), r["value"], r["type"], r.get("page", r.get("page_num")),
-                    r.get("cell_offset"), r.get("frame_idx"),
-                    "; ".join("#%s %s" % (f[0], f[2]) for f in r.get("frames") or ()),
+                    r.get("cell_offset"), frame_no(r.get("frame_idx")),
+                    "; ".join("#%s %s" % (f[0] + 1, f[2]) for f in r.get("frames") or ()),
                     r.get("confidence")]
                 if full:
                     rd = r.get("row_data")
@@ -2123,6 +2356,20 @@ class App(tk.Tk):
         self._browse_crumb = top.add(Breadcrumb(top, self, table_var=self._browse_table_var))
         self._browse_table_combo = self._browse_crumb.table_combo
         self._browse_table_combo.bind("<<ComboboxSelected>>", lambda e: self._load_browse_table())
+        # Live rows | Recovered (N): shown when recovery found records for the table
+        self._browse_view_var = tk.StringVar(value="live")
+        self._browse_live_rb = top.add(ttk.Radiobutton(
+            top, text="Live rows", value="live", variable=self._browse_view_var,
+            style="Segment.TRadiobutton", command=self._browse_view_changed), gap=8,
+            visible=False)
+        self._browse_rec_rb = top.add(ttk.Radiobutton(
+            top, text="Recovered", value="recovered", variable=self._browse_view_var,
+            style="Segment.TRadiobutton", command=self._browse_view_changed), gap=0,
+            visible=False)
+        ToolTip(self._browse_rec_rb, "The table's recovered records (deleted rows, older "
+                                     "versions, rows on unreferenced pages), in its own "
+                                     "columns, with where each was found (Forensics recovers "
+                                     "them)")
 
         # Global filter: every word must occur in some column; the per-column filters are in
         # the grid, under the column headers
@@ -2144,11 +2391,19 @@ class App(tk.Tk):
             command=lambda: show_filter_help(self._browse_filter_help)), gap=2)
         ToolTip(self._browse_filter_help, "The filter syntax: >5, 1~5, /regex/, NULL, !text, "
                                           "%like%")
-        self._browse_inspector_var = tk.BooleanVar(value=False)
+        # the row panel: shown unless the user turned it off (the choice is kept)
+        self._browse_inspector_var = tk.BooleanVar(
+            value=self.tags.settings.get("browse_row_panel", True) is not False)
         self._browse_inspector_cb = top.add(ttk.Checkbutton(
             top, text="Row panel", variable=self._browse_inspector_var,
-            command=lambda: self._browse_grid.set_inspector(self._browse_inspector_var.get())),
-            gap=10)
+            command=self._toggle_browse_row_panel), gap=10)
+        self._browse_pictures_var = tk.BooleanVar(
+            value=bool(self.tags.settings.get("browse_pictures", False)))
+        pics = top.add(ttk.Checkbutton(
+            top, text="Pictures", variable=self._browse_pictures_var,
+            command=self._toggle_browse_pictures), gap=8)
+        ToolTip(pics, "Image BLOBs (JPEG, PNG, GIF...) as thumbnails in their cells, with "
+                      "taller rows (the stored value stays for copies and the inspector)")
         self._browse_columns_btn = top.add(ttk.Button(
             top, text="Columns…", command=lambda: self._browse_grid.column_chooser()), gap=6)
         # every named limit (rows per window, positions mapped, characters drawn, ...)
@@ -2174,6 +2429,8 @@ class App(tk.Tk):
             describe=self._describe_value, row_style=self.tags.browse_row_style,
             on_context_menu=self._on_browse_menu, on_header_menu=self._on_browse_header_menu)
         self._browse_grid.pack(fill="both", expand=True, padx=8, pady=(2, 2))
+        self._browse_grid.set_inspector(self._browse_inspector_var.get())
+        self._browse_grid.set_pictures(self._browse_pictures_var.get())
         # the Browse bar's 'Filter all columns' is the grid's search (not a second box)
         self._browse_grid.use_search_box(SimpleNamespace(var=self._browse_filter_var,
                                                          entry=self._browse_filter_entry))
@@ -2215,14 +2472,23 @@ class App(tk.Tk):
         self._browse_count_gen += 1
         self._browse_counter.cancel()
         running = self._browse_counter.running_thread()
-        if running is not None and self._browse_counter.running_key() == "blob-check":
-            self.db.interrupt(running)          # the BLOB check of the table shown until now
+        key = self._browse_counter.running_key()
+        if running is not None and key in ("blob-check", "count", "positions"):
+            # the BLOB check, count or position index of the table shown until now: stopped,
+            # so the new table's count does not wait behind it (an index of 2.5 million rows
+            # held it back for seconds)
+            db = (self._browse_pos_db or self.db) if key == "positions" else self.db
+            db.interrupt(running)
+            if key == "positions":
+                self._browse_pos_gen += 1       # its result is for the table left
         self._browse_count_error = ""
         self._browse_t0 = time.perf_counter()
         self._browse_first_ms = self._browse_first_range = None
         self._browse_table_gen += 1
         self._browse_wal_loading = None
         self._browse_has_blobs = False
+        self._browse_view_var.set("live")
+        self._browse_recovered = []
         if tbl.startswith("WAL: "):
             # read on a worker: an empty grid with the table's columns until the records
             # arrive, and the status says what is being read
@@ -2232,18 +2498,32 @@ class App(tk.Tk):
         else:
             known = self._count_cache.get(tbl)
             src = TableSource(self.db, tbl, total=known if isinstance(known, int) else None)
+            src = self._browse_fields.wrap(tbl, src)    # + the columns derived from fields
+            src = self._browse_calcs.wrap(tbl, src)     # + the calculated columns
         self._browse_source = src
         self._browse_filter_var.set("")
         self._show_browse_blob_export(self._browse_has_blob_columns())
         self._browse_grid.set_source(src)
         self.tags.restore_view(tbl)
+        self._refresh_browse_recovered()
         self.relations.refresh_marks()      # the link glyph on columns with confident links
         self._browse_dates.apply(tbl)
+        self._browse_numbers.apply(tbl)     # 'Show as number' (a column has one or the other)
         self._browse_lookups.apply(tbl)     # 'Show value from linked table' (after dates)
+        self._browse_fields.apply(tbl)      # fields shown inside a column (after lookups)
+        self._browse_calcs.apply(tbl)       # the calculated columns' colour
         self._show_browse_note([], "")
-        self._start_browse_blob_check(tbl)  # queued first of all: it runs last
-        self._start_browse_positions()      # queued first: the (quick) count runs before it
-        self._start_browse_count()
+        # given together (the newest runs first): the quick row count first, so the scrollbar
+        # spans the whole table at once, then the position index, the BLOB check last (it
+        # reads the whole table: 8 s on a 2.5-million-row table held the count back)
+        self._counter_batch = []
+        try:
+            self._start_browse_blob_check(tbl)
+            self._start_browse_positions()
+            self._start_browse_count()
+        finally:
+            batch, self._counter_batch = self._counter_batch, None
+        self._browse_counter.submit_many(batch)
         self._update_browse_status()
 
     def _start_browse_blob_check(self, tbl):
@@ -2263,7 +2543,7 @@ class App(tk.Tk):
                 return
             self._browse_has_blobs = True
             self._show_browse_blob_export(True)
-        self._browse_counter.submit("blob-check", work, done)
+        self._counter_submit("blob-check", work, done)
 
     def _start_wal_only_load(self, tbl):
         """Read the records of the WAL-only table `tbl` ('WAL: name') off the Tk thread, then
@@ -2301,6 +2581,14 @@ class App(tk.Tk):
         open database (a worker may have read several of a case)."""
         self.case.release_thread_connection()
 
+    def _counter_submit(self, key, fn, done):
+        """Give a job to the Browse count worker, or to the batch being put together."""
+        batch = getattr(self, "_counter_batch", None)
+        if batch is not None:
+            batch.append((key, fn, done))
+        else:
+            self._browse_counter.submit(key, fn, done)
+
     def _start_browse_count(self):
         """Count the rows of the Browse source for its current filter, off the Tk thread."""
         src = self._browse_source
@@ -2328,7 +2616,7 @@ class App(tk.Tk):
                     self._count_cache[src.table] = n
                 self._browse_grid.row_count_changed()
             self._update_browse_status()
-        self._browse_counter.submit("count", lambda: src.count_rows(cancel), done)
+        self._counter_submit("count", lambda: src.count_rows(cancel), done)
 
     def _start_browse_positions(self):
         """Index where the rows of the Browse view are (engine.positions), off the Tk thread,
@@ -2359,7 +2647,7 @@ class App(tk.Tk):
                 # through the index just built
                 self._browse_grid.restart_reads()
             self._update_browse_status()
-        self._browse_counter.submit("positions", lambda: src.build_positions(cancel), done)
+        self._counter_submit("positions", lambda: src.build_positions(cancel), done)
 
     def _show_browse_note(self, rows, note="", keep_space=False):
         """Show the engine's note and a count of flagged rows among `rows` (objects with a
@@ -2397,13 +2685,13 @@ class App(tk.Tk):
             self._browse_forget_first_time()       # it timed other rows: no longer said
         self._update_browse_status()
 
-    def _schedule_browse_status(self):
+    def _schedule_browse_status(self, ms=1000):
         """While rows are being read, the status line says so again each second."""
         if getattr(self, "_browse_status_after", None) is None:
             def tick():
                 self._browse_status_after = None
                 self._update_browse_status()
-            self._browse_status_after = self.after(1000, tick)
+            self._browse_status_after = self.after(ms, tick)
 
     def _browse_forget_first_time(self):
         """The 'opened in N ms' time describes the first rows of the table as opened; once
@@ -2455,11 +2743,24 @@ class App(tk.Tk):
                 text += (" (filtered from %s)" % format(src.total, ",")) \
                     if src.total is not None else " (filtered)"
             parts.append(text)
+        derived = [c for c in src.columns() if c.startswith(self._browse_fields.PREFIX)]
+        if derived:
+            # columns the tool computes from a column's values: said, so they are never
+            # taken for columns of the table
+            parts.append("%d derived column%s (%s computed by the tool from a column's "
+                         "values, not stored in the table)" % (
+                             len(derived), "" if len(derived) == 1 else "s",
+                             self._browse_fields.PREFIX.strip()))
         first, end = g.target_row_range()
         if end > first:
-            if g.waiting():
+            secs = g.waiting_seconds() if g.waiting() else 0.0
+            if g.waiting() and secs < 0.5:
+                # a read of a few milliseconds while scrolling: nothing to say about it (the
+                # status looks again in a moment, in case the read turns out to be long)
+                parts.append("showing %s–%s" % (format(first + 1, ","), format(end, ",")))
+                self._schedule_browse_status(500)
+            elif g.waiting():
                 # rows far into a sorted or filtered view: say what is read and for how long
-                secs = g.waiting_seconds()
                 parts.append("reading rows %s–%s ⟳%s" % (
                     format(first + 1, ","), format(end, ","),
                     (" %d s%s" % (secs, ", faster once the rows are indexed"
@@ -2467,7 +2768,8 @@ class App(tk.Tk):
                 self._schedule_browse_status()
             else:
                 parts.append("showing %s–%s" % (format(first + 1, ","), format(end, ",")))
-        if self._browse_pos_busy:
+        if self._browse_pos_busy and not g.reads_quick():
+            # (a table read in its row order reads any window in milliseconds already)
             parts.append("indexing rows for fast scrolling…")
         if g.notice:
             parts.append(g.notice)
@@ -2481,7 +2783,9 @@ class App(tk.Tk):
         bad = g.filter_errors()
         if bad:
             parts.append("filter not used for %s (hover it for why)" % ", ".join(sorted(bad)))
-        if isinstance(src, ListSource):
+        if getattr(src, "recovered", False):
+            parts.append("recovered records (not live rows): Live rows shows the table")
+        elif isinstance(src, ListSource):
             parts.append("WAL-only table")
         if self._browse_lookups.last_note:     # a saved lookup that cannot be shown now
             parts.append("linked values not shown: " + self._browse_lookups.last_note)
@@ -2489,16 +2793,107 @@ class App(tk.Tk):
             parts.append("opened in %s ms" % format(int(self._browse_first_ms), ","))
         self._browse_status.configure(text="  |  ".join(parts))
 
-    @staticmethod
-    def _describe_value(v):
-        """Timestamp readings of a number, for the row inspector's Decoded column (the one
-        decoder, engine.decode.timestamps)."""
+    def _browse_recovered_records(self, table):
+        """The records Forensics recovered for this table of the active database (index
+        entries left out: they have the index's columns)."""
+        tab = getattr(self, "_forensics", None)
+        recs = getattr(tab, "_records", None) or []
+        return [r for r in recs if r.table == table and getattr(r, "index", None) is None]
+
+    def _refresh_browse_recovered(self):
+        """Show 'Live rows | Recovered (N)' when the table has recovered records."""
+        tbl = self._browse_table_var.get() if hasattr(self, "_browse_view_var") else ""
+        recs = self._browse_recovered_records(tbl) if tbl else []
+        top = self._browse_top
+        top.show(self._browse_live_rb, bool(recs))
+        top.show(self._browse_rec_rb, bool(recs))
+        self._browse_rec_rb.configure(text="Recovered (%s)" % format(len(recs), ","))
+        if not recs and self._browse_view_var.get() == "recovered":
+            self._browse_view_var.set("live")
+            self._browse_view_changed()
+
+    def _browse_view_changed(self):
+        """Live rows: the table; Recovered: its recovered records in its own columns."""
+        tbl = self._browse_table_var.get()
+        if self._browse_view_var.get() != "recovered":
+            if getattr(self._browse_source, "recovered", False):
+                self._load_browse_table()
+            return
+        from recordui import file_offset, record_state
+        recs = self._browse_recovered_records(tbl)
+        cols = []
+        for r in sorted(recs, key=lambda r: -len(r.columns)):
+            for c in r.columns:
+                if c not in cols:
+                    cols.append(c)
+        rows = []
+        for i, r in enumerate(recs):
+            vals = dict(zip(r.columns, r.values))
+            rows.append(([i + 1, record_state(r), r.confidence, r.prov.where(),
+                          file_offset(self.db, r.prov)] + [vals.get(c) for c in cols], ()))
+        src = ListSource([RID, "State", "Confidence", "Where", "Byte offset"] + cols, rows,
+                         encoding=self.db.encoding)
+        src.recovered = True
+        self._browse_recovered = recs
+        self._browse_source = src
+        self._browse_grid.set_source(src)
+        self._update_browse_status()
+
+    def _toggle_browse_pictures(self):
+        on = bool(self._browse_pictures_var.get())
+        self._browse_grid.set_pictures(on)
+        self.tags.settings["browse_pictures"] = on
+        try:
+            self.tags.save_settings()
+        except Exception:               # noqa: BLE001 - a choice not kept is not fatal
+            pass
+
+    def _toggle_browse_row_panel(self):
+        on = bool(self._browse_inspector_var.get())
+        self._browse_grid.set_inspector(on)
+        self.tags.settings["browse_row_panel"] = on
+        try:
+            self.tags.save_settings()
+        except Exception:               # noqa: BLE001 - a choice not kept is not fatal
+            pass
+
+    def _describe_value(self, v, column=None):
+        """The row panel's Decoded column: a number read as a date the way the column is read
+        (its 'Show as date' choice, else the kind the date detector finds for the column,
+        judged once in the background), only for columns whose name says date or time."""
+        from engine import timeline as tl
+        table = self._browse_table_var.get() if column else None
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            return ""
+        dates = getattr(self, "_browse_dates", None)
+        if column and dates is not None and table:
+            kind = dates.choice(table, column)
+            if kind not in tl.KINDS:
+                if tl.name_hint(column) not in ("strong", "weak"):
+                    return ""
+                ok, kind = dates.known(table, column)
+                if not ok:              # judged on a worker; the panel redraws after
+                    dates.suggest_later(table, column,
+                                        lambda _k: self._browse_grid.refresh_inspector())
+                    kind = None
+            if kind in tl.KINDS:
+                when = tl.utc_text(tl.formatter(kind)(v))
+                if when and "not set" not in when:   # the date first: it is what is read
+                    return "%s · %s" % (when, tl.SHORT.get(kind, tl.LABELS[kind]))
         found = timestamps.readings(v)
         return "; ".join("%s: %s" % (label, when) for _k, label, when in found[:2])
 
     def _on_browse_open_row(self, _row, values):
         tbl = self._browse_table_var.get()
         if not values:
+            return
+        if getattr(self._browse_source, "recovered", False):
+            try:
+                rec = self._browse_recovered[int(values[0]) - 1]
+            except (IndexError, TypeError, ValueError):
+                return
+            from forensics_tab import RecordWindow
+            RecordWindow(self, rec, self)
             return
         loc = values[0]
         # WAL-only tables: the record from its own frame (the row says which)
@@ -2533,7 +2928,10 @@ class App(tk.Tk):
 
     def _on_browse_header_menu(self, menu, c):
         self._browse_dates.header_menu(menu, c)
+        self._browse_numbers.header_menu(menu, c)
         self._browse_lookups.header_menu(menu, c)
+        self._browse_fields.header_menu(menu, c)
+        self._browse_calcs.header_menu(menu, c)
         self.relations.header_menu(menu, self._browse_table_var.get(), c)
 
     # ── Column relationships (relations_view) ────────────────────────
@@ -2566,6 +2964,14 @@ class App(tk.Tk):
     def open_blob(self, value, column, context=""):
         """Open the BLOB inspector for a value from any tab."""
         BlobViewer(self, bytes(value), column, context)
+
+    def show_table_history(self, member, table):
+        """Forensics > Row History with this table's changed rows listed."""
+        if member is None or member not in self.case.members or not member.db.ok:
+            return
+        self.activate_member(member)
+        self._nb.select(self._forensics)
+        self._forensics.show_table_history(table)
 
     def show_row_history(self, table, key):
         """Show every version of a row (main file, WAL frames, journal) in the Forensics tab."""
@@ -2638,9 +3044,9 @@ class App(tk.Tk):
             scopes.append(("selected", "Selected rows (%s)" % format(sel[1] - sel[0] + 1, ",")))
         opts = export_options(self, "Export %s" % self._browse_label(), scopes, fmt=fmt,
                               hidden=bool(g.hidden_columns()), spreadsheet_safe=True,
-                              note="Values are written as stored (a column shown as a date "
-                                   "or a linked value keeps its raw value; the linked value "
-                                   "gets a column of its own).")
+                              note="Values are written as stored; a column shown as a "
+                                   "date or with a linked value keeps its raw value, and the "
+                                   "date or the linked value gets a column of its own.")
         if opts is None:
             return
         fmt, which = opts["fmt"], opts["scope"]
@@ -2655,8 +3061,11 @@ class App(tk.Tk):
         # a column shown with a linked value keeps its raw values; the looked-up ones go in
         # a column of their own, named '<column> → <db › table.column>'
         extra = self._browse_lookups.export_columns(names)
+        # columns shown as dates: the date text in a column of its own, the stored value kept
+        dextra = (self._browse_dates.export_columns(tbl, names) +
+                  self._browse_numbers.export_columns(tbl, names))
         raw_n = len(names)
-        names = names + [nm for _i, nm, _lk in extra]
+        names = names + [nm for _i, nm, _lk in extra] + [nm for _i, nm, _fn in dextra]
         win = limits.get("grid_window_rows")
 
         def rows_fn():
@@ -2680,6 +3089,8 @@ class App(tk.Tk):
                 for i, _nm, lk in extra:
                     hit = lk.value(vals[i]) if i < raw_n else None
                     vals.append(hit[0] if hit is not None else None)
+                for i, _nm, fn in dextra:
+                    vals.append(fn(vals[i]) if i < raw_n else None)
                 yield vals
         total = (sel[1] - sel[0] + 1) if which == "selected" else n
         source = "Browse %s '%s' (%s)" % (
@@ -3042,7 +3453,7 @@ class App(tk.Tk):
         self._palette = CommandPalette(self, self.palette_items(), recent, chosen)
         return "break"
 
-    def palette_items(self):
+    def palette_items(self):  # noqa: C901
         """Everything the command palette offers."""
         items = []
         nav = self._navigator
@@ -3058,7 +3469,9 @@ class App(tk.Tk):
                 elif e.kind == "table":
                     items.append(Item("table", e.table, m.name if multi else "",
                                       ("table", m.path, e.table),
-                                      lambda m=m, t=e.table: self.browse_member_table(m, t)))
+                                      lambda m=m, t=e.table: self.browse_member_table(m, t),
+                                      weight=_rows_weight((getattr(m, "counts", None) or {})
+                                                          .get(e.table))))
                 else:
                     items.append(Item("column", e.column, "%s%s" % (
                         m.name + " \u203A " if multi else "", e.table),
@@ -3082,6 +3495,7 @@ class App(tk.Tk):
                    ("Limits\u2026", lambda: self.datamap.limits_window(self), True),
                    ("Toggle the navigator (Ctrl+B)", self._toggle_sidebar_by_hand, True),
                    ("Help", lambda: HelpDialog(self), True),
+                   ("Guide: how the tool works (HTML)", self._open_guide, True),
                    ("Close", self._close_db, ok)]
         for label, fn, enabled in actions:
             if enabled:
@@ -3123,8 +3537,12 @@ class App(tk.Tk):
                 "Include views: off by default, a view usually repeats rows of its tables.\n"
                 "Max matching rows per table: a table that reaches it is named in the status\n"
                 "('urls (100+)' in the Table filter). All: no limit.")
-        ToolTip(self._search_free_cb, "Also search deleted records still held by freed pages\n"
-                                      "(Forensics > Freed Pages shows them page by page)")
+        ToolTip(self._search_free_cb, "Also search the deleted and older records the file still "
+                                      "holds (freeblocks,\nunallocated space, freed and "
+                                      "unreferenced pages, the rollback journal), as "
+                                      "Forensics recovers them;\n"
+                                      "recovered first when not done yet. Without it Search "
+                                      "covers the live rows only.")
         ToolTip(self._search_wal_cb,
                 "Also search every row version kept in the WAL (Write-Ahead Log) file:\n"
                 "older versions, deleted rows, uncommitted and stale frames.\n"
@@ -3437,6 +3855,8 @@ class App(tk.Tk):
                         ["%s: %s" % (os.path.basename(p), e) for p, e in failed] + notes))
             else:
                 self._report_open_problems(failed, notes)
+            if st["new_case"] and members and self.case.multi and self._overview_added:
+                self._nb.select(self._overview)     # a new case lands on its overview
             if st["on_done"] is not None:
                 st["on_done"](list(members))
             waiting, self._open_waiting = self._open_waiting, []
@@ -3447,6 +3867,8 @@ class App(tk.Tk):
                     self._start_open(paths, saved, active, told, new_case=True, on_done=done)
         if members:
             active = st["active"] and self.case.by_path(st["active"])
+            if active is None and st["new_case"] and self.case.multi:
+                active = self._main_member()
             if active is not None and active is not self.case.active:
                 self.activate_member(active)
             # a step per turn of the event loop, unless a script waits for the open
@@ -3454,6 +3876,20 @@ class App(tk.Tk):
             self._case_changed(spread=not st.get("wait"), then=rest)
         else:
             rest()
+
+    def _main_member(self):
+        """The database a new case shows first when none was chosen: the largest file (the
+        messages database of an app, not its 2-row job queue that sorts first)."""
+        def size(m):
+            total = 0
+            for sfx in ("", "-wal"):
+                try:
+                    total += os.path.getsize(m.path + sfx)
+                except OSError:
+                    pass
+            return total
+        members = [m for m in self.case if getattr(m.db, "ok", False)]
+        return max(members, key=size) if members else None
 
     def _cancel_open(self):
         """Abandon an open still running (a new case or Close): the databases it opened
@@ -3600,6 +4036,7 @@ class App(tk.Tk):
         elif self._browse_source is not None:
             # the linked values were stopped (one may have been read from that database)
             self._browse_lookups.apply(self._browse_table_var.get())
+            self._browse_fields.apply(self._browse_table_var.get())
         self._case_changed(timeline=False)
         if timeline_stopped:
             self._timeline.on_open()        # it was reading the database: it starts over
@@ -3695,6 +4132,8 @@ class App(tk.Tk):
         self._forensics.reset()
         self._browse_dates.reset()
         self._browse_lookups.reset()
+        self._browse_fields.reset()
+        self._browse_calcs.reset()
         self._browse_source = None
         self._browse_grid.set_source(None)
         self._browse_filter_var.set("")
@@ -3703,13 +4142,8 @@ class App(tk.Tk):
         self._sql_result_rows, self._sql_result_cols = [], []
         if hasattr(self, "_sql_status_label"):
             self._sql_status_label.configure(text="")
-        self._wal_frame.reset()
-        if self._wal_tab_added:
-            try:
-                self._nb.forget(self._wal_frame)
-            except tk.TclError:
-                pass
-            self._wal_tab_added = False
+        self._wal_frame.reset()         # the tab stays: forgetting it would move the
+                                        # selection to the next tab (SQL) on every switch
 
     def _activate_ui(self):
         """Show the active database in the tabs that work on one database."""
@@ -3730,6 +4164,7 @@ class App(tk.Tk):
                 for wt in wal_only:
                     browse_vals.append(f"WAL: {wt}")
         self._browse_table_combo.configure(values=browse_vals)
+        self._refresh_browse_counts()
         if tables:
             # the table viewed last, else the first one with rows (not an empty one)
             self._browse_table_var.set(last_table if last_table in browse_vals
@@ -3738,19 +4173,16 @@ class App(tk.Tk):
             self._load_browse_table()
 
         self._forensics.on_open()
+        self._query.on_open()
         self.relations.refresh_marks()
 
-        # WAL tab: for a database with a -wal file, readable or not (then it says why);
-        # always right after Browse
-        s = self.db.session
-        if self.db.has_wal or (s is not None and s.wal_problem):
-            if not self._wal_tab_added:
-                self._nb.insert(self._sql_frame, self._wal_frame, text="WAL")
-                self._wal_tab_added = True
-            self._wal_frame.on_open()
-        elif self._wal_tab_added:
-            self._nb.forget(self._wal_frame)
-            self._wal_tab_added = False
+        # WAL tab: always right after Browse - the frames of a -wal file (or why it cannot
+        # be read), and for a database without one, that there is none and what that means
+        # (a tab that comes and goes left examiners unsure whether the WAL was looked at)
+        if not self._wal_tab_added:
+            self._nb.insert(self._sql_frame, self._wal_frame, text="WAL")
+            self._wal_tab_added = True
+        self._wal_frame.on_open()
         self._update_sql_notice()
         if hasattr(self, "_sql_status_label"):
             self._sql_status_label.configure(
@@ -3787,6 +4219,23 @@ class App(tk.Tk):
                 return t
         return tables[0]
 
+    def _refresh_browse_counts(self):
+        """Each table of the Browse picker with its row count ('14,175', '~14,175' while only
+        estimated, 'empty'), as the navigator counts them."""
+        counts = {}
+        for t, n in (self._count_cache or {}).items():
+            if isinstance(n, bool):
+                continue
+            if isinstance(n, int):
+                counts[t] = "empty" if n == 0 else format(n, ",")
+            elif isinstance(n, str) and n.startswith("~") and n[1:].isdigit():
+                counts[t] = "~" + format(int(n[1:]), ",")
+        try:
+            if counts != self._browse_table_combo.cget("counts"):
+                self._browse_table_combo.configure(counts=counts)
+        except tk.TclError:
+            pass
+
     def _start_counts(self, member):
         """Count a database's rows on the row-count worker thread (the session gives it its
         own connection); one worker serves every database of the case in turn."""
@@ -3820,6 +4269,7 @@ class App(tk.Tk):
                  self._update_search_options,
                  self.relations.start_mapping,  # links checked against the values, in the background
                  self._timeline.on_open if timeline else None,
+                 self._query.on_open,           # its table list groups the databases
                  self._update_overview,
                  lambda: self.tags.refresh_views(now=True),
                  self._save_case]
@@ -4056,7 +4506,12 @@ class App(tk.Tk):
                 return
             approx_n = db.approx_count(t)
             if approx_n is not None and not isinstance(cache.get(t), int):
-                cache[t] = f"~{approx_n}"
+                # an estimate of 0 is checked (one row looked for): an empty table says an
+                # exact 0, never '~0' beside the real zeros
+                if approx_n == 0 and db.is_empty(t):
+                    cache[t] = 0
+                else:
+                    cache[t] = f"~{approx_n}"
         if not stale():
             self._after_safe(0, self._update_schema_counts)
         if not exact:
@@ -4067,9 +4522,10 @@ class App(tk.Tk):
                 return
             try:
                 cache[t] = db.count(t)
-            except Exception:
+            except Exception as e:      # noqa: BLE001 - shown as '?', the reason on hover
                 if not isinstance(cache.get(t), int):
                     cache[t] = "?"
+                db.count_errors[t] = count_error_text(e)
             now = time.time()
             if now - last_update >= 0.3:
                 last_update = now
@@ -4078,8 +4534,10 @@ class App(tk.Tk):
             self._after_safe(0, self._update_schema_counts)
 
     def _update_schema_counts(self):
-        """Row counts changed (the count worker): the navigator's and the Overview's lines."""
+        """Row counts changed (the count worker): the navigator's and the Overview's lines,
+        and the Browse table picker."""
         self._navigator.refresh_counts()
+        self._refresh_browse_counts()
         if self._overview_added:
             if getattr(self, "_overview_counts_after", None) is None:
                 self._overview_counts_after = self.after(500, self._overview_counts)
@@ -4090,10 +4548,37 @@ class App(tk.Tk):
             self._overview.refresh_counts()
 
     def _on_app_close(self):
-        """Close the database (verifying the evidence) and exit."""
+        """The window's close button: with a database or case open, ask first (what will be
+        closed and verified); then close it (verifying the evidence) and exit."""
+        if self.db.ok and not self._confirm_exit():
+            return
         self._close_db(confirm=False, wait=True)
         self.wait_closed()              # a verification still running from an earlier close
         self.destroy()
+
+    ask_before_exit = True              # tests turn the question off
+
+    def _confirm_exit(self):
+        if not self.ask_before_exit or os.environ.get("SGA_NO_EXIT_QUESTION"):
+            return True             # scripts and the tests close without the question
+        members = list(self.case) if getattr(self.case, "multi", False) else []
+        if members:
+            what = "the case of %d databases (%s)" % (
+                len(members), ", ".join(m.name for m in members[:4]) +
+                ("\u2026" if len(members) > 4 else ""))
+        else:
+            path = getattr(getattr(self.db, "evidence", None), "main", "") or ""
+            what = "the database %s" % (os.path.basename(path) or "open now")
+        try:
+            self._raise_window()
+            return messagebox.askyesno(
+                "Exit SQLite GUI Analyzer",
+                "Exit and close %s?\n\nNothing was written to the evidence; its files are "
+                "checked once more on closing (size, time and SHA-256, up to the limit "
+                "verify_rehash_bytes) and the result goes to the activity log." % what,
+                parent=self)
+        except tk.TclError:
+            return True
 
     def closing(self):
         """True while the evidence of databases just closed is being verified."""
@@ -4455,9 +4940,12 @@ class App(tk.Tk):
         self._sr_reset_groups()
         self._sr_filtered = []
         self._forensics.reset()
+        self._query.reset()
         self._timeline.reset()
         self._browse_dates.reset()
         self._browse_lookups.reset()
+        self._browse_fields.reset()
+        self._browse_calcs.reset()
         self._browse_source = None
         self._browse_grid.set_source(None)
         self._browse_filter_var.set("")
@@ -5007,6 +5495,9 @@ class App(tk.Tk):
             lambda e: (self._sql_history_prev(), "break")[1])
         self._sql_editor.bind("<Alt-Down>",
             lambda e: (self._sql_history_next(), "break")[1])
+        from sql_complete import SqlCompleter
+        self._sql_completer = SqlCompleter(self._sql_editor, self._sql_schema)
+        self._sql_editor.bind("<<Completed>>", self._sql_on_key)
 
         tbar = Toolbar(sf)
         tbar.pack(fill="x", padx=M, pady=(XS, XS))
@@ -5036,14 +5527,16 @@ class App(tk.Tk):
         self._sql_export_json_btn = self._sql_export_btn    # one button for both formats
 
         tbar.add(ttk.Label(tbar, text="Limit", style="Muted.TLabel"), gap=M)
-        self._sql_limit_var = tk.StringVar(value="1000")
+        self._sql_limit_var = tk.StringVar(value="All")
         sql_lim_cb = SearchableCombobox(
             tbar, textvariable=self._sql_limit_var,
             values=["100", "500", "1000", "5000", "All"],
             state="readonly", width=7,
         )
         tbar.add(sql_lim_cb, gap=2)
-        ToolTip(sql_lim_cb, "Maximum rows to return")
+        ToolTip(sql_lim_cb, "Maximum rows to return. All: every row, up to the query_rows "
+                            "setting (%s) that protects memory - the status says when a "
+                            "query reaches it" % format(limits.get("query_rows"), ","))
 
         sbar = ttk.Frame(sf)
         sbar.pack(fill="x", padx=10, pady=(0, 2))
@@ -5064,12 +5557,13 @@ class App(tk.Tk):
         # Results in the same virtual grid as Browse (rows held in memory: sorting and the
         # column filters apply to the rows the query returned)
         self._sql_grid = DataGrid(res_border, frozen=0, on_open_row=self._sql_open_row,
+                                  on_header_menu=lambda m, c: self._sql_header_menu(m, c),
                                   on_open_blob=lambda row, column, value: BlobViewer(
                                       self, value, column, "%s.%s — row %s" % (
                                           self._sql_grid.context(), column,
                                           format(row + 1, ","))),
                                   on_filter=lambda _e, _g: self._sql_update_count(),
-                                  describe=self._describe_value)
+                                  describe=lambda v, _c=None: self._describe_value(v))
         self._sql_grid.context = lambda: "query result, %s" % self.case.active.name \
             if self.case.active is not None else "query result"
         self._sql_search = grid_search(res_outer, self._sql_grid,
@@ -5100,8 +5594,10 @@ class App(tk.Tk):
         hist_border = tk.Frame(hist_outer, relief="solid", bd=1, bg=C["border"])
         hist_border.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
+        # 4 lines asked for (Tk's default is 10): the results - what a run is for - get the
+        # room; the sash gives the history more when wanted
         self._sql_hist_listbox = tk.Listbox(
-            hist_border, font=F["mono"],
+            hist_border, font=F["mono"], height=4,
             bg=C["bg2"], fg=C["text"],
             selectbackground=C["tsel"], selectforeground=C["text"],
             relief="flat", activestyle="none",
@@ -5153,6 +5649,25 @@ class App(tk.Tk):
         if hasattr(self, "_sql_hl_after"):
             self.after_cancel(self._sql_hl_after)
         self._sql_hl_after = self.after(150, self._sql_highlight)
+
+    def _sql_schema(self):
+        """{table or view: [(column, declared type)]} of the active database, for the SQL
+        editor's completion (read once per database from the schema, never the rows)."""
+        db = self.db
+        if db is None or not db.ok or db.session is None:
+            return {}
+        cache = getattr(self, "_sql_schema_cache", None)
+        if cache is not None and cache[0] is db.session:
+            return cache[1]
+        out = {}
+        for t in list(db.tables()) + list(db.views()):
+            try:
+                out[t] = [(c.name, c.decl_type) for c in db.session.info(t).columns
+                          if c.hidden != 1]
+            except Exception:           # noqa: BLE001 - a table the schema cannot describe
+                out[t] = []
+        self._sql_schema_cache = (db.session, out)
+        return out
 
     def _focus_sql_editor(self):
         self._nb.select(self._sql_frame)
@@ -5255,7 +5770,8 @@ class App(tk.Tk):
         if not self._sql_query_history or self._sql_query_history[-1] != sql:
             self._sql_query_history.append(sql)
             self._sql_query_history_idx = len(self._sql_query_history) - 1
-            display = sql[:90].replace("\n", " ")
+            one = " ".join(sql.split())     # one line; '…' says when it is shortened
+            display = one if len(one) <= 200 else one[:199] + "…"
             self._sql_hist_listbox.insert(0, display)
             keep = limits.get("sql_history")
             while self._sql_hist_listbox.size() > keep:
@@ -5263,7 +5779,8 @@ class App(tk.Tk):
                 self._sql_query_history.pop(0)
 
         lim_str = self._sql_limit_var.get()
-        limit = None if lim_str == "All" else int(lim_str)
+        self._sql_all = lim_str == "All"
+        limit = limits.get("query_rows") if self._sql_all else int(lim_str)
 
         self._sql_grid.set_source(None)
         self._sql_result_rows = []
@@ -5336,12 +5853,65 @@ class App(tk.Tk):
         self._sql_limited = bool(limit)          # a row past the limit was there
         self._sql_grid.set_source(ListSource(cols, [(row, ()) for row in rows],
                                              encoding=self.db.encoding))
+        self._sql_dates = self._sql_auto_dates(cols, rows)
         self._sql_update_count()
         self._sql_col_info.configure(text="{} column{}".format(
             len(cols), "s" if len(cols) != 1 else ""))
         if rows:
             self._sql_export_btn.configure(state="normal")
             self._sql_export_json_btn.configure(state="normal")
+
+    def _sql_auto_dates(self, cols, rows):
+        """{column index: date kind} of the result columns whose name and values both say
+        dates (WhatsApp message.timestamp: Unix ms): shown as dates, the stored value kept in
+        copies, exports and the tooltip; the header's right-click turns it off and on."""
+        from engine import timeline as tl
+        off = getattr(self, "_sql_dates_off", set())
+        out = {}
+        for i, name in enumerate(cols):
+            if name in off or tl.name_hint(name) not in ("strong", "weak"):
+                continue
+            sample = [r[i] for r in rows[:300] if i < len(r) and r[i] is not None]
+            kind = tl.suggest_kind(name, sample) if sample else None
+            if kind in tl.KINDS:
+                out[i] = kind
+                self._sql_grid.set_column_formatter(i, tl.formatter(kind),
+                                                    "UTC " + tl.SHORT.get(kind, ""))
+        return out
+
+    def _sql_header_menu(self, menu, c):
+        """Right-click a result header: show a date column as stored values, or again as
+        dates (the kind the values read as)."""
+        from engine import timeline as tl
+        cols = getattr(self, "_sql_result_cols", None) or []
+        if not 0 <= c < len(cols):
+            return
+        name = cols[c]
+        dates = getattr(self, "_sql_dates", {})
+        off = self.__dict__.setdefault("_sql_dates_off", set())
+        rows = getattr(self, "_sql_result_rows", None) or []
+
+        def stored():
+            off.add(name)
+            dates.pop(c, None)
+            self._sql_grid.set_column_formatter(c, None)
+            self._sql_update_count()
+
+        def as_dates(kind):
+            off.discard(name)
+            dates[c] = kind
+            self._sql_grid.set_column_formatter(c, tl.formatter(kind),
+                                                "UTC " + tl.SHORT.get(kind, ""))
+            self._sql_update_count()
+        menu.add_separator()
+        if c in dates:
+            menu.add_command(label="Show the stored values (not as dates)", command=stored)
+        else:
+            sample = [r[c] for r in rows[:300] if c < len(r) and r[c] is not None]
+            kind = tl.suggest_kind(name, sample) if sample else None
+            if kind in tl.KINDS:
+                menu.add_command(label="Show as dates (%s)" % tl.SHORT.get(kind, kind),
+                                 command=lambda: as_dates(kind))
 
     def _sql_update_count(self):
         """Status line of the SQL tab: rows returned, and how many the column filters keep."""
@@ -5351,9 +5921,19 @@ class App(tk.Tk):
         status = "{:,} row{} returned".format(src.total, "s" if src.total != 1 else "")
         if src.filtered:
             status += "  ({:,} kept by the column filters)".format(src.row_count())
-        if self._sql_limited:
+        if self._sql_limited and getattr(self, "_sql_all", False):
+            status += "  (CUT OFF at the query_rows setting, %s: the query has more rows; " \
+                      "narrow it with WHERE, or raise query_rows in Settings)" % format(
+                          limits.get("query_rows"), ",")
+        elif self._sql_limited:
             status += "  (stopped at the Limit: the query has more rows; choose a larger " \
                       "Limit or All)"
+        dates = getattr(self, "_sql_dates", {})
+        cols = getattr(self, "_sql_result_cols", None) or []
+        if dates:
+            status += "  · %s shown as dates (UTC); the stored values stay in copies and " \
+                      "exports (right-click a header to switch)" % ", ".join(
+                          cols[i] for i in sorted(dates) if i < len(cols))
         self._sql_status_label.configure(text=status)
 
     def _sql_view_rows(self):
@@ -5402,6 +5982,24 @@ class App(tk.Tk):
             return
         rows = self._sql_view_rows()
         cols = list(self._sql_result_cols)
+        dates = dict(getattr(self, "_sql_dates", {}))
+        if dates:                       # a date column keeps its stored value; the date text
+            from engine import timeline as tl   # goes next to it, as the grid shows it
+            fmt_of = dict((i, tl.formatter(k)) for i, k in dates.items())
+            out_cols = []
+            for i, name in enumerate(cols):
+                out_cols.append(name)
+                if i in fmt_of:
+                    out_cols.append("%s (date, UTC)" % name)
+            out_rows = []
+            for r in rows:
+                row = []
+                for i, v in enumerate(r):
+                    row.append(v)
+                    if i in fmt_of:
+                        row.append(fmt_of[i](v))
+                out_rows.append(row)
+            cols, rows = out_cols, out_rows
         s = self.db.session
         seen = ("the current state (WAL applied)" if s.sql_sees_current_state
                 else "the main file only: committed WAL frames NOT included")
@@ -5435,3 +6033,4 @@ class App(tk.Tk):
         for state, (_label, _fg, bg, _desc) in WAL_STATES.items():
             tree.tag_configure("wal_" + state, background=bg)
         tree.tag_configure("sr_child", foreground=C["text2"])   # a row's cells / frames
+        tree.tag_configure("sr_recovered", background=K["danger_soft"])  # recovered records

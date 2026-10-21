@@ -37,7 +37,8 @@ The grid never shows empty rows for a source it has drawn rows of: while the row
 position (after a scroll, a sort or a filter) are being read, it keeps the rows it drew last
 (waiting() is True, target_row_range() says where the view is going, the scrollbar is
 already there) and draws the new rows when they arrive. While the scrollbar is dragged, rows
-not read yet are asked for once the thumb has rested 'grid_drag_debounce_ms'; a read for a
+not read yet are read at once when the last read took less than 'grid_drag_debounce_ms'
+(the rows follow the thumb), else once the thumb has rested that long; a read for a
 position left behind is stopped (the source's interrupt()).
 
 Drawing: four canvases (corner, header, frozen column, cells) hold items at fixed positions and
@@ -54,7 +55,7 @@ source methods used by the popover: column_types(), distinct_values(), count_mat
 estimate_matching(), nth_value(), date_bins() (see browse_sources.TableSource); sources
 without them are read row by row on the filter worker.
 
-Saved filters: the owner sets grid.saved_filters = (load_fn, save_fn) with load_fn(key) ->
+Saved filters: the caller sets grid.saved_filters = (load_fn, save_fn) with load_fn(key) ->
 {name: filters} and save_fn(key, name, filters) (filters None deletes the name), and
 grid.filter_key = the table's key (a string, or a function returning one; default: the
 source's `table`). `filters` is JSON-safe: {"columns": {column: filter text}, "search": text,
@@ -75,6 +76,7 @@ import weakref
 from tkinter import ttk
 import tkinter.font as tkfont
 
+import base64
 import colfilter
 from constants import C, ROW_FLAG_BG
 from engine import limits
@@ -92,6 +94,31 @@ from widgets import SearchBox, ToolTip, add_placeholder
 
 MIN_COL_W = 36
 MAX_AUTOSIZE_W = 600
+PIC_W, PIC_H = 64, 48           # a thumbnail in a cell (picture mode)
+PIC_CACHE = 300                 # thumbnails kept per grid
+PIC_TYPES = ("JPEG", "PNG", "GIF", "WEBP", "BMP", "TIFF", "ICO")
+PIC_GAP = "\u2003" * 6          # room left of a picture cell's text for its thumbnail
+
+
+def _thumbnail(master, data):
+    """A PhotoImage no larger than PIC_W x PIC_H, or None. Pillow reads every format it
+    knows; without it Tk reads PNG and GIF (reduced by a whole factor). The declared size is
+    checked first (limit preview_pixels)."""
+    import previews
+    from constants import HAS_PIL
+    try:
+        if HAS_PIL:
+            from constants import ImageTk
+            return ImageTk.PhotoImage(previews.thumbnail(data, (PIC_W, PIC_H)), master=master)
+        size = previews.header_size(data)
+        if size is None:
+            return None
+        previews.check_size(*size)
+        img = tk.PhotoImage(master=master, data=base64.b64encode(data).decode("ascii"))
+        k = max(1, -(-size[0] // PIC_W), -(-size[1] // PIC_H))
+        return img.subsample(k, k) if k > 1 else img
+    except Exception:           # noqa: BLE001 - not an image Tk/Pillow can draw: no thumbnail
+        return None
 REDRAW_BUDGET = 0.05     # seconds a redraw when idle may take before it goes on at the next turn
 PAD = 6                 # text inset in a cell
 BORDER_GRIP = 4         # pixels either side of a header border that start a resize
@@ -426,50 +453,93 @@ class _Keyed(object):
     An item keeps its place while its key stays in view, so a redraw only configures items
     whose content changed and those of rows or columns that came into view. Items whose key
     left the view are hidden and reused.
+
+    A jump (the layout changed: every key is new) reuses the items in the order they were
+    drawn, so each lands on the screen place it had: its coordinates are then not set again,
+    and it is not hidden and shown again either - one Tk call per item instead of three
+    (a jump of the Browse grid made ~1,000 calls). Items not reused are hidden at end().
     """
-    __slots__ = ("cv", "kind", "tags", "opts", "items", "free", "frame", "grew")
+    __slots__ = ("cv", "kind", "tags", "opts", "items", "free", "frame", "grew", "pos",
+                 "hidden", "stale", "shown")
 
     def __init__(self, cv, kind, tags, opts):
         self.cv, self.kind, self.tags, self.opts = cv, kind, tags, opts
         self.items = {}         # key -> [item id, state, frame last shown]
-        self.free = []
+        self.free = []          # item ids to reuse; the last one is taken first
         self.frame = 0
         self.grew = False
+        self.pos = {}           # item id -> coordinates it has
+        self.hidden = set()     # item ids hidden now
+        self.stale = set()      # item ids let go by clear(), still showing until end()
+        self.shown = {}         # item id -> the options it has (only changed ones are sent)
 
     def begin(self):
         self.frame += 1
+
+    def _place(self, iid, coords):
+        if self.pos.get(iid) != coords:
+            self.cv.coords(iid, *coords)
+            self.pos[iid] = coords
+
+    def _set(self, iid, state, show=False):
+        """Configure item iid for state, sending only the options that differ from those it
+        has (a reused cell mostly changes its text only)."""
+        want = self.opts(state)
+        had = self.shown.get(iid)
+        send = want if had is None else dict((k, v) for k, v in want.items() if had.get(k) != v)
+        if show:
+            send["state"] = "normal"
+        if send:
+            self.cv.itemconfigure(iid, **send)
+        self.shown[iid] = want
 
     def put(self, key, coords, state):
         ent = self.items.get(key)
         if ent is not None:
             ent[2] = self.frame
             if ent[1] != state:
-                self.cv.coords(ent[0], *coords)
-                self.cv.itemconfigure(ent[0], **self.opts(state))
+                self._place(ent[0], coords)
+                self._set(ent[0], state)
                 ent[1] = state
             return
         if self.free:
             iid = self.free.pop()
-            self.cv.coords(iid, *coords)
-            self.cv.itemconfigure(iid, state="normal", **self.opts(state))
+            self._place(iid, coords)
+            if iid in self.hidden:
+                self.hidden.discard(iid)
+                self._set(iid, state, show=True)
+            else:
+                self.stale.discard(iid)
+                self._set(iid, state)
         else:
             iid = getattr(self.cv, "create_" + self.kind)(*coords, tags=self.tags,
                                                            **self.opts(state))
+            self.pos[iid] = coords
+            self.shown[iid] = self.opts(state)
             self.grew = True
         self.items[key] = [iid, state, self.frame]
+
+    def _hide(self, iid):
+        self.cv.itemconfigure(iid, state="hidden")
+        self.hidden.add(iid)
 
     def end(self):
         frame = self.frame
         gone = [k for k, ent in self.items.items() if ent[2] != frame]
         for k in gone:
             iid = self.items.pop(k)[0]
-            self.cv.itemconfigure(iid, state="hidden")
+            self._hide(iid)
             self.free.append(iid)
+        if self.stale:
+            for iid in self.stale:
+                self._hide(iid)
+            self.stale = set()
 
     def clear(self):
-        for iid, _state, _frame in self.items.values():
-            self.cv.itemconfigure(iid, state="hidden")
-            self.free.append(iid)
+        """Let every item go (the layout changed); they keep showing until reused or end()."""
+        ids = [ent[0] for ent in self.items.values()]
+        self.stale.update(ids)
+        self.free.extend(reversed(ids))     # the first drawn is taken first
         self.items = {}
 
 
@@ -519,6 +589,9 @@ class _Surface(object):
         self.cur = cv.create_rectangle(0, 0, 0, 0, outline=C["accent"], width=2, state="hidden",
                                        tags=("cur",))
         self.cur_box = None
+        self.stripe_img = None          # the plain rows' backgrounds and lines, one image
+        self.stripe_item = None
+        self.stripe_key = None
         self.all = (self.rowbg, self.hl, self.marker, self.hline, self.vline, self.cell,
                     self.badge, self.hdrbg, self.funnel, self.hdrtext, self.fixed)
         self.origin = (0, 0)
@@ -541,6 +614,32 @@ class _Surface(object):
         for k in self.all:
             k.begin()
         return cleared
+
+    def stripes(self, x, y, w, n, rh, colors):
+        """The plain backgrounds of n rows from an even row at (x, y) - colors (even row,
+        odd row, line) - with each row's bottom grid line: one image item, rebuilt only when
+        the width, the row count, the row height or the colours change."""
+        cv = self.cv
+        if n <= 0 or w <= 0:
+            if self.stripe_item is not None:
+                cv.itemconfigure(self.stripe_item, state="hidden")
+            return
+        key = (w, n, rh, colors)
+        if key != self.stripe_key:
+            img = tk.PhotoImage(master=cv, width=w, height=n * rh)
+            even, odd, line = colors
+            for j in range(n):
+                img.put(odd if j % 2 else even, to=(0, j * rh, w, (j + 1) * rh - 1))
+                img.put(line, to=(0, (j + 1) * rh - 1, w, (j + 1) * rh))
+            self.stripe_img, self.stripe_key = img, key
+            if self.stripe_item is None:
+                self.stripe_item = cv.create_image(x, y, anchor="nw", image=img,
+                                                   tags=("stripes",))
+            else:
+                cv.itemconfigure(self.stripe_item, image=img)
+            cv.tag_lower(self.stripe_item)
+        cv.coords(self.stripe_item, x, y)
+        cv.itemconfigure(self.stripe_item, state="normal")
 
     def set_cur(self, box):
         if box != self.cur_box:
@@ -699,7 +798,7 @@ class DataGrid(tk.Frame):
       on_sort(column, desc)               after a header click re-sorted the source
       on_filter(col_exprs, global_text)   after the filters changed (valid expressions only)
       on_view_change(grid)                after a redraw showed other rows or new data
-      describe(value) -> str              extra 'Decoded' text in the row inspector
+      describe(value, column) -> str      extra 'Decoded' text in the row inspector
       row_style(row, values, flags) -> (background, marker)
                                           how to mark a loaded row in view (called on every
                                           redraw, so keep it cheap): a background colour for
@@ -714,7 +813,7 @@ class DataGrid(tk.Frame):
                                           add entries to it (the menu is not posted yet)
       on_header_menu(menu, col)           the same for the right-click menu of a header
 
-    Options: search=True puts a 'Search in rows…' box in the filter bar (False when the owner
+    Options: search=True puts a 'Search in rows…' box in the filter bar (False when the caller
     has its own box: it calls set_global_filter, or grid_search() which hides this one);
     inline_filters=True: the filter row under the headers (set_inline_filters toggles it).
 
@@ -734,7 +833,7 @@ class DataGrid(tk.Frame):
         self._inline = bool(inline_filters)
         self.saved_filters = None       # (load_fn(key), save_fn(key, name, filters)): see doc
         self.filter_key = None          # the table key for saved filters (str or callable)
-        self.search_box = None          # an owner's search field (grid_search): kept in step
+        self.search_box = None          # a caller's search field (grid_search): kept in step
         self._fmeta = {}                # column -> (filter text, chip words) from the popover
         self._col_types = {}            # column -> colfilter.ColumnType the popover detected
         self._chip_order = []           # column indices / 'global', oldest change first
@@ -747,7 +846,7 @@ class DataGrid(tk.Frame):
         self._last_applied = ({}, "")
         self.on_open_row, self.on_open_blob = on_open_row, on_open_blob
         # where the rows are from, for the titles of windows opened from a cell ('urls,
-        # History'): a string or a function returning one; set by the owner
+        # History'): a string or a function returning one; set by the caller
         self.context = ""
         self.on_sort, self.on_filter, self.on_view_change = on_sort, on_filter, on_view_change
         self.on_selection = on_selection
@@ -756,11 +855,16 @@ class DataGrid(tk.Frame):
         self.on_header_menu = on_header_menu
         self._formatters = {}           # column -> (formatter, header badge)
         self._formatter_colors = {}     # column -> text colour of its formatted values
+        self._col_colors = {}           # column -> colour of its values and header (derived)
         self.filter_delay = filter_delay
         self._frozen_n = 1 if frozen else 0
 
         self._fonts = grid_fonts(self)
-        self._rh = self._fonts[0].metrics("linespace") + 8
+        self._wrap = False
+        self._pictures = False       # image BLOBs drawn as thumbnails (taller rows)
+        self._pics = collections.OrderedDict()      # value key -> PhotoImage or None
+        self._pic_cols = set()       # columns widened for their thumbnails
+        self._rh = self._row_height()
         self._hh = self._fonts[2].metrics("linespace") + 10
         self._fh = self._fonts[3].metrics("linespace") + 10
         self._mincw = [max(1, f.measure(".")) for f in self._fonts]
@@ -797,6 +901,8 @@ class DataGrid(tk.Frame):
         self._cv = tk.Canvas(self._frame, **opts)
         self._vsb = ttk.Scrollbar(self._frame, orient="vertical", command=self._on_vscroll)
         self._hsb = ttk.Scrollbar(self._frame, orient="horizontal", command=self._on_hscroll)
+        self._vsb.bind("<ButtonPress-1>", lambda e: self._hold_thumb(True), add="+")
+        self._vsb.bind("<ButtonRelease-1>", lambda e: self._hold_thumb(False), add="+")
         self._corner.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=(1, 0))
         self._hdr.grid(row=0, column=1, sticky="ew", padx=(1, 0), pady=(1, 0))
         self._fcv.grid(row=1, column=0, sticky="ns", padx=(1, 0))
@@ -862,6 +968,8 @@ class DataGrid(tk.Frame):
         self._last_top = 0
         self._direction = 1             # +1 scrolling down, -1 up (for reading ahead)
         self._drag_until = 0.0          # a scrollbar drag is going on until then
+        self._read_s = None             # seconds the last finished window read took
+        self._thumb_held = False        # the mouse button is down on the vertical scrollbar
         self._drag_after = None
         self._first_after = None
         self._source_t0 = 0.0
@@ -968,6 +1076,7 @@ class DataGrid(tk.Frame):
         self._marks = {}
         self._formatters = {}
         self._formatter_colors = {}
+        self._col_colors = {}
         self._sort = (None, False)
         self._cur = (0, self._frozen if len(self._cols) > self._frozen else 0) \
             if self._cols else None
@@ -1100,8 +1209,14 @@ class DataGrid(tk.Frame):
 
     def row_background(self, row):
         """Background colour row `row` is drawn with (None if it is not in view)."""
-        ent = self._surf[self._cv].rowbg.items.get(row)
-        return ent[1][0] if ent is not None else None
+        surf = self._surf[self._cv]
+        ent = surf.rowbg.items.get(row)
+        if ent is not None and ent[1] is not None:
+            return ent[1][0]
+        drawn = getattr(self, "_drawn", None)
+        if drawn and drawn[0] <= row < drawn[1] and surf.stripe_key is not None:
+            return C["alt"] if row % 2 else C["bg"]     # a plain row: the stripes' colour
+        return None
 
     def row_marker(self, row):
         """Colour of the marker drawn for row `row` by row_style (None: no marker, or the row
@@ -1116,7 +1231,8 @@ class DataGrid(tk.Frame):
     def set_column_formatter(self, c, formatter, badge="", color=None):
         """Draw column c's values as formatter(value) returns them (None: the value itself);
         formatter None removes it. badge: a short word shown after the column name; color:
-        the text colour of the formatted values (default green)."""
+        the text colour of the formatted values: a theme token name ('teal', followed when
+        the theme changes) or '#rrggbb' (default green)."""
         if not 0 <= c < len(self._cols):
             return
         if formatter is None:
@@ -1124,7 +1240,7 @@ class DataGrid(tk.Frame):
             self._formatter_colors.pop(c, None)
         else:
             self._formatters[c] = (formatter, badge or "")
-            self._formatter_colors[c] = color or C["green"]
+            self._formatter_colors[c] = color      # None, a theme token name or '#rrggbb' 
         self._fit_cache.clear()
         self._insp_key = None
         if c not in self._user_sized:
@@ -1137,6 +1253,21 @@ class DataGrid(tk.Frame):
             self._widths[c] = max(self._widths[c], min(want, MAX_AUTOSIZE_W))
         self._layout()
 
+    def set_column_colors(self, colors):
+        """{column index: colour} for the values AND the header of columns the tool derives
+        (a theme token name, looked up when drawn, or '#rrggbb'); cleared with the source."""
+        colors = dict(colors)
+        if colors != self._col_colors:
+            self._col_colors = colors
+            self._view_key = None
+            self._schedule()
+
+    def column_color(self, c):
+        color = self._col_colors.get(c)
+        if not color:
+            return None
+        return K.get(color, color) if not str(color).startswith("#") else color
+
     def column_formatter(self, c):
         """(formatter, badge) of column c, or None."""
         return self._formatters.get(c)
@@ -1145,6 +1276,14 @@ class DataGrid(tk.Frame):
         """The text column c draws for value v (formatted, or the value itself)."""
         text = self._formatted(v, c)
         return text if text is not None else cell_text(v)[0]
+
+    def _formatter_color(self, c):
+        """The colour of column c's formatted values, read when drawn so it follows the theme:
+        a theme token name ('purple') is looked up now; none means green (dates)."""
+        color = self._formatter_colors.get(c)
+        if not color:
+            return C["green"]
+        return K.get(color, color) if not color.startswith("#") else color
 
     def _formatted(self, v, c):
         ent = self._formatters.get(c)
@@ -1202,10 +1341,10 @@ class DataGrid(tk.Frame):
                 self._col_order = seq
         if state.get("wrap") and not self._wrap:
             self._wrap = True
-            self._rh = self._fonts[0].metrics("linespace") * self._wrap_lines + 8
+            self._rh = self._row_height()
         elif not state.get("wrap") and self._wrap:
             self._wrap = False
-            self._rh = self._fonts[0].metrics("linespace") + 8
+            self._rh = self._row_height()
         self._layout()
         if self._cur is not None and self._cur[1] in self._hidden:
             shown = self.displayed_columns()
@@ -1844,8 +1983,8 @@ class DataGrid(tk.Frame):
 
     # -- filters: search boxes, the filter row, the popover ------------------------------------
     def use_search_box(self, box):
-        """An owner's search field drives the search of all columns (grid_search): the bar's
-        own box is hidden and the owner's is kept in step (cleared, Back / Forward)."""
+        """An caller's search field drives the search of all columns (grid_search): the bar's
+        own box is hidden and the caller's is kept in step (cleared, Back / Forward)."""
         self.search_box = box
         own = self.filter_bar.search
         if own is not None and own.winfo_manager():
@@ -2182,9 +2321,72 @@ class DataGrid(tk.Frame):
         if on == self._wrap:
             return
         self._wrap = on
-        ls = self._fonts[0].metrics("linespace")
-        self._rh = ls * (self._wrap_lines if on else 1) + 8
+        self._rh = self._row_height()
         self._layout()
+
+    def _row_height(self):
+        """Rows fit one line of text (or the wrapped lines), and a thumbnail in picture
+        mode."""
+        ls = self._fonts[0].metrics("linespace")
+        rh = ls * (self._wrap_lines if getattr(self, "_wrap", False) else 1) + 8
+        return max(rh, PIC_H + 8) if getattr(self, "_pictures", False) else rh
+
+    # -- pictures ---------------------------------------------------------------------------
+    def set_pictures(self, on):
+        """Draw image BLOBs (JPEG, PNG, GIF, WEBP, BMP...) as thumbnails in their cells; the
+        stored value stays what copies, filters and the inspector use."""
+        on = bool(on)
+        if on == self._pictures:
+            return
+        self._pictures = on
+        self._pic_cols = set()
+        self._rh = self._row_height()
+        self._fit_cache.clear()
+        self._layout()
+
+    def pictures(self):
+        return self._pictures
+
+    def _picture(self, v):
+        """A thumbnail PhotoImage of an image BLOB, or None (not an image, too large for
+        preview_pixels, or unreadable). Kept in a small cache."""
+        key = (len(v), hash(bytes(v[:512])), hash(bytes(v[-64:])))
+        if key in self._pics:
+            self._pics.move_to_end(key)
+            return self._pics[key]
+        img = None
+        if blob_type(bytes(v[:16])) in PIC_TYPES:
+            img = _thumbnail(self, bytes(v))
+        self._pics[key] = img
+        while len(self._pics) > PIC_CACHE:
+            self._pics.popitem(last=False)
+        return img
+
+    def _draw_pictures(self, vis, first, data):
+        """Thumbnails over the image cells in view (a layer of their own, drawn anew)."""
+        cv = self._cv
+        cv.delete("pic")
+        if not self._pictures:
+            return
+        rh, base = self._rh, self._base
+        for i, d in enumerate(data):
+            if d is None:
+                continue
+            values = d[0]
+            y = (first + i - base) * rh
+            for c, x, w in vis:
+                v = values[c] if c < len(values) else None
+                if not isinstance(v, (bytes, bytearray)) or isinstance(v, InvalidText) or \
+                        c in self._formatters or w < PIC_W + 2 * PAD:
+                    continue
+                img = self._picture(v)
+                if img is not None:
+                    cv.create_image(x + PAD, y + rh // 2, anchor="w", image=img,
+                                    tags=("pic",))
+                    if c not in self._user_sized and c not in self._pic_cols:
+                        self._pic_cols.add(c)   # widened once to show the text beside it
+                        self.after_idle(lambda c=c: self.autosize_column(c))
+        cv.tag_raise("pic")
 
     def _wrap_text(self, text, avail, fi):
         """text wrapped to at most _wrap_lines lines of avail pixels; the last line ends
@@ -2257,9 +2459,8 @@ class DataGrid(tk.Frame):
         w = self._text_width(self._header_text(c), 2) + 2 * PAD + 14 +             (FUNNEL_W if self.filterable(c) else 0)
         for values, _flags in self.visible_rows_data():
             if c < len(values):
-                text, kind = cell_text(values[c], 200)
-                text = self._formatted(values[c], c) or text
-                w = max(w, self._text_width(text, 1 if kind == "null" else 0) + 2 * PAD + 2)
+                text, _fill, fi = self._cell(values[c], c)      # as drawn (a picture's room)
+                w = max(w, self._text_width(text[:200 + len(PIC_GAP)], fi) + 2 * PAD + 2)
         self._widths[c] = max(MIN_COL_W, min(int(w), MAX_AUTOSIZE_W))
         self._user_sized.add(c)
         self._layout()
@@ -2283,6 +2484,12 @@ class DataGrid(tk.Frame):
             self._pane.forget(self._insp)
         self._insp_key = None
         self._schedule()
+
+    def refresh_inspector(self):
+        """Draw the row panel again (e.g. a column's date kind became known)."""
+        self._insp_key = None
+        if self.inspector_visible():
+            self._refresh_inspector()
 
     def inspector_visible(self):
         return str(self._insp) in [str(p) for p in self._pane.panes()]
@@ -2328,6 +2535,7 @@ class DataGrid(tk.Frame):
 
     def _reset_rows(self, keep_top=False):
         self._gen += 1
+        self._read_s = None             # another source, sort or filter: timed anew
         self._runner.cancel()
         self._cache.clear()
         self._pending.clear()
@@ -2336,11 +2544,9 @@ class DataGrid(tk.Frame):
         self.load_error = ""
         self.notice = ""
         self._win = limits.get("grid_window_rows")
-        # Let the filter chip/bar paint before the (possibly slow) COUNT(*)
-        try:
-            self.update_idletasks()
-        except tk.TclError:
-            pass
+        # no forced layout pass here: row_count() answers from a cached or estimated count
+        # (the counts run on workers), and the pass cost 70-130 ms of the UI thread for
+        # every grid given a source
         n = self._source.row_count() if self._source is not None else 0
         self._exact = n is not None
         self._total = n if n is not None else self._win
@@ -2381,7 +2587,7 @@ class DataGrid(tk.Frame):
         if not getattr(src, "threaded", False):
             try:
                 self._store(w, list(src.rows(start, win)))
-            except Exception as e:      # noqa: BLE001 - shown by the owner, not raised
+            except Exception as e:      # noqa: BLE001 - shown by the caller, not raised
                 self._failed.add(w)
                 self.load_error = "%s: %s" % (type(e).__name__, e)
             return
@@ -2400,7 +2606,12 @@ class DataGrid(tk.Frame):
             else:
                 self._store(w, rows)
             self._schedule()
-        job = ((gen, w), lambda: list(src.rows(start, win)), done)
+        def read():
+            t0 = time.perf_counter()
+            rows = list(src.rows(start, win))
+            self._read_s = time.perf_counter() - t0     # (one attribute: safe from a worker)
+            return rows
+        job = ((gen, w), read, done)
         if batch is not None:
             batch.append(job)
         else:
@@ -2428,6 +2639,10 @@ class DataGrid(tk.Frame):
             except Exception:           # noqa: BLE001 - it then just finishes
                 pass
         self._schedule()
+
+    def reads_quick(self):
+        """The last window read took less than 'grid_drag_debounce_ms' (see _quick_reads)."""
+        return self._quick_reads()
 
     def waiting_seconds(self):
         """How long the rows the view is at have been read for (0 when not waiting)."""
@@ -2499,7 +2714,10 @@ class DataGrid(tk.Frame):
 
     def _header_text(self, c):
         ent = self._formatters.get(c)
-        return self._cols[c] + ((" · " + ent[1]) if ent is not None and ent[1] else "")
+        name = self._cols[c]
+        if name == colfilter.RID:
+            name = "#"              # the row locator column: a position, not a table column
+        return name + ((" · " + ent[1]) if ent is not None and ent[1] else "")
 
     # -- layout and geometry ------------------------------------------------------------------
     def _layout(self):
@@ -2667,11 +2885,14 @@ class DataGrid(tk.Frame):
         if c is not None and c in self._formatters:
             text = self._formatted(v, c)
             if text is not None:
-                return text, self._formatter_colors.get(c, C["green"]), 0
+                return text, self._formatter_color(c), 0
         text, kind = cell_text(v)
         if kind == "null":
             return text, C["text2"], 1
         if kind == "blob":
+            if self._pictures and isinstance(v, (bytes, bytearray)) and \
+                    self._picture(v) is not None:
+                return PIC_GAP + text, C["purple"], 0
             return text, C["purple"], 0
         if kind == "invalid":
             return text, C["red"], 0
@@ -2688,7 +2909,7 @@ class DataGrid(tk.Frame):
         return C["alt"] if r % 2 else C["bg"]
 
     def _style(self, r, d):
-        """(background, marker) the owner's row_style gives a loaded row; a failing callback
+        """(background, marker) the caller's row_style gives a loaded row; a failing callback
         marks nothing rather than breaking the redraw."""
         if d is None or self.row_style is None:
             return None, None
@@ -2728,6 +2949,14 @@ class DataGrid(tk.Frame):
             # (in the current layout); the scrollbar and the status show the new position
             first, end, data = frame[1], frame[2], frame[3]
             held = True
+            if self._dragging():
+                # the thumb is being dragged: the rows read nearest to it, so the view
+                # follows the thumb a read behind instead of staying where the drag began
+                near = self._nearest_cached(target[0], target[1] - target[0])
+                if near is not None and abs(near - target[0]) < abs(first - target[0]):
+                    first, end = near, near + (target[1] - target[0])
+                    data = [self.row_data(r) for r in range(first, end)]
+                    self._shown_rows = (self._source, first, end, data)
         elif missing and reading and frame is not None and frame[0] is not self._source \
                 and self._source is not None:
             # another source's first rows: leave the last table in view a moment rather than
@@ -2759,7 +2988,11 @@ class DataGrid(tk.Frame):
         while k < len(self._order) and self._xs[k] < self._xoff + W:
             vis.append((self._order[k], self._xs[k], self._widths[self._order[k]]))
             k += 1
-        if abs(first - self._base) > REBASE:
+        was = getattr(self, "_drawn", None)
+        jumped = was is not None and end > first and (first >= was[1] or end <= was[0])
+        if abs(first - self._base) > REBASE or jumped:
+            # (a jump to rows sharing none with those drawn: every item is placed anew,
+            # reusing each on the screen place it had - see _Keyed)
             self._base = first
             self._layout_gen += 1       # keep canvas coordinates small: place everything anew
         layout = (self._layout_gen, self._base, W)
@@ -2777,6 +3010,7 @@ class DataGrid(tk.Frame):
                                   False, styles, stop, least)
         self._place_entries(vis, cleared)
         drawn = data if self._rows_cut is None else data[:self._rows_cut]
+        self._draw_pictures(vis, first, drawn)
         if self._frozen:
             fw = self._widths[0]
             self._draw_header(self._surf[self._corner], [(0, 0, fw)], 0, layout, frozen=True)
@@ -2827,7 +3061,8 @@ class DataGrid(tk.Frame):
         threaded = getattr(self._source, "threaded", False)
         if threaded:
             last = (self._total - 1) // win if self._total > 0 else 0
-            depth = limits.get("grid_prefetch_windows")
+            # dragging the thumb: no reading ahead, the worker reads where the thumb is
+            depth = 0 if self._dragging() else limits.get("grid_prefetch_windows")
             if self._direction > 0:
                 ahead = [visible[-1] + i for i in range(1, depth + 1)]
                 behind = [visible[0] - 1]
@@ -2836,16 +3071,27 @@ class DataGrid(tk.Frame):
                 behind = [visible[-1] + 1]
             # an unknown row count: nothing past the window after the view
             top = last if self._exact else visible[-1] + 1
-            extra = [w for w in ahead + behind if 0 <= w <= top]
+            extra = [w for w in ahead + behind if 0 <= w <= top] if depth else []
             needed.update(extra)
         else:
             extra = []
         for key in self._runner.discard(lambda k: k[0] == gen and k[1] in needed):
             self._pending.discard(key[1])
+        if threaded and self._quick_reads():
+            # reads take a few milliseconds: the rows in view are read here and now, which
+            # is quicker than the hand-over from the worker (a poll of 15 ms), so a drag or a
+            # jump never shows the rows it left; a read that turns out slow hands the rest
+            # back to the worker
+            for w in visible:
+                if w not in self._cache and w not in self._failed and not self._read_now(w):
+                    break
         if threaded:
             self._stop_stale_read(gen, needed)
-            if time.time() < self._drag_until and any(w not in self._cache for w in visible):
-                # dragging: read once the thumb rests (the newest position wins)
+            if (time.time() < self._drag_until and not self._quick_reads()
+                    and self._runner.busy() and any(w not in self._cache for w in visible)):
+                # the thumb is moving and reads are slow: while the worker reads, the next
+                # read waits until the thumb rests a moment or the worker is free (one read
+                # at a time, at the newest position); quick reads are made at once above
                 if self._drag_after is None:
                     delay = max(1, int((self._drag_until - time.time()) * 1000))
                     self._drag_after = self.after(delay, self._drag_rested)
@@ -2861,6 +3107,66 @@ class DataGrid(tk.Frame):
         for w in visible:
             if w in self._cache:
                 self._cache.move_to_end(w)
+
+    def _read_now(self, w):
+        """Read window w on this thread (see _request_windows); False when it failed or was
+        slow (the worker reads from then on)."""
+        src, win = self._source, self._win
+        t0 = time.perf_counter()
+        try:
+            rows = list(src.rows(w * win, win))
+        except Exception:               # noqa: BLE001 - the worker reads it and reports it
+            self._read_s = None
+            return False
+        self._read_s = time.perf_counter() - t0
+        self._store(w, rows)
+        return self._quick_reads()
+
+    def _hold_thumb(self, down):
+        self._thumb_held = down
+        if not down:
+            self._schedule()            # the drag ended: read ahead again, draw the rows
+
+    def _dragging(self):
+        """The scrollbar is being dragged: its button is down, or a thumb move came within
+        'grid_drag_debounce_ms' (a frame can take longer than that to draw, so the button is
+        what tells a drag that goes on)."""
+        return self._thumb_held or time.time() < self._drag_until
+
+    def _nearest_cached(self, top, n):
+        """The first row nearest to `top` of n rows in a row that are all read, or None."""
+        win, best = self._win, None
+        for w, rows in self._cache.items():
+            lo = w * win
+            hi = lo + len(rows) - n          # the last start whose n rows are in this window
+            if hi < lo:
+                continue
+            c = min(max(top, lo), hi)
+            if best is None or abs(c - top) < abs(best - top):
+                best = c
+        return best
+
+    def _quick_reads(self):
+        """The last window read took less than the drag's rest time and the source reads any
+        window as quickly (seeks_fast(): its position index is complete): reading at once
+        while the thumb moves is then faster than waiting (~2 ms anywhere in 2.5 million
+        rows); otherwise reads wait for the thumb to rest or the worker to be free."""
+        last = self._read_s
+        if last is None or last * 1000.0 >= limits.get("grid_drag_debounce_ms"):
+            return False
+        # quick so far is not quick everywhere (an OFFSET scan is quick near the top only):
+        # the source has to say that a window anywhere reads quickly
+        # (asked again each 0.5 s until it says yes; a yes holds for this generation)
+        gen, ok, at = getattr(self, "_seek_ok", (None, False, 0.0))
+        if gen == self._gen and (ok or time.time() - at < 0.5):
+            return ok
+        hook = getattr(self._source, "seeks_fast", None)
+        try:
+            ok = bool(hook()) if hook is not None else False
+        except Exception:               # noqa: BLE001 - unknown: treated as slow
+            ok = False
+        self._seek_ok = (self._gen, ok, time.time())
+        return ok
 
     def _drag_rested(self):
         self._drag_after = None
@@ -2883,8 +3189,8 @@ class DataGrid(tk.Frame):
             funnel = self._has_funnel(c, w)
             avail = w - 2 * PAD - (FUNNEL_W if funnel else 0)
             surf.hdrtext.put(c, (x + PAD, hh // 2),
-                             (self._fit(self._header_text(c) + mark + arrow, avail, 2), C["text"],
-                              2))
+                             (self._fit(self._header_text(c) + mark + arrow, avail, 2),
+                              self.column_color(c) or C["text"], 2))
             if funnel:
                 fx, fy = x + w - FUNNEL_W // 2 - 4, hh // 2 - 5
                 hover = self._funnel_hover == c
@@ -2977,6 +3283,26 @@ class DataGrid(tk.Frame):
         rh, base = self._rh, self._base
         cleared = surf.begin(layout, ox, oy)
         grid_c = C["bg4"]
+        plain_c, alt_c = C["bg"], C["alt"]
+        # the plain rows: one striped image from the even row at or above the first one
+        r0 = first - (first % 2)
+        try:
+            vw = max(1, surf.cv.winfo_width())
+            vh = max(1, surf.cv.winfo_height())
+        except tk.TclError:
+            vw = vh = 1
+        # as many rows as the view holds and two more (an even start and a partial last
+        # row), fewer only where the table ends: the same image while scrolling
+        n = vh // rh + 3
+        if self._exact:
+            n = min(n, max(0, self._total - r0))
+        else:                       # the count is not known yet: no stripes past the rows
+            n = min(n, (first - r0) + len(data))
+        if not data:
+            n = 0
+        sw = span if frozen else vw + 2
+        surf.stripes(ox if not frozen else 0, (r0 - base) * rh, sw, n, rh,
+                     (plain_c, alt_c, grid_c))
         hl = bool(self._hl_words)
         v = None
         cur_r, cur_c = self._cur if self._cur is not None else (None, None)
@@ -2989,7 +3315,10 @@ class DataGrid(tk.Frame):
             y = (r - base) * rh
             values, flags = d if d is not None else (None, ())
             tint, marker = styles[i]
-            surf.rowbg.put(r, (0, y, span, y + rh), (self._row_bg(r, flags, tint), ""))
+            bg = self._row_bg(r, flags, tint)
+            if bg != (alt_c if r % 2 else plain_c):
+                # (one pixel short: the stripes' grid line under the row stays visible)
+                surf.rowbg.put(r, (0, y, span, y + rh - 1), (bg, ""))
             if frozen and marker:
                 surf.marker.put(r, (1, y + 3, 1 + MARKER_W, y + rh - 3), (marker, marker))
             mid = y + rh // 2
@@ -3023,7 +3352,6 @@ class DataGrid(tk.Frame):
                             self._highlight(surf, r, c, x + PAD, y, shown, fi)
                 if r == cur_r and c == cur_c:
                     cur_box = (x + 1, y + 1, x + w - 2, y + rh - 2)
-            surf.hline.put(r, (0, y + rh - 1, span, y + rh - 1), (grid_c,))
         # column lines run over every row the canvas coordinates cover
         y0 = max(-base, -BAND) * rh
         y1 = min(self._total - base, BAND) * rh
@@ -3038,24 +3366,32 @@ class DataGrid(tk.Frame):
 
     def _place_entries(self, vis, cleared):
         """Show the filter entries of the columns in view. They sit at their column's position
-        on the header canvas and scroll with it, so only entries coming into view are placed."""
+        on the header canvas and scroll with it; an entry is placed again only when its
+        column's place or width changed (hiding and showing the embedded entries on every
+        jump of the rows cost ~20 ms of drawing per frame)."""
         cv = self._hdr
-        if cleared or not self._inline:
+        placed = getattr(self, "_entry_place", None)
+        if placed is None:
+            placed = self._entry_place = {}
+        if not self._inline:
             for c in self._entry_shown:
                 cv.itemconfigure(self._entries[c][1], state="hidden")
             self._entry_shown = set()
-        if not self._inline:
+            placed.clear()
             return
         want = set()
         for c, x, w in vis:
             want.add(c)
-            if c not in self._entry_shown:
+            at = (x, w, self._hh, self._fh)
+            if c not in self._entry_shown or placed.get(c) != at:
                 _e, wid, _tip = self._entry(c)
                 cv.coords(wid, x, self._hh)
                 cv.itemconfigure(wid, width=w, height=self._fh, state="normal")
                 self._entry_shown.add(c)
+                placed[c] = at
         for c in self._entry_shown - want:
             cv.itemconfigure(self._entries[c][1], state="hidden")
+            placed.pop(c, None)
         self._entry_shown &= want
 
     # -- filter entries ------------------------------------------------------------------------
@@ -3395,7 +3731,7 @@ class DataGrid(tk.Frame):
         loc = self._value_at(row, 0) if self._frozen else None
         where = " — row %s" % loc.display() if isinstance(loc, Locator) else \
             " — row %s" % format(row + 1, ",")
-        # which table and database (the owner says: grid.context)
+        # which table and database (the caller says: grid.context)
         ctx = self.context() if callable(self.context) else self.context
         return ValueViewer(self, v, "%s%s%s" % (self._cols[col], where,
                                                 " (%s)" % ctx if ctx else ""))
@@ -3574,10 +3910,12 @@ class DataGrid(tk.Frame):
         t.heading("value", text="Value")
         t.column("#0", width=110, stretch=False)
         t.column("type", width=62, stretch=False)
-        t.column("value", width=220, stretch=True)
+        # value and decoded share the room the panel has (a fixed decoded column took it
+        # all from the values when the panel is narrow)
+        t.column("value", width=170 if self.describe else 220, minwidth=80, stretch=True)
         if self.describe:
             t.heading("decoded", text="Decoded")
-            t.column("decoded", width=160, stretch=False)
+            t.column("decoded", width=170, minwidth=80, stretch=True)
         ysb = ttk.Scrollbar(tf, orient="vertical", command=t.yview)
         t.configure(yscrollcommand=ysb.set)
         ysb.pack(side="right", fill="y")
@@ -3587,11 +3925,25 @@ class DataGrid(tk.Frame):
         self._insp_key = None
         self._insp_values = []
 
-    def _place_inspector_sash(self):
+    def _place_inspector_sash(self, _e=None):
+        """The row panel takes up to a third (at most 460 px: column, type, value, decoded),
+        the rows the rest - again as the window settles, until the sash is moved by hand
+        (placed once, before the window had its size, the panel ended at half the width)."""
+        if getattr(self, "_insp_dragged", False):
+            return
+        if not getattr(self, "_insp_bound", False):
+            self._insp_bound = True
+            self._pane.bind("<Configure>", self._place_inspector_sash, add="+")
+            self._pane.bind("<ButtonRelease-1>",
+                            lambda e: setattr(self, "_insp_dragged", True), add="+")
         try:
             total = self._pane.winfo_width()
-            if total > 500:
-                self._pane.sashpos(0, total - 360)
+            # only on a new width: the pane's own re-layout after the sash moved must not
+            # set it again (a resize loop, as the Forensics panes once had)
+            if total > 500 and self.inspector_visible() and \
+                    total != getattr(self, "_insp_sized_w", None):
+                self._insp_sized_w = total
+                self._pane.sashpos(0, total - min(460, int(total * 0.34)))
         except tk.TclError:
             pass
 
@@ -3632,7 +3984,7 @@ class DataGrid(tk.Frame):
             vals = [typ, shown]
             if self.describe:
                 try:
-                    vals.append(formatted or self.describe(v) or "")
+                    vals.append(formatted or self.describe(v, name) or "")
                 except Exception:       # noqa: BLE001 - decoding is a courtesy
                     vals.append("")
             t.insert("", "end", text=name, values=vals)

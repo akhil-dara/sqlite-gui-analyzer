@@ -28,7 +28,7 @@ jobs:
   build:
     name: Build and test (Windows)
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
@@ -88,23 +88,24 @@ jobs:
       - name: Install build tools
         # a block: ':all: ' in a plain YAML value would end the workflow file's parsing
         run: |
-          python -m pip install --require-hashes --only-binary=:all: -r tools/build-requirements.txt
+          python -m pip install --require-hashes --only-binary=:all: --no-binary pyinstaller -r tools/build-requirements.txt
+          python -c "import PyInstaller, os; d = os.path.join(os.path.dirname(PyInstaller.__file__), 'bootloader'); print('bootloader built on this runner:', sorted(os.listdir(d)))"
 
-      - name: Build onedir and onefile programs
+      - name: Build the program (one folder; no self-extracting onefile exe)
         run: python -m PyInstaller --noconfirm --clean --distpath $env:DIST --workpath $env:WORK sqlite-gui-analyzer.spec
 
       - name: Self-test the built programs
         timeout-minutes: 10
         run: |
           ./tools/run_self_test.ps1 -Exe "$env:DIST\SQLiteGUIAnalyzer\SQLiteGUIAnalyzer.exe"
-          ./tools/run_self_test.ps1 -Exe "$env:DIST\SQLiteGUIAnalyzer-$env:VERSION-portable.exe"
 
-      - name: Package the portable builds
+      - name: Package the portable build
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           New-Item -ItemType Directory -Force $env:OUT | Out-Null
+          Copy-Item LICENSE "$env:DIST\SQLiteGUIAnalyzer\LICENSE.txt"
+          Copy-Item THIRD-PARTY-NOTICES.md "$env:DIST\SQLiteGUIAnalyzer\THIRD-PARTY-NOTICES.txt"
           python tools/release.py zip "$env:DIST\SQLiteGUIAnalyzer" "$env:OUT\SQLiteGUIAnalyzer-$env:VERSION-portable.zip" --root "SQLiteGUIAnalyzer-$env:VERSION"
-          Copy-Item "$env:DIST\SQLiteGUIAnalyzer-$env:VERSION-portable.exe" $env:OUT
 
       - name: Build the installer
         run: |
@@ -144,7 +145,7 @@ jobs:
       - name: Checksums and release notes
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $files = "setup.exe", "portable.zip", "portable.exe" | ForEach-Object { "$env:OUT\SQLiteGUIAnalyzer-$env:VERSION-$_" }
+          $files = "setup.exe", "portable.zip" | ForEach-Object { "$env:OUT\SQLiteGUIAnalyzer-$env:VERSION-$_" }
           python tools/release.py checksums "$env:OUT\SHA256SUMS.txt" @files
           python tools/release.py notes "$env:OUT\RELEASE_NOTES.md" --checksums "$env:OUT\SHA256SUMS.txt"
           Get-ChildItem $env:OUT | Format-Table Name, Length -AutoSize
@@ -187,7 +188,6 @@ jobs:
           gh release create "$TAG" \
             "SQLiteGUIAnalyzer-$VERSION-setup.exe" \
             "SQLiteGUIAnalyzer-$VERSION-portable.zip" \
-            "SQLiteGUIAnalyzer-$VERSION-portable.exe" \
             SHA256SUMS.txt \
             --title "SQLite GUI Analyzer $VERSION" \
             --notes-file RELEASE_NOTES.md \

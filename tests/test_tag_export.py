@@ -117,7 +117,7 @@ class ExportTest(TempDirTest):
         self.assertEqual(sum(1 for t in tables.values() for r in t["rows"]
                              if "deleted body" in r), 2)
         self.assertEqual(text.count("<td>deleted body</td>"), 2)         # the plain tables
-        self.assertIn("WAL frame 12 (superseded)", text)
+        self.assertIn("WAL frame 13 (superseded)", text)   # frame index 12, shown from 1
         self.assertIn("page 7 @ 812", text)
         by_table = html_report(self.entries(), self.store.defs, self.info, layout="table")
         self.assertEqual(by_table.count("<td>deleted body</td>"), 1)
@@ -132,6 +132,12 @@ class ExportTest(TempDirTest):
                                      protected=self.protected), out)
         with open(out, encoding="utf-8") as f:
             check_page(self, f.read())
+        import json
+        with open(out + ".manifest.json", encoding="utf-8") as f:       # as every export
+            manifest = json.load(f)
+        self.assertEqual([os.path.basename(e["path"]) for e in manifest["files"]],
+                         ["report.html"])
+        self.assertTrue(manifest["files"][0]["sha256"])
         before = dir_snapshot(self.evidence)
         with self.assertRaises(TagExportError):
             export_html(os.path.join(self.evidence, "r.html"), self.entries(), self.store.defs,

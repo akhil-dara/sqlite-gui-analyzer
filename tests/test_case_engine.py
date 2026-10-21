@@ -68,7 +68,29 @@ class NamesTest(unittest.TestCase):
     def test_unique_names(self):
         self.assertEqual(display_names(["/x/a/msgstore.db", "/x/b/msgstore.db", "/x/wa.db"]),
                          ["msgstore.db (a)", "msgstore.db (b)", "wa.db"])
-        self.assertEqual(display_names(["/x/a/m.db", "/y/a/m.db"]), ["m.db (a)", "m.db (a) #2"])
+        # the nearest folder that tells them apart, not just the parent
+        self.assertEqual(display_names(["/x/a/m.db", "/y/a/m.db"]), ["m.db (x)", "m.db (y)"])
+        self.assertEqual(display_names(["/c/phone_a/com.whatsapp/databases/msgstore.db",
+                                        "/c/phone_b/com.whatsapp/databases/msgstore.db"]),
+                         ["msgstore.db (phone_a)", "msgstore.db (phone_b)"])
+        self.assertEqual(display_names(["/x/m.db", "/x/m.db"]), ["m.db (x)", "m.db (x) #2"])
+
+    def test_browser_profiles_are_named(self):
+        import json
+        import shutil
+        import tempfile
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        paths = []
+        for folder, person in (("Default", "Alex"), ("Profile 2", None)):
+            d = os.path.join(root, "Google", "Chrome", "User Data", folder)
+            os.makedirs(d)
+            if person:
+                with open(os.path.join(d, "Preferences"), "w", encoding="utf-8") as f:
+                    json.dump({"profile": {"name": person}}, f)
+            paths.append(os.path.join(d, "History"))
+        self.assertEqual(display_names(paths), ["History (Chrome Default · Alex)",
+                                                "History (Chrome Profile 2)"])
 
     def test_identity_and_colours(self):
         p = os.path.join("x", "a.db")

@@ -17,7 +17,11 @@ class LimitsWindowTest(AppCase):
             w = app.datamap.limits_window(app)
             app.update_idletasks()
             opened = time.perf_counter() - t0
-            self.assertEqual(len(w.tree.get_children()), len(lim.LIMITS))
+            self.assertEqual(len(w.shown_items()), len(lim.LIMITS))
+            # grouped by area: every limit under an area row
+            self.assertTrue(all(w.tree.parent(i) in w._areas.values() for i in w.shown_items()))
+            self.assertEqual(w.tree.parent(w._rows["sql_history"][0]),
+                             w._areas["SQL and Query tabs"])
             self.assertLess(len(list(self.walk(w))), 40)       # not a field per limit
             self.assertLess(opened, 1.0)
             # the editor shows the selected limit; its value edits the list row
@@ -40,16 +44,16 @@ class LimitsWindowTest(AppCase):
             self.assertIn(name, w.status.cget("text"))
             # Find: only the matching limits stay listed, in name order
             w.find_var.set("grid_")
-            shown = [w.tree.item(i, "text") for i in w.tree.get_children()]
+            shown = [w.tree.item(i, "text") for i in w.shown_items()]
             self.assertTrue(shown)
-            self.assertEqual(shown, sorted(shown))
+            self.assertEqual(shown, sorted(shown))              # one area here: A-Z
             self.assertTrue(all("grid_" in n or "grid_" in lim.LIMITS[n][3].lower()
                                 for n in shown))
             self.assertIn("of %d" % len(lim.LIMITS), w.search.count_text())
             w.choose(name)                  # a limit the Find hides: listed again
-            self.assertIn(w._rows[name][0], w.tree.get_children())
+            self.assertIn(w._rows[name][0], w.shown_items())
             w.find_var.set("")
-            self.assertEqual(len(w.tree.get_children()), len(lim.LIMITS))
+            self.assertEqual(len(w.shown_items()), len(lim.LIMITS))
             w.defaults()
             self.assertTrue(w.save())
             t0 = time.perf_counter()

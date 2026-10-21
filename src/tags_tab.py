@@ -17,7 +17,8 @@ from constants import C
 from tokens import COLOR as K, FONT as F
 from database import RID
 from engine.tag_export import provenance_text
-from engine.tags import TagError, tint
+from engine.tags import TagError
+from tagging import row_tint
 from grid import DataGrid
 from utils import safe_filename, write_allowed
 from widgets import ElideLabel, FlowFrame, SearchBox, ToolTip, TreeFilter, fit_geometry
@@ -61,9 +62,11 @@ def _preview(entry):
 class TagsTab(ttk.Frame):
     """The Tagged tab (app.py adds it to the notebook)."""
 
+    # what the row holds (Preview) right after where it is: the note and when it was tagged
+    # after it
     COLUMNS = (("tags", "Tags", 170), ("table", "Table", 160), ("row", "Row", 90),
-               ("source", "Source", 210), ("note", "Note", 220),
-               ("tagged", "Tagged at (UTC)", 150), ("preview", "Preview", 420))
+               ("preview", "Preview", 420), ("source", "Source", 160), ("note", "Note", 200),
+               ("tagged", "Tagged at (UTC)", 150))
     DATABASE_COLUMN = ("database", "Database", 150)     # listed first when 2+ databases are open
 
     def __init__(self, master, app):
@@ -196,10 +199,10 @@ class TagsTab(ttk.Frame):
         rowid = e.rowid
         if isinstance(rowid, str) and rowid.lstrip("-").isdigit() and len(rowid) < 20:
             rowid = int(rowid)          # sorts as a number
-        out = ("\u25cf " + ", ".join(e.tags), e.table, rowid,
+        out = ("\u25cf " + ", ".join(e.tags), e.table, rowid, _preview(e),
                e.source + (" \u2014 " + prov if prov else ""),
                note if len(note) <= 200 else note[:200] + "\u2026",
-               e.tagged_at.replace("T", " ").rstrip("Z")[:19], _preview(e))
+               e.tagged_at.replace("T", " ").rstrip("Z")[:19])
         if self._multi:
             fn = getattr(self.tags, "database_name", None)
             out = ((fn(e) if fn is not None else "") or
@@ -233,7 +236,7 @@ class TagsTab(ttk.Frame):
         if store is not None:
             for d in store.defs:
                 color = store.color_of(d.name)
-                self._colors[d.name] = (tint(color), color)
+                self._colors[d.name] = (row_tint(color), color)
         self._shown = self._entries(self.selected_tag()) if store is not None else []
         self._source.replace(([i + 1] + list(self._values(e)), ())
                              for i, e in enumerate(self._shown))

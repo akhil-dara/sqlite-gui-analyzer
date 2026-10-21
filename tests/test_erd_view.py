@@ -174,6 +174,23 @@ class ErdCanvasTest(ViewCase):
         v._on_double(ev(cv, x0 + 20, y0 + 5))
         self.assertEqual(self.calls[-1], ("open", (DB, "tag")))
 
+    def test_a_focused_diagram_opens_readable(self):
+        # a Core Data card of 70 columns: shown around a table it opens at a size its column
+        # names read (pan for the rest); the whole database may open smaller
+        from erd_view import OPEN_MIN_SCALE
+        from tests.test_erd import node
+        from tests.test_linkgraph import mk
+        links = [mk("ZEXCHANGEMETA", "ZREWARD", "ZREWARD", "Z_PK")]
+        specs = {node("ZREWARD"): spec("Z_PK INTEGER pk", *("ZCOL%02d TEXT" % i
+                                                            for i in range(70))),
+                 node("ZEXCHANGEMETA"): spec("Z_PK INTEGER pk", "ZREWARD INTEGER")}
+        v = self.view
+        v.show(ErdModel(links, specs), focus=node("ZEXCHANGEMETA"))
+        self.assertGreaterEqual(v.scale, OPEN_MIN_SCALE)
+        self.assertTrue(v.rows_shown())
+        v.show(ErdModel(links, specs))                  # the whole database: no focus
+        self.assertLess(v.scale, OPEN_MIN_SCALE)
+
     def test_zoom_fit_and_minimap(self):
         v = self.view
         v.show(people_model())

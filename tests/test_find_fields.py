@@ -105,6 +105,44 @@ class FindFieldsTest(AppCase):
             self.assertEqual(listed(tree), names)
         self.run_app(scenario)
 
+    def test_blob_inspector_opens_a_small_value(self):
+        # a small nested value opens down to its fields (a payment's amount and payer were
+        # three clicks away); a large one stays closed past the first levels
+        import json
+
+        def scenario():
+            from inspector import BlobInspector
+            app = self.app
+            small = json.dumps({"root": {"amount": 50000, "from": {"name": "A. Payer",
+                                                                  "phone": "95730"}}})
+            w = BlobInspector(app, small.encode(), "ZDATA", "test")
+            self.assertTrue(self.pump(lambda: w.tree.get_children(), 20))   # decoded
+            texts = []
+
+            def walk(iid):
+                for c in w.tree.get_children(iid):
+                    texts.append(w.tree.item(c, "text"))
+                    if w.tree.item(c, "open"):
+                        walk(c)
+            walk("")
+            self.assertIn("name", texts)                # opened down to the payer's name
+            self.assertIn("amount", texts)
+            w.destroy()
+            big = json.dumps({"rows": [{"k%d" % i: {"v": i}} for i in range(200)]})
+            w = BlobInspector(app, big.encode(), "c", "test")
+            self.assertTrue(self.pump(lambda: w.tree.get_children(), 20))
+            shown = []
+
+            def count(iid):
+                for c in w.tree.get_children(iid):
+                    shown.append(c)
+                    if w.tree.item(c, "open"):
+                        count(c)
+            count("")
+            self.assertLess(len(shown), 260)            # not every row opened
+            w.destroy()
+        self.run_app(scenario)
+
     def test_blob_inspector_timestamps(self):
         def scenario():
             from inspector import BlobInspector

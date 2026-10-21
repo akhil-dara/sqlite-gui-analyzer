@@ -9,6 +9,36 @@ from constants import C
 from tokens import COLOR as K, FONT as F
 
 
+def _align_headings():
+    """Every list's header text sits over its values: headers are left-aligned like the values
+    (Tk centres them by default), and a column whose values are right-aligned (numbers, set
+    with column(anchor='e')) gets a right-aligned header too. Done once here for every
+    ttk.Treeview of the tool, so no screen has to remember it."""
+    real_init, real_column = ttk.Treeview.__init__, ttk.Treeview.column
+
+    def init(self, *a, **k):
+        real_init(self, *a, **k)
+        try:
+            for c in ("#0",) + tuple(self.cget("columns") or ()):
+                self.heading(c, anchor="w")
+        except tk.TclError:
+            pass
+
+    def column(self, column, option=None, **kw):
+        out = real_column(self, column, option, **kw)
+        if "anchor" in kw:
+            try:
+                self.heading(column, anchor="e" if str(kw["anchor"]) in ("e", "ne", "se")
+                             else "w")
+            except tk.TclError:
+                pass
+        return out
+    ttk.Treeview.__init__, ttk.Treeview.column = init, column
+
+
+_align_headings()
+
+
 def enable_dpi_awareness():
     """On Windows, draw at the display's real resolution (125-200% scaling) instead of a
     blurred bitmap stretch: Tk then sizes the fonts (in points) for the real DPI. Only this
@@ -420,6 +450,14 @@ class ElideLabel(ttk.Label):
         except tk.TclError:
             font = tkfont.Font(font=self.cget("font"))
         avail = self.winfo_width() - 6
+        if avail > 20 and font.measure(text) > avail and " · " in text:
+            # a summary of ' · ' separated facts: whole facts go (the middle ones first, the
+            # first and the last stay) before any fact is cut inside ('18.9MB' never
+            # becomes '18....B')
+            parts = text.split(" · ")
+            while len(parts) > 2 and font.measure(" · ".join(parts)) > avail:
+                del parts[len(parts) // 2]
+            text = " · ".join(parts)
         if avail > 20 and font.measure(text) > avail:
             lo, hi = 1, len(text)
             best = "…"
@@ -969,6 +1007,11 @@ def set_app_theme(root, name):
             root.option_add("*%s.selectForeground" % cls, K["text"])
         for cls in ("Label", "Checkbutton", "Radiobutton", "Button"):
             root.option_add("*%s.foreground" % cls, K["text"])
+        # a classic button's face follows the theme too (never light text on the system's
+        # light grey face)
+        root.option_add("*Button.background", K["muted"])
+        root.option_add("*Button.activeBackground", K["hover"])
+        root.option_add("*Button.activeForeground", K["text"])
         root.option_add("*Toplevel.background", K["background"])
         root.option_add("*Frame.background", K["background"])
     except tk.TclError:

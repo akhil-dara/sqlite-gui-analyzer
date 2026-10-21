@@ -33,7 +33,7 @@ class NameIndexTest(TempDirTest):
             worst = max(worst, time.perf_counter() - t0)
             self.assertTrue(any(e.kind == "table" and e.table == t and e.member is m
                                 for e in found), t)
-        self.assertLess(worst, 0.1)                     # every table found in under 100 ms
+        within(self, worst, 0.1, "finding a table")     # every table found in under 100 ms
         cols = index.find("counterparty")
         self.assertEqual([(e.kind, e.member.name, e.table) for e in cols],
                          [("column", "transactions_db", "txn")])
@@ -59,6 +59,81 @@ class DensityTest(unittest.TestCase):
         self.assertEqual(nice_bins(t0, t0 + timedelta(days=400), 20)[1], "30 days")
         self.assertEqual(bin_times([]), ([], [], {}, None, ""))
 
+    def test_a_few_far_dates_do_not_squash_the_chart(self):
+        # 1,000 events in 2023 and two far ones (1970, 2035 - an expiry): the chart opens on
+        # 2023 and says how many are outside; 'show all' draws every event; a selection zooms
+        from density import busy_range, DensityChart
+        from tests.helpers import tk_root
+        t0 = datetime(2023, 1, 1)
+        times = [t0 + timedelta(hours=8 * i) for i in range(1000)]
+        far = times + [datetime(1970, 1, 1), datetime(2035, 12, 30)]
+        lo, hi = busy_range(sorted(far))
+        self.assertEqual(lo.year, 2023)
+        self.assertEqual(hi.year, 2023)
+        self.assertIsNone(busy_range(sorted(times)))        # evenly spread: everything
+        root = tk_root(self)
+        ch = DensityChart(root, height=96, width=600)
+        ch.pack()
+        ch.winfo_width, ch.winfo_height = (lambda: 600), (lambda: 96)    # hidden root
+        root.update()
+        ch.set_data(far)
+        root.update()
+        self.assertTrue(ch.view_auto)
+        self.assertEqual(ch.outside, (0, 0) if ch.view is None else ch.outside)
+        self.assertEqual(sum(ch.totals) + sum(ch.outside), 1002)
+        texts = [ch.itemcget(i, "text") for i in ch.find_withtag("outside")]
+        self.assertTrue(any("earlier" in t for t in texts) and any("later" in t for t in texts),
+                        texts)
+        ch.set_view(None, None)                             # 'show all'
+        self.assertEqual(sum(ch.totals), 1002)
+        self.assertEqual(ch.find_withtag("outside"), ())
+        ch.selection = (datetime(2023, 3, 1), datetime(2023, 3, 31))
+        ch.zoom_to_selection()
+        self.assertEqual(ch.edges[0].month, 3)
+        self.assertEqual(sum(ch.totals) + sum(ch.outside), 1002)
+        ch.set_view(datetime(2030, 1, 1), datetime(2030, 2, 1))   # nothing there
+        root.update()
+        self.assertIn("No events in this range",
+                      [ch.itemcget(i, "text") for i in ch.find_all()])
+        ch.destroy()
+
+
+class OverviewDatesTest(unittest.TestCase):
+    def test_the_span_most_date_columns_share(self):
+        # the WhatsApp folder's shape: 100 columns 2022-2026, a contact photo stamp in 1992
+        # and thumbnail expiries in 2034/2036
+        from overview_tab import core_range
+        firsts = [datetime(2022, 4, 10) + timedelta(days=9 * i) for i in range(100)]
+        lasts = [datetime(2026, 3, 13)] * 100
+        f = firsts + [datetime(1992, 3, 4)]
+        l = lasts + [datetime(2034, 1, 7), datetime(2036, 1, 10)]
+        lo, hi = core_range(f, l)
+        self.assertGreaterEqual(lo.year, 2022)
+        self.assertEqual(hi, datetime(2026, 3, 13))
+        self.assertIsNone(core_range(firsts, lasts))            # no far dates: the whole
+        self.assertIsNone(core_range(f[:3], l[:3]))              # too few columns
+
+
+class ToolbarTest(unittest.TestCase):
+    def test_the_primary_button_never_goes_behind_more(self):
+        import tkinter as tk
+        from tkinter import ttk
+        from parts import Toolbar
+        from tests.helpers import tk_root
+        root = tk_root(self)
+        root.geometry("260x80")
+        bar = Toolbar(root)
+        bar.pack(fill="x")
+        for i in range(4):
+            bar.add(ttk.Button(bar, text="Option number %d" % i))
+        go = bar.add(ttk.Button(bar, text="Build timeline", style="Primary.TButton"))
+        bar.add(ttk.Button(bar, text="Options"))
+        bar.winfo_width = lambda: 260
+        bar.relayout()
+        self.assertTrue(bar.overflowed)                 # too narrow: some go behind More
+        self.assertNotIn(go, bar.overflowed)
+        del tk
+
 
 class PaletteRankTest(unittest.TestCase):
     def test_rank(self):
@@ -74,6 +149,20 @@ class PaletteRankTest(unittest.TestCase):
         # nothing typed: the recent ones first, then the actions and tabs
         self.assertEqual([i.label for i, _s in rank("", items, [("t", 1)])],
                          ["message", "Build timeline"])
+
+
+class PaletteWeightTest(unittest.TestCase):
+    def test_bigger_tables_first_shadow_tables_last(self):
+        # WhatsApp 'contact': the 44k-row wa_contacts before a version table and a block
+        # list; the full-text index's shadow tables last
+        from palette import Item, rank
+        items = [Item("table", "message_system_block_contact", "msgstore.db", ("t", 1), None, 3),
+                 Item("table", "system_contacts_version_table", "wa.db", ("t", 2), None, 1),
+                 Item("table", "wa_contacts_fts_segdir", "wa.db", ("t", 3), None, 900),
+                 Item("table", "wa_contacts", "wa.db", ("t", 4), None, 44863)]
+        got = [i.label for i, _s in rank("contact", items)]
+        self.assertEqual(got[0], "wa_contacts")
+        self.assertEqual(got[-1], "wa_contacts_fts_segdir")
 
 
 class WorkspaceAppTest(AppCase):
@@ -119,7 +208,7 @@ class WorkspaceAppTest(AppCase):
             self.assertEqual(sorted(wal), ["mmssms.db", "msgstore.db", "transactions_db"])
             # search: a column finds its table in its database, under 50 ms
             nav.search.set("counterparty")
-            self.assertLess(nav.last_filter_ms, 50)
+            within(self, nav.last_filter_ms / 1000.0, 0.05, "the navigator filter")
             self.assertEqual([n for n, _s, _t, _r in nav.db_lines()], ["transactions_db"])
             self.assertIn("1 column", nav.search.count_text())
             nav.search.set("")
@@ -205,7 +294,15 @@ class WorkspaceAppTest(AppCase):
             app.scopes.set("timeline", uids, own=True)
             self.assertEqual(picker.button.cget("text"), "2 of 40 databases ▾")
             self.assertTrue(picker.follow_lbl.winfo_manager())
-            self.assertIn("Build timeline reads them", tab.status.summary())
+            # the events and columns shown narrow to those 2 at once (both were read already)
+            names = set(m.name for m in app.case if m.uid in uids)
+            shown = set(e.database for e in tab.grid.source.events)
+            self.assertTrue(shown and shown <= names, (shown, names))
+            self.assertIn("Showing", tab.status.summary())
+            listed = set(tab.col_tree.set(g, "table").split("  (")[0]
+                         for g in tab._group_iids.values()
+                         if g is not None)
+            self.assertTrue(listed <= names | {""}, listed)
             self.assertEqual(app._search_db_picker.button.cget("text"), "All 40 databases ▾")
         self.run_app(scenario)
 
@@ -221,7 +318,7 @@ class WorkspaceAppTest(AppCase):
             t0 = time.perf_counter()
             nav.search.set("wal_edits")
             took = time.perf_counter() - t0
-            self.assertLess(took, 0.2)
+            within(self, took, 0.2, "filtering 44 databases")
             self.assertEqual(len(nav.db_lines()), 14)   # every third of the 44 synthetic ones
             nav.search.set("")
             # many groups: collapsed except the active one's; never a flat wall

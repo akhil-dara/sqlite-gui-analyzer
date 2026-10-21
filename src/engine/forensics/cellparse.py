@@ -93,18 +93,37 @@ class Cell(object):
             self.start, self.end, self.payload_len, self.rowid, self.types, self.rebuilt)
 
 
-def _types(buf, pos, stop, max_cols=MAX_COLUMNS):
-    """Serial types between pos and stop (at most max_cols): (types, body_size) or None."""
-    types, body = [], 0
+_SMALL_SIZE = [serial_size(st) if st not in (10, 11) else 0 for st in range(128)]
+
+
+def _types(buf, pos, stop, max_cols=MAX_COLUMNS, limit=None):
+    """Serial types between pos and stop (at most max_cols): (types, body_size) or None.
+    limit: the body size the cell allows - a header asking for more is no cell (stops
+    early; the carver tries millions of positions). One-byte types, nearly all of them, are
+    read without the general varint reader."""
+    types = []
+    append = types.append
+    body = 0
+    small = _SMALL_SIZE
     while pos < stop:
-        r = varint(buf, pos, stop)
-        if r is None or len(types) >= max_cols:
+        if len(types) >= max_cols:
             return None
-        st, pos = r
-        if st == 10 or st == 11:
+        b = buf[pos]
+        if b < 0x80:
+            st = b
+            pos += 1
+            if st == 10 or st == 11:
+                return None
+            body += small[st]
+        else:
+            r = varint(buf, pos, stop)
+            if r is None:
+                return None
+            st, pos = r
+            body += serial_size(st)
+        append(st)
+        if limit is not None and body > limit:
             return None
-        types.append(st)
-        body += serial_size(st)
     return (types, body) if pos == stop else None
 
 
@@ -123,9 +142,12 @@ def _count_types(buf, pos, count, end):
     return types, pos, body
 
 
-def parse_intact(buf, pos, end, usable, index, max_cols=MAX_COLUMNS):
+def parse_intact(buf, pos, end, usable, index, max_cols=MAX_COLUMNS, cut=False):
     """The complete cell starting at buf[pos] and ending at or before `end`, or None.
-    Records with more than max_cols columns are not looked for."""
+    Records with more than max_cols columns are not looked for.
+
+    cut: also a cell whose header is whole but whose (all local) body runs past `end` - a
+    newer cell overwrote its tail; it is returned with local = the bytes before `end`."""
     r = varint(buf, pos, end)
     if r is None or r[0] < 1:
         return None
@@ -145,7 +167,7 @@ def parse_intact(buf, pos, end, usable, index, max_cols=MAX_COLUMNS):
     hend = p + hlen
     if hend > end:
         return None
-    parsed = _types(buf, q, hend, max_cols)
+    parsed = _types(buf, q, hend, max_cols, plen - hlen)
     if parsed is None:
         return None
     types, body = parsed
@@ -164,6 +186,8 @@ def parse_intact(buf, pos, end, usable, index, max_cols=MAX_COLUMNS):
             return None
         cend += 4
     if cend > end:
+        if cut and ovfl is None and hend < end:
+            return Cell(pos, index, plen, rowid, p, hlen, types, hend, end - p, end, None)
         return None
     return Cell(pos, index, plen, rowid, p, hlen, types, hend, local, cend, ovfl)
 
@@ -189,6 +213,8 @@ def _shape_ok(buf, start, length, intact_from):
     """Could the bytes buf[start:start+length] that survive (index >= intact_from) be part of
     one minimal varint of that length?"""
     last = start + length - 1
+    if last >= len(buf):
+        return False                    # past the page's end (a free area at its very end)
     for p in range(max(start, intact_from), start + length):
         b = buf[p]
         if p == last:
@@ -246,6 +272,34 @@ def _layouts(buf, pos, usable, index, clobber):
     return out
 
 
+def self_ends(buf, pos, end, usable, index, counts, clobber=4):
+    """Where a cell at pos ends by its own header, when the overwritten bytes held only the
+    lengths (payload, rowid, header) and every column type survived: the types count `n`
+    (one of `counts`) from the first intact byte, the body follows them, and the payload
+    length they give fits the varint and the page. Ends between pos and `end` only, sorted.
+    For a freed cell whose neighbour lost its own start (no boundary to end it at)."""
+    out = set()
+    for lp, lr, lh, a, t0, first, known_h, _rowid in _layouts(buf, pos, usable, index,
+                                                              clobber):
+        if first != t0:
+            continue                    # a column type was overwritten: no own length
+        for n in counts:
+            got = _count_types(buf, t0, n, end)
+            if not got:
+                continue
+            _types, hend, body = got
+            if known_h is not None and known_h != hend - a:
+                continue
+            if varint_len(hend - a) != lh:
+                continue
+            plen = hend - a + body
+            e = hend + body
+            if pos + clobber < e < end and varint_len(plen) == lp and \
+                    local_payload_size(plen, usable, not index) == plen:
+                out.add(e)
+    return sorted(out)
+
+
 def reconstruct(buf, pos, end, usable, index, tpl, clobber=4, cache=None):
     """Every way the cell occupying exactly buf[pos:end] can be a record of template `tpl`
     when its first `clobber` bytes were overwritten. Returns a list of Cells (rowid None
@@ -255,9 +309,15 @@ def reconstruct(buf, pos, end, usable, index, tpl, clobber=4, cache=None):
                                                  cache)]
 
 
-def reconstruct_all(buf, pos, end, usable, index, tpls, clobber=4, cache=None):
+def reconstruct_all(buf, pos, end, usable, index, tpls, clobber=4, cache=None,
+                    partial=False):
     """reconstruct() for several templates at once: [(template, Cell)]. The byte layout
-    work is shared by every template with the same column count."""
+    work is shared by every template with the same column count.
+
+    partial: also the cells whose body runs past `end` (an update to a shorter value wrote
+    its new cell over the old one's tail): the lost leading columns are taken as storing no
+    bytes (a rowid alias, NULLs) and the payload as cut at `end`; the caller decides
+    whether what survives is worth keeping."""
     size = end - pos
     out = []
     if size < 4:
@@ -268,6 +328,8 @@ def reconstruct_all(buf, pos, end, usable, index, tpls, clobber=4, cache=None):
             by_n.setdefault(t.n, []).append(t)
     if not by_n:
         return out
+    # which templates a cache entry was worked out for (one cache serves several groups)
+    gid = dict((n, tuple(id(t) for t in g)) for n, g in by_n.items())
     if cache is None:
         cache = {}
     layouts = cache.get("layouts")
@@ -300,14 +362,24 @@ def reconstruct_all(buf, pos, end, usable, index, tpls, clobber=4, cache=None):
                 if varint_len(hlen) != lh or (known_h is not None and known_h != hlen):
                     continue
                 rest = plen - hlen - known_body      # bytes of the lost columns
-                for tpl in group:
-                    if not all(tpl.type_ok(j + i, st)[0] for i, st in enumerate(types_tail)):
-                        continue
+                fkey = ("fits", key, gid[n])
+                fits = cache.get(fkey)
+                if fits is None:                     # the templates whose columns j.. take
+                    fits = cache[fkey] = [           # these types (the same for every end)
+                        tpl for tpl in group
+                        if all(tpl.type_ok(j + i, st)[0] for i, st in enumerate(types_tail))]
+                for tpl in fits:
                     if spills:
                         for cell in _with_overflow(buf, pos, end, usable, index, tpl, lp, lr, a,
                                                    hlen, lens, types_tail, hend, known_body,
                                                    rowid, clobber):
                             out.append((tpl, cell))
+                    if partial and rest < 0 and not spills:
+                        for head, solved in _assign(tpl, lens, 0):
+                            out.append((tpl, Cell(pos, index, hlen + known_body, rowid, a,
+                                                  hlen, head + types_tail, hend, plen, end,
+                                                  None, clobber, solved, j)))
+                        continue
                     if not whole or rest < 0:
                         continue
                     for head, solved in _assign(tpl, lens, rest):
@@ -321,7 +393,9 @@ MAX_ASSIGNMENTS = 64
 
 def _assign(tpl, lens, rest):
     """Serial types for the lost leading columns whose sizes add up to `rest`:
-    [(types, solved_positions)].
+    [(types, solved_positions)] - remembered per template (the answer depends only on the
+    template, lens and rest; a carve asks the same question millions of times). The memo is
+    dropped when the template learns lengths (Template.forget_assignments).
 
     Only the last lost column can take whatever size is left. When an earlier lost column is
     text or blob too, its size cannot be read off anything, so only the lengths seen in the
@@ -329,6 +403,21 @@ def _assign(tpl, lens, rest):
     A template with `free_variable` set (index entries: a short text key followed by the
     rowid) also tries every size that leaves room for some combination of the fixed sizes of
     the columns after it, when those are all fixed-size."""
+    memo = getattr(tpl, "_assign_memo", None)
+    if memo is None:
+        memo = {}
+        try:
+            tpl._assign_memo = memo
+        except AttributeError:          # a template that keeps no memo: computed each time
+            pass
+    key = (tuple(lens), rest)
+    got = memo.get(key)
+    if got is None:
+        got = memo[key] = _assign_now(tpl, lens, rest)
+    return got
+
+
+def _assign_now(tpl, lens, rest):
     options = [tpl.size_options(i, vlen) for i, vlen in enumerate(lens)]
     tails = [None] * (len(lens) + 1)          # possible fixed-size sums of columns i..end
     if getattr(tpl, "free_variable", False):
@@ -385,23 +474,50 @@ def _with_overflow(buf, pos, end, usable, index, tpl, lp, lr, a, hlen, lens, typ
     """Lost leading types for a cell that spills to overflow pages: only fixed-size types can
     be solved (the payload length is lost with them)."""
     out = []
-    options = [[o for o in tpl.size_options(i, vlen) if o[0] is not None]
-               for i, vlen in enumerate(lens)]
-
-    def walk(i, acc, size):
-        if i == len(lens):
+    checked = {}                        # total size of the lost columns -> (local, ovfl) or None
+    for size, head in _fixed_combos(tpl, lens):
+        got = checked.get(size, False)
+        if got is False:
+            got = None
             plen = hlen + known_body + size
-            if varint_len(plen) != lp:
-                return
-            local = local_payload_size(plen, usable, not index)
-            if local >= plen or a + local + 4 != end:
-                return
-            ovfl = _U32.unpack_from(buf, a + local)[0]
-            if ovfl:
-                out.append(Cell(pos, index, plen, rowid, a, hlen, acc + types_tail, hend, local,
-                                end, ovfl, clobber, (), len(lens)))
-            return
-        for fsize, st in options[i]:
-            walk(i + 1, acc + [st], size + fsize)
-    walk(0, [], 0)
+            if varint_len(plen) == lp:
+                local = local_payload_size(plen, usable, not index)
+                if local < plen and a + local + 4 == end:
+                    ovfl = _U32.unpack_from(buf, a + local)[0]
+                    if ovfl:
+                        got = (plen, local, ovfl)
+            checked[size] = got
+        if got is not None:
+            plen, local, ovfl = got
+            out.append(Cell(pos, index, plen, rowid, a, hlen, head + types_tail, hend, local,
+                            end, ovfl, clobber, (), len(lens)))
     return out
+
+
+def _fixed_combos(tpl, lens):
+    """[(total size, serial types)] of every fixed-size choice for the lost leading columns,
+    in the order they are tried - they depend only on the template and the lost varints'
+    lengths, so they are worked out once per template (a large carve asks millions of times)."""
+    memo = getattr(tpl, "_ovfl_memo", None)
+    if memo is None:
+        memo = {}
+        try:
+            tpl._ovfl_memo = memo
+        except AttributeError:
+            pass
+    key = tuple(lens)
+    got = memo.get(key)
+    if got is None:
+        options = [[o for o in tpl.size_options(i, vlen) if o[0] is not None]
+                   for i, vlen in enumerate(lens)]
+        got = []
+
+        def walk(i, acc, size):
+            if i == len(lens):
+                got.append((size, acc))
+                return
+            for fsize, st in options[i]:
+                walk(i + 1, acc + [st], size + fsize)
+        walk(0, [], 0)
+        memo[key] = got
+    return got

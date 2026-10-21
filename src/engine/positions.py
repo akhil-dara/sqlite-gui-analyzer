@@ -192,6 +192,7 @@ class PositionIndex(object):
         cursor; explain(sql, params) the EXPLAIN QUERY PLAN detail strings. cancel() -> True
         stops (the index stays incomplete). Returns True when complete."""
         pos = 0
+        sqls = []
         for pi, phase in enumerate(self.plan.phases):
             where = " AND ".join(w for w in (base_where, phase.where) if w)
             sql = "SELECT %s FROM %s%s ORDER BY %s" % (
@@ -202,6 +203,13 @@ class PositionIndex(object):
             except sqlite3.Error:
                 plan = ["TEMP B-TREE"]
             self.seekable[pi] = not base_where and not any("TEMP B-TREE" in d for d in plan)
+            sqls.append(sql)
+        if self.dense is not None and all(self.seekable):
+            # the checkpoints seek as fast as a map of every row would: no map (it was built
+            # and then dropped - 0.7 s of a 2.7 s build of 2.5 million rows)
+            self.dense = None
+        for pi, phase in enumerate(self.plan.phases):
+            sql = sqls[pi]
             self.phase_starts[pi] = pos
             first = True
             cur = run_query(sql, base_params)
@@ -220,13 +228,17 @@ class PositionIndex(object):
                             self.map_skipped = True
                         else:
                             dense.extend(r[-1] for r in chunk)
-                    every = self.every
-                    for r in chunk:
-                        if first or pos % every == 0:
-                            self._add_checkpoint(pos, pi, tuple(r))
-                            every = self.every
-                            first = False
-                        pos += 1
+                    # the checkpoint rows of the chunk, by index (no Python step per row):
+                    # the phase's first row and every row whose position is a multiple of
+                    # `every` (which a thinning may double on the way)
+                    n = len(chunk)
+                    i = 0 if first else (-pos) % self.every
+                    first = False
+                    while i < n:
+                        self._add_checkpoint(pos + i, pi, tuple(chunk[i]))
+                        j = pos + i + 1
+                        i = j + (-j) % self.every - pos
+                    pos += n
                     self.count = pos
             finally:
                 try:

@@ -17,6 +17,23 @@ def is_wal(hit):
     return hit.get("source", "DB").startswith("WAL")
 
 
+KIND_WORDS = {"DB": "Live row", "WAL": "WAL version", "Freelist": "Recovered"}
+# the Source filter's words and the kinds they stand for
+SOURCE_FILTER = (("Live rows", "DB"), ("WAL versions", "WAL"), ("Recovered records", "Freelist"))
+
+
+def source_word(src):
+    """The words for a hit's source in a result line: 'Live row', 'WAL version · stale',
+    'Recovered'."""
+    src = str(src or "DB")
+    if src.startswith("WAL"):
+        state = src[3:].strip(" ()").lower()
+        return "WAL version" + (" · " + state if state else "")
+    if src.startswith("Freelist"):
+        return "Recovered"
+    return "Live row"
+
+
 def source_kind(hit):
     """"DB", "WAL" or "Freelist" (records still held by freed pages)."""
     src = hit.get("source", "DB")
@@ -69,7 +86,7 @@ def _same_row(a, b):
 
 class RowGroup(object):
     __slots__ = ("table", "locator", "rowid", "source", "row", "hits", "frames", "order",
-                 "dbid", "database")
+                 "dbid", "database", "gone")
 
     def __init__(self, hit, order):
         # the database the row is in: a case member's uid and name (None / '' for a search
@@ -83,6 +100,7 @@ class RowGroup(object):
         self.hits = []
         self.frames = []        # (frame index, page, state) of each WAL copy of this row version
         self.order = order
+        self.gone = None        # WAL version: True when the row is no longer in the database
 
     @property
     def first(self):
@@ -106,13 +124,18 @@ class RowGroup(object):
         return max(self.frames)[2] if self.source == "WAL" and self.frames else ""
 
     def source_label(self):
+        """What the line is: 'Live row' (· WAL ×n when WAL frames hold it too), 'WAL version
+        · stale ×2', 'Recovered · p.5 @ 100' (the record's page and offset in it)."""
         n = len(self.frames)
         if self.source == "DB":
-            return "DB + WAL ×%d" % n if n else "DB"
+            return "Live row · WAL ×%d" % n if n else "Live row"
         if self.source == "Freelist":
             first = self.hits[0] if self.hits else {}
-            return "Freelist p.%s" % first.get("page", "?")
-        label = "WAL " + "/".join(self.states())
+            prov = first.get("provenance") or {}
+            page = first.get("page", prov.get("page", "?"))
+            off = first.get("cell_offset", prov.get("cell_offset"))
+            return "Recovered · p.%s%s" % (page, "" if off is None else " @ %s" % off)
+        label = "WAL version · " + "/".join(self.states())
         return label + (" ×%d" % n if n > 1 else "")
 
     def columns_label(self, most=3):
@@ -122,7 +145,7 @@ class RowGroup(object):
         return "%s +%d" % (", ".join(cols[:most]), len(cols) - most)
 
     def frames_label(self, most=12):
-        shown = ["#%d %s" % (f[0], f[2]) for f in sorted(self.frames)[:most]]
+        shown = ["#%d %s" % (f[0] + 1, f[2]) for f in sorted(self.frames)[:most]]
         more = len(self.frames) - most
         return ", ".join(shown) + (", +%d more" % more if more > 0 else "")
 
@@ -144,7 +167,9 @@ class ResultGrouper(object):
         dbid = hit.get("dbid")      # rows of different databases never share a group
         if source_kind(hit) == "Freelist":
             # one record of a freed page (its locator carries the record itself)
-            key = (dbid, "Freelist", hit.get("page"), hit.get("cell_offset"), hit["table"], loc)
+            prov = hit.get("provenance") or {}
+            key = (dbid, "Freelist", hit.get("page", prov.get("page")),
+                   hit.get("cell_offset", prov.get("cell_offset")), hit["table"], loc)
             g = self._by_key.get(key) or self._new(hit, key)
             g.hits.append(hit)
             return g

@@ -320,7 +320,7 @@ class HelpTest(unittest.TestCase):
         for mode in SEARCH_MODES:
             self.assertIn(mode, text)
         for label in ("Include BLOB bytes", "Include decoded BLOBs", "Include views",
-                      "Include WAL row versions", "Include freed pages", "Row panel",
+                      "Include WAL row versions", "Include recovered records", "Row panel",
                       "Inspect BLOB…", "Ctrl+E", "Ctrl+Enter", "Alt+Up/Down", "Escape",
                       "Freed Pages", "Recovered Records", "verify_rehash_bytes",
                       "Activity log", "manifest.json"):

@@ -168,7 +168,7 @@ class ApiTest(ComboTestBase):
 
 
 class CycleArrowsTest(ComboTestBase):
-    """DB Browser-style: Up/Down with closed popup cycles values directly."""
+    """Up/Down with the popup closed cycles the values directly."""
 
     def setUp(self):
         ComboTestBase.setUp(self)
@@ -358,15 +358,15 @@ class ReadonlyTest(ComboTestBase):
         self.pump()
         self.assertFalse(c.is_open())
         del c._focus_now
-        # another program taking the keyboard focus: the list stays open
+        # another program taking the keyboard focus: the list (a topmost window of its own,
+        # which would float over that program) closes; the entry keeps its text
         self.click_entry(c)
         self.assertTrue(c.is_open())
         c._focus_now = lambda: None
         c._on_focus_out()
         self.pump()
-        self.assertTrue(c.is_open())
+        self.assertFalse(c.is_open())
         del c._focus_now
-        c.close()
         self.pump()
         self.click_entry(c)
         self.assertTrue(c.is_open())

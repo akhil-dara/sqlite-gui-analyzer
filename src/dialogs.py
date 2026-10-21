@@ -6,6 +6,7 @@ import io
 import json
 import binascii
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
 
 from constants import C, HAS_PIL, VERSION, WAL_STATES, _EXT_MAP, mode_label
@@ -24,6 +25,24 @@ from widgets import FlowFrame, SearchBox, ToolTip, TreeFilter, fit_geometry, pla
 
 # ── HelpDialog ───────────────────────────────────────────────────────────
 HELP = [
+    ("Getting started",
+     "Everything is read-only: nothing is ever written to or next to the database you open.\n\n"
+     "1. Open a database (Open ▾ > Open database..., or drop a file on the window), or a "
+     "whole folder of them (Open folder...: an app's databases become one case).\n"
+     "2. Look at its tables: pick one on the left, or in Browse. Columns named like dates "
+     "show as dates; the stored value is kept and shown beside it.\n"
+     "3. Find something: type a name, number or word in Search - every table is searched.\n"
+     "4. See what was deleted: Forensics > Recover deleted records (a small database is "
+     "recovered on its own after opening). The WAL tab shows older versions of rows.\n"
+     "5. Put rows together without writing SQL: Query - add tables, they join on their own "
+     "links; tick the columns you want; Filter... a column (dates by month, values from a "
+     "list); Run.\n"
+     "6. When did things happen: Timeline - every date column of the database on one list "
+     "and chart.\n"
+     "7. Keep what matters: right-click a row > Tag, then Tagged > Export... (CSV, JSON, an "
+     "HTML report), each with the evidence hashes.\n\n"
+     "Every list can be searched (Ctrl+F), every dropdown typed into, and Ctrl+K goes to "
+     "any table, column or action. The sections below say everything in detail."),
     ("Overview",
      "SQLite GUI Analyzer opens SQLite databases read-only to search, browse and examine them, "
      "including what the database no longer shows: row versions in the WAL, records in freed "
@@ -60,6 +79,12 @@ HELP = [
      "and WAL-only tables when it has them), a table for its columns with their types, foreign "
      "keys, indexes and CHECK constraints. Click a table to open it in Browse (its database "
      "becomes the active one); double-click or Enter on a database makes it active.\n\n"
+     "Triggers are work a database does by itself: deleting a call can delete its "
+     "participants, inserting a row can delete the oldest ones, a change can be written into "
+     "a log table. Select a trigger for what it does in plain words above its SQL (read from "
+     "the SQL, never run); select a table for the triggers that fire on it or change it. The "
+     "Relationships tab's table panel and the Overview's Triggers column say the same, and a "
+     "recovered record says when its table's rows are deleted or logged by a trigger.\n\n"
      "The search box finds databases, tables and columns of every database as you type (the "
      "tables holding a matching column are opened on it) and says how many match; Enter goes to "
      "the next match. The chips keep only the databases with rows, with a WAL, with dates (once "
@@ -79,9 +104,19 @@ HELP = [
      "Cards give the range of the dates found (sampled from the first and last rows of each "
      "table, as the Timeline samples them), the biggest tables, the links between the "
      "databases (click: Relationships) and the warnings (click: the status of every database). "
-     "The table lists every database: its app or folder, size, tables, rows, WAL state, "
-     "SHA-256, the dates found and the links in and out; click a heading to sort, type in the "
-     "box to filter, double-click to browse a database, right-click for the navigator's menu. "
+     "The table lists every database: its app or folder, its full path, size, tables, its "
+     "triggers ('357 · 141 delete rows': how many, and how many delete rows by themselves; "
+     "hover for the rest), rows, WAL state, the whole SHA-256, the dates found and the links "
+     "in and out; click a heading to sort, type in the box to filter, double-click to browse "
+     "a database, right-click for Copy SHA-256, Copy this line (every field; Ctrl+C) and the "
+     "navigator's menu; hover a line for its path, hash and size in bytes. Export ▾ copies "
+     "the whole table (text, CSV, JSON) or saves it (path, size in bytes, tables, rows, WAL, "
+     "SHA-256, open mode, dates, links, triggers, warnings) - never into the evidence folder. "
+     "Databases with the same file name are named by the folders that tell them apart "
+     "('History (anu)', 'History (bob)'); '#2' appears only for identical paths. "
+     "The links card counts copies of the same table in several databases apart ('3 same "
+     "tables across databases, listed apart'): the same column of a same-named table in "
+     "another database is a copy of that app's table, not a link. "
      "The dates are looked for in the background, database after database (Stop stops it, "
      "Find dates starts again, limit overview_date_tables), and the Timeline reuses what was "
      "found."),
@@ -117,8 +152,9 @@ HELP = [
      "(the tables and views searched: one dialog for one database or, in a case, each "
      "database's tables under its name; Hide empty never hides a table still being counted; "
      "All listed, None listed, Invert and Only with rows act on the tables listed; the button "
-     "then says '12 of 19 tables ▾' and Reset searches all again), WAL row versions and Freed "
-     "pages (offered only when a searched database has them), and Advanced ▾ (it says how many "
+     "then says '12 of 19 tables ▾' and Reset searches all again), WAL row versions and "
+     "Recovered records (offered only when a searched database has them), and Advanced ▾ (it "
+     "says how many "
      "of its options are on): Include BLOB bytes (search BLOBs as bytes: text in UTF-8/UTF-16, "
      "and hex patterns), Include decoded BLOBs (plists, protobuf, keyed archives, compressed "
      "data…), Include views (off by default: views repeat their tables' rows) and Max matching "
@@ -130,7 +166,7 @@ HELP = [
      "tables' - and its Details list each database with matches and its rows, then one line "
      "for the databases searched without a match ('14 databases: searched, nothing found') "
      "and one for those not searched (stopped).\n\n"
-     "The results are filtered by Database (a case), Source (DB, WAL, Freed pages), Table, "
+     "The results are filtered by Database (a case), Source (DB, WAL, Recovered), Table, "
      "Column and Type (searchable dropdowns), and paged with ◀ ▶. 'N errors' appears only when "
      "a table could not be searched, and lists why. Export ▾: Matches (CSV or JSON)…, Matches "
      "with their whole rows (JSON)…, or Copy results. After a search the navigator offers 'Has "
@@ -150,7 +186,17 @@ HELP = [
     ("Browse tab",
      "The breadcrumb ('● msgstore.db ▾ › message ▾') chooses the database (in a case) and the "
      "table or view (a table only the WAL still holds is listed as 'WAL: name' and read on a "
-     "worker, with the values as stored). The grid scrolls through all rows (read as you "
+     "worker, with the values as stored). Pictures (next to Row panel) draws image BLOBs - "
+     "JPEG, PNG, GIF, WEBP... - as thumbnails in their cells, with taller rows; the stored "
+     "value stays for copies, filters and the inspector (images larger than the "
+     "preview_pixels limit are not decoded; without Pillow only PNG and GIF). Fields inside… "
+     "on a column heading adds fields read out of its values (bplist, JSON...) as NEW columns "
+     "after the table's own, named ƒ field and drawn in their own colour (the status line "
+     "counts them): sort, filter, copy and export them like any column; the stored value is "
+     "never changed, and a right-click on a ƒ header removes it. The choice is kept per "
+     "table name in the tool's own settings (never near the evidence), so the same table "
+     "in another database shows the columns too. The grid "
+     "scrolls through all rows (read as you "
      "scroll, however large; a jump far into a sorted or filtered view says which rows it "
      "reads and for how long, and is read again through the row index once that is built). "
      "Click a header to sort; drag a border to resize, double-click it to fit.\n\n"
@@ -188,8 +234,13 @@ HELP = [
      "value… (Shift+Enter), Inspect BLOB…, Hide column, Column chooser…, Row history (every "
      "version), Related rows, Find this value everywhere, Copy with related and Tag (only what "
      "applies to the cell is offered). Right-click a header for Sort ascending / descending, "
-     "Autosize column, Hide column, Column chooser…, Show as date, Show value from linked "
-     "table… and Column relationships….\n\n"
+     "Autosize column, Hide column, Column chooser…, Show as date, Show as number, Show value "
+     "from linked table…, Fields inside…, Calculate from… (a new ƒ= column by a "
+     "formula or steps, see Query tab) and Column relationships…. Show as number draws a stored number "
+     "divided by 100, 1,000 or 1,000,000, with thousands separators (an app that keeps "
+     "amounts in the smallest unit: 34000 stored shows 340.00; the header says '÷100'): the "
+     "stored value stays in copies and the tooltip, an export keeps it and adds the column "
+     "'amount (÷100)' beside it; remembered per table and column.\n\n"
      "Export ▾: Rows (CSV or JSON)… writes the rows the filters keep (or the selected rows) on a "
      "worker thread with progress and Stop; BLOBs as files… (offered when the table holds BLOB "
      "values, in any column) writes each BLOB as a file with a manifest."),
@@ -205,9 +256,20 @@ HELP = [
      "Find at the top (Ctrl+F) lists only the columns whose name or value holds every word "
      "('12 of 250 columns match'); Enter goes to the next one and marks its name. It looks at "
      "up to 100,000 characters of a text and at a BLOB's summary and first 512 bytes (hex).\n\n"
-     "A WAL record, a recovered record or a query result opens in the same kind of window, "
-     "headed with where it was found (frame and page, page and offset with its confidence, or "
-     "the query), with the same Find."),
+     "A WAL record or a query result opens in the same kind of window, headed with where it "
+     "was found (frame and page, or the query), with the same Find.\n\n"
+     "A recovered record opens in its own window: a banner with its state (deleted, older "
+     "version, inserted again, unreferenced page, index entry), table, rowid, confidence and "
+     "where its bytes are - 'page 1318 @ 690 · byte 5,395,122 (0x5252B2) of data.db · "
+     "1,471 bytes' - then three tabs: Values (right-click or Ctrl+C copies a value, Enter or "
+     "a double-click shows it whole with JSON pretty-printed, a BLOB in the inspector), Where "
+     "found (every provenance field: file, page, offset in the page, byte offset in the file, "
+     "length, WAL frame, overflow pages, other places the same record was found, why it was "
+     "read so, its record id) and Bytes (the page as the file holds it, the record "
+     "highlighted; copy its bytes as hex). Copy ▾ gives the record as JSON (values and "
+     "provenance), CSV, text or TSV, its provenance alone or the where line; Save ▾ writes a "
+     "JSON, CSV or text file or the record's bytes (never into the evidence folder). The "
+     "Forensics record panel has the same Bytes… and 'Copy where'."),
     ("Rows and their related rows",
      "Related rows (right-click a cell) lists the rows of other tables that hold the value "
      "through a trusted link, per link; All related rows… opens them in a window. In a case, "
@@ -230,22 +292,132 @@ HELP = [
      "Runs statements that read: SELECT, WITH, VALUES, EXPLAIN and read-only PRAGMA (comments "
      "before them are fine). The connection is read-only, so anything that would change the "
      "database is refused, inline, and the rows of an earlier query are cleared. ▶ Run (Ctrl+Enter) "
-     "runs, ■ Stop ends a long query, Clear empties the editor, Copy SQL copies it. Limit (100 to "
-     "All) keeps that many rows and says when the query had more. Query history lists the last "
+     "runs, ■ Stop ends a long query, Clear empties the editor, Copy SQL copies it. While you "
+     "type, a list offers the tables, the columns with their declared types (the columns of "
+     "the tables the statement reads first; after 'alias.' only that table's), keywords and "
+     "functions: Up / Down move, Tab or Enter takes one, Esc closes, Ctrl+Space opens it. "
+     "Limit (100 to All; All by default) keeps that many rows and says when the query had "
+     "more; All stops at the query_rows setting, and says so. Query history lists the last "
      "100 queries (limit sql_history); Alt+Up/Down walks it in the editor; Clear history empties "
      "it. Ctrl+E goes to the editor from anywhere. Export ▾: Export CSV… or Export JSON…, with "
-     "the query in the provenance.\n\n"
+     "the query in the provenance. A result column whose name and values both say dates (a "
+     "timestamp in Unix milliseconds) is shown as dates in UTC, its header saying the kind; "
+     "copies keep the stored value, an export adds '<column> (date, UTC)' beside it, and "
+     "right-clicking the header switches between the dates and the stored values.\n\n"
      "When the database is read in main-only mode (a WAL too large for the in-memory view, limit "
      "ram_overlay_bytes, or Python before 3.11) a notice above the results says that SQL sees "
      "the main file only and how many committed WAL frames it misses, with 'Browse (WAL "
      "applied)' and 'Limits…'; Browse, Search and the Timeline include them."),
+    ("Query tab",
+     "Builds a query without typing SQL, and says in plain words what it gives ('What you'll "
+     "get', above the tables: one line per row of which table, what each joined table adds, "
+     "what happens to rows without a match).\n\n"
+     "Tables: double-click one in the list, or drag it onto the canvas: it becomes a card "
+     "with every column, its declared type, and PK / FK / UQ for primary key, declared foreign "
+     "key and unique; the wheel scrolls a long card, 'choose…' lists its columns with a "
+     "search. Tick the columns to show. A table added to others is joined by the trusted links "
+     "of Relationships (a declared foreign key, or a link the values confirm), drawn between "
+     "the two columns with 1 / N at its ends: 'keep all' keeps a row that has no match (LEFT "
+     "JOIN), 'matches only' leaves it out (INNER JOIN) - click the line to change or remove "
+     "it; right-click a column to join it by hand. A table no join reaches is drawn dashed "
+     "'NOT JOINED' and Run asks before pairing every row with every row. Tidy layout puts the "
+     "cards in columns along the keys; in a case each database has its colour.\n\n"
+     "Columns shown: drag a line to reorder; right-click it (or a ticked column on its card) "
+     "for Show as (a date kind - a date-like column is shown as a date when ticked; the "
+     "stored value stays in copies and exports), Meanings of the values ('2 = incoming', "
+     "saved as sets), Summary (count, count distinct, smallest, largest, sum, average, list - "
+     "the other columns become the groups), Label, Fields inside… and Calculate….\n\n"
+     "Fields inside… (any column): decodes a sample of the values (bplist, keyed archive, "
+     "JSON, protobuf, gzip…) and lists every field path found with how many values have it "
+     "and examples - exactly as the data has them. Tick fields to show each as a column, or "
+     "several as ONE column (the first that has a value: a sender kept under 'from' in some "
+     "rows and 'paidFrom' in others), or join a table on a field (the tool reads the field "
+     "out of each row after the query and looks it up; a purple dotted line). The fields "
+     "are found in a sample of the column (the first blob_fields_sample rows in the grid's "
+     "order; their counts are of that sample) and listed up to blob_fields_paths. A field, a "
+     "calculated column and a table joined on a field are worked out by the tool after the "
+     "SQL: they show, sort and export, but cannot be used in Rows where (the SQL does not "
+     "have them). In Browse a field is a new column of its own (ƒ field, see Browse); sorting "
+     "or filtering on it reads the table into memory (up to derived_scan_rows rows, said when "
+     "cut).\n\n"
+     "Calculate… makes a new column from a column's values by steps: a Formula of your "
+     "own in Excel-like terms (x is the value; any other column of the row by its name, or "
+     "col(\"Full name\"): round(x / 100, 2), x * qty + fee, upper(left(name, 3)), x if x > 0 "
+     "else 0, date(x, \"ms\"), json(x, \"to.name\"), thousands(x / 100, 2), coalesce(a, b), "
+     "iif(test, a, b), contains / startswith / endswith / matches(regex) / regex(s, pattern, "
+     "group), mid / left / right / split / digits / replace / lpad / rpad / wordcount, "
+     "size(x) (bytes as '1.5 MB', or in a unit), duration(x, \"ms\"), dateformat, year / "
+     "month / day / hour / weekday / week / quarter, datediff, unix (a date stored one way "
+     "as another), a zone offset for any date, field(x, path) inside JSON / plist / "
+     "NSKeyedArchiver / protobuf values, decoded(x), kind(x), md5 / sha1 / sha256, base64 / "
+     "fromhex / utf8 / urldecode, isnull / isempty, sign / trunc / percent, sqrt / floor / "
+     "ceil; checked as you type, with the row's "
+     "columns, the functions and examples one pick away), numbers (divide, multiply, add, "
+     "round, thousands, percentage), text (before / after, capitals, part, replace, split, "
+     "digits only), with another column of the row (add, divide, join, if empty take). A "
+     "live preview shows real values, and why a result is empty; nothing is executed: a "
+     "formula is read with a closed list of operators and functions. The stored column "
+     "never changes. In Browse the same calculator (right-click a header › Calculate "
+     "from…) adds the result as a new column ƒ= name, remembered per table name; "
+     "right-click its header to edit or remove it.\n\n"
+     "Filter… (right-click a column): the column as it is - a date column as bars of rows "
+     "per month (click a month or drag across months; From / To calendars for exact times; "
+     "the tool finds how the dates are stored and says so in one line, which can change "
+     "it), a column of a few values as a checklist with how many rows have each, numbers "
+     "with From / To, other text with 'contains' and its most frequent values. It says how "
+     "many rows it keeps; Apply makes it the column's filter (▼ on the card); More options… "
+     "opens the full condition dialog.\n\n"
+     "Rows where: keep a row when it matches all the conditions (AND) or any (OR); a group "
+     "(any of…) is one condition made of several. A condition: is / is not, less / more / at "
+     "most / at least (before / after for dates), between, is one of / none of (Pick values… "
+     "lists the column's real values with their counts), contains / does not contain / starts "
+     "/ ends with, matches a pattern (LIKE: % and _; GLOB: * and ?, capitals count), has no "
+     "value (NULL) / has a value, is empty / not empty; against a value or another column; "
+     "capitals can be told not to count (contains / starts / ends with never count capitals "
+     "of A-Z - SQLite's LIKE - while other letters, accented or not Latin, always count); "
+     "is not, does not contain and none of leave out rows with no value (NULL), as SQL does - "
+     "add 'or has no value' to keep them; dates are typed or picked on a calendar and "
+     "compared as the number the column stores. The dialog says how many rows the condition "
+     "keeps. A "
+     "condition on a summary column filters the groups (HAVING).\n\n"
+     "Distinct rows; Count per shown value; At most N rows (off: every row, up to the "
+     "query_rows setting - the results say when that cuts them); skip the first N rows. The "
+     "SQL tab shows exactly the statement Run (Ctrl+Enter) executes, with comment lines for "
+     "what the tool works out after it (fields, calculations, joins on a field): Copy SQL, or "
+     "Open in the SQL tab. Results: Export results ▾ (CSV, JSON, HTML report, with the query "
+     "in the manifest), Bigger results, a double-click shows every value of a row, a "
+     "right-click on a BLOB inspects it. Save… keeps the query ('Skype / contacts' files it "
+     "under Skype); Load ▾ lists them by application.\n\n"
+     "In a case the list shows every database's tables under its name and a query can join "
+     "tables of several databases (by the trusted value links between them, or by hand), "
+     "named db1, db2… in the SQL. Once Forensics has recovered deleted records, 'Recovered "
+     "rows (Forensics)' lists recovered_<table>: the table's columns plus recovered_state, "
+     "recovered_confidence and recovered_where, joined like the live table (a copy in memory, "
+     "temp.recovered_* in the SQL)."),
+    ("Time machine",
+     "The WAL keeps every commit until a checkpoint, so the database can be seen as it was at "
+     "any of them. In the WAL tab, 'Time machine: see the database as it was at commit k of "
+     "n' and 'Open it beside this one' (or right-click a frame: 'Open the database as of "
+     "commit k') open the same files again, read-only, with the WAL applied only up to that "
+     "commit. It joins the case as '<name> @ commit k of n' with a banner saying so: Browse, "
+     "Search, Timeline, Recover and the Query tab work on it; in the Query tab its tables can "
+     "be joined to the current state's by hand (keep all, then 'has no value' on the other "
+     "side: the rows added, or deleted, since). Nothing is written; the commits after k are "
+     "simply not applied. A checkpoint may already have copied later commits into the main "
+     "file: the pages they changed then show that later state - the banner says so, from the "
+     "-shm file beside the WAL (and says when there is no -shm to tell)."),
     ("WAL tab",
-     "Shown for every database with a -wal file, right after Browse; when the file cannot be "
+     "Always there, right after Browse. For a database without a -wal file it says so (the "
+     "file name expected, the header's journal mode), why that is, which databases of the "
+     "case have one, and how a WAL is read; when the file cannot be "
      "read, the tab says why and that its frames are not applied. The tool parses every frame "
      "itself, verifies the checksum chain like SQLite, and labels each frame:\n"
      "@WAL_STATES@\n"
      "A summary line gives the frames per state, commits, checksum failures and sizes; '▶ "
      "Per-table statistics' opens a table per table; 'Technical details' shows the WAL header.\n\n"
+     "Frames are numbered from 1 (the first frame after the 32-byte WAL header, as in "
+     "SQLite's documentation) and commits from 1, the same everywhere: Search, Recovered "
+     "Records, Row History, the Timeline and exports.\n\n"
      "Frames lists each frame with its table, state, page type, records (counted in the "
      "background), checksum and transaction; Status, Table, Page type and Page # filter it and "
      "the headers sort it. Select a frame for its summary, the records on the page (double-click "
@@ -260,20 +432,69 @@ HELP = [
      "files…\n\n"
      "Search: 'Include WAL row versions' also searches every row version kept in WAL frames. A "
      "row copied into many frames is one result listing its frames (e.g. 'WAL stale ×3'); a WAL "
-     "copy identical to a matching database row is shown on that row's line."),
+     "copy identical to a matching database row is shown on that row's line. 'Include "
+     "recovered records' also searches the deleted and older records the file still holds "
+     "(freeblocks, unallocated space, freed and unreferenced pages), recovered first when "
+     "Forensics has not done it yet; without it Search covers the live rows only. The Kind "
+     "column says what each line is: 'Live row' (· WAL ×n when WAL frames hold copies), 'WAL "
+     "version · stale' (a version the database no longer shows; 'deleted now' when its row is "
+     "gone), or 'Recovered · p.1318 @ 690' (a recovered record, tinted, with its page and "
+     "offset); the Kind filter uses the same words."),
+    ("Missing row numbers",
+     "Right-click a table in the database list: 'Missing row numbers (deleted rows)…' lists "
+     "the row numbers (rowids) the table no longer has - deleted rows, also when nothing of "
+     "them can be recovered. Gaps between the live rows; with AUTOINCREMENT also the numbers "
+     "after the last live row up to sqlite_sequence (the highest number ever given: the last "
+     "rows were added and then deleted) and those before the first live row. Without "
+     "AUTOINCREMENT a deleted last row leaves no gap, and the numbers below the first live row "
+     "are not counted (such a table need not start at 1; the window names its first live "
+     "row). A strip from 1 to the highest number shows where the gaps are (amber; green for "
+     "missing rows Forensics recovered), the ranges are listed largest first (the first 5,000 "
+     "when there are more, said; every range is counted and drawn), Export writes them as "
+     "CSV. A missing number "
+     "is usually a deleted row; an app can also skip numbers itself. A WITHOUT ROWID table has "
+     "no row numbers."),
+    ("Encrypted files",
+     "When the header is readable but page 1 (the list of tables) is not a page SQLite writes "
+     "and pages end with reserved bytes, the tool says the file looks encrypted (SQLCipher, as "
+     "Signal and Session use) - without the key nothing in it can be read or recovered. A file "
+     "whose first 16 bytes carry another product's name instead of 'SQLite format 3' (e.g. "
+     "'SQLitecrypt.com!') and whose tables cannot be read is said to be an encrypted database "
+     "format: an error banner, a ⚠ in every list, the Overview's Warnings card, and "
+     "'encrypted' in place of 0 tables and 0 rows, so it is never taken for an empty file."),
     ("Forensics tab",
      "Recovered Records recovers rows the database no longer shows. Table: one table or all; "
-     "Look in: Freeblocks, Unallocated space, Freed pages, Orphan pages, WAL frames, Replaced "
+     "Look in: Freeblocks, Unallocated space, Freed pages, Unreferenced pages, WAL frames, Replaced "
      "pages, Rollback journal; Time limit: 1 minute, 5 minutes or No limit; 'Index entries' also "
-     "recovers deleted index entries. Each record says where it was found and how sure the match "
-     "to a table is (high / medium / low, with the reasons); Show: keeps All, Medium and high, "
-     "or High. Rows identical to a live row are left out; a table (or index) too large to "
+     "recovers deleted index entries. A 'partial' record is the start of a freed record whose "
+     "end a newer one overwrote (an update to a shorter value leaves this): only what "
+     "survives is shown, at low confidence, and only when its text values hold at least 16 "
+     "characters in all. Rows written before an ALTER TABLE ADD COLUMN (fewer values) are "
+     "recovered too when the table's live rows show such records. A record whose first bytes "
+     "a freeblock header overwrote lost its rowid with them; the rowid is inferred, and said, "
+     "when the page leaves exactly one possibility or one live row agrees in every column but "
+     "one (then it is an older version of that row; such records are at most medium "
+     "confidence). Each record says where it was found and how sure the match to a table is "
+     "(high / medium / low, with the reasons); Show: keeps All, Medium and high, or High. "
+     "State says what each record is, the first that applies: index entry (a deleted entry "
+     "of an index), unreferenced page (on a page nothing references; a record rebuilt from "
+     "damaged bytes there reads as deleted), older version (the row is live with other "
+     "values, or its UNIQUE key is live under another rowid: replaced), inserted again "
+     "(deleted, and the same values are live under another rowid - an app that deletes and "
+     "re-inserts rows, or a duplicate row; the record names that rowid), else deleted. 'Older "
+     "version' here is a row; the WAL tab also calls a superseded page an older version. "
+     "The record panel says, when it applies, what an index entry proves and what the "
+     "database's triggers do to the record's table (rows deleted by the database itself, or "
+     "logged to another table). A small database (up to auto_recover_bytes) is recovered on "
+     "its own after opening. "
+     "Rows identical to a live row are left out, also when the bytes fit several tables and "
+     "the row is live in one of them; a table (or index) too large to "
      "compare with its live rows (limits live_hash_rows, live_index_entries) is named in the "
      "status. If a recovery stops early the status says why (Stop, the time limit, or the limit "
      "carve_max_records). Double-click a record for its row detail; Tag ▾ tags records.\n\n"
      "Freed Pages (only for a database with freed pages) lists the pages of the freelist with "
      "the records still on them, the same carver and the same confidence as Recovered Records "
-     "and as Search's 'Include freed pages', and each page's bytes.\n\n"
+     "and as Search's 'Include recovered records', and each page's bytes.\n\n"
      "Row History: picking a table lists the rows with several versions (limit "
      "forensics_history_keys); picking a row, or a row id or key with Show history, lists "
      "every version of the row across the main file, the WAL and the journal (and says when "
@@ -307,7 +528,10 @@ HELP = [
      "Build timeline reads the events, newest first, up to 'Max events per column'. The density "
      "chart above the events shows how many fall in each stretch of time (in a case in the "
      "databases' colours; 'Colour by database' turns it off); hover a bar for its count, drag "
-     "across the bars to keep only that range in the grid, click the chart (or ×) to clear it. "
+     "across the bars to keep only that range in the grid ('zoom in' then draws just that range, "
+     "finer), click the chart (or ×) to clear it. When a few far dates (an expiry years ahead, "
+     "a 1970 zero) would squash the bars, the chart opens on the busy part and says how many "
+     "events lie outside it ('◀ 143 earlier', '139 later ▶'): click either to see them all. "
      "The line under it says how many events, from how many databases, of which sources, and "
      "their span. The status is one line; Details lists each database with its events, one "
      "line for those without, and every note (caps, tables that could not be read). In a case "
@@ -320,8 +544,11 @@ HELP = [
     ("Dates",
      "One decoder serves the whole tool, always in UTC: the row detail shows beside a number the "
      "dates it plausibly is ('Unix milliseconds: 2020-09-13 12:26:40.123 UTC'); 'Show as date' "
-     "(right-click a Browse header: Auto, a format, or Off) shows a column as dates while "
-     "sorting, filters, copies and exports keep the stored values (Auto reads a sample of the "
+     "(right-click a Browse header: Auto, a format, or Off; a column named like a date - "
+     "created_at, ZCREATEDAT, timestamp - opens as dates on its own when its values read as "
+     "dates, and Off is remembered) shows a column as dates while "
+     "sorting, filters and copies keep the stored values and exports add the date as a column "
+     "of its own beside the stored one (Auto reads a sample of the "
      "column in the background, 'reading a sample…' meanwhile); the BLOB Inspector reads a "
      "number in every epoch."),
     ("Tags",
@@ -336,9 +563,15 @@ HELP = [
      "exports are noted in the activity log."),
     ("Several databases (a case)",
      "Open ▾ › Add database(s)… adds files from any folders to the case (Open database… "
-     "replaces the open databases, after asking when there are several); Open folder… lists "
-     "the SQLite files of a folder (with its subfolders if asked) to tick, and shows the "
-     "Overview. The databases open one after the other in the background: each joins the "
+     "replaces the open databases, after asking when there are several); Open folder… goes "
+     "in three steps: 1 the folder (with its subfolders or not), 2 which files - optional "
+     "conditions of your own on the file name, the path in the folder, the folder name, the "
+     "extension or the size (is, is not, contains, starts / ends with, matches * and ?, at "
+     "least / at most; all or any of them), 3 Scan for databases: the line beside it says "
+     "first what will be opened, files that do not match are never opened, and the list "
+     "fills as databases are found (Stop, Scan again). Then tick them (the conditions and a "
+     "find box filter the list, Tick shown only, columns sort on a click) and Open: the "
+     "Overview is shown. The databases open one after the other in the background: each joins the "
      "navigator when it is open, the first is shown at once, and when opening takes a while a "
      "small window says which one is opening, with Stop (those already open stay). With two or "
      "more, the header says so in one line, the Case navigator lists "
@@ -584,6 +817,9 @@ class HelpDialog(tk.Toplevel):
             self.clipboard_clear()
             self.clipboard_append(txt.get("1.0", "end"))
         ttk.Button(btnf, text="Copy", command=copy_help).pack(side="left", padx=4)
+        from guide import open_guide
+        ttk.Button(btnf, text="Open the illustrated guide (HTML)…", style="Primary.TButton",
+                   command=lambda: open_guide(self)).pack(side="left", padx=4)
         ttk.Button(btnf, text="Close", command=self.destroy).pack(side="right", padx=4)
         self._from = "1.0"
 
@@ -922,7 +1158,7 @@ class ScopeDlg(tk.Toplevel):
         groups = []
         for m in members:
             tables, views = list(m.db.tables()), list(m.db.views())
-            groups.append({"key": m.uid, "name": m.name, "tables": tables, "views": views,
+            groups.append({"key": m.uid, "name": m.name, "path": m.path, "tables": tables, "views": views,
                            "counts": m.counts,
                            "selected": list(m.scope_tables or ()) or tables + views})
         return cls(parent, groups=groups)
@@ -1010,11 +1246,15 @@ class ScopeDlg(tk.Toplevel):
             keys = [self._key(g, n) for n in tables + views]
             if self._multi:
                 ticked = sum(1 for k in keys if self._vars[k].get())
-                hdr = ttk.Label(self._inner, text="%s  (%d of %d listed ticked: click to tick "
-                                                  "or clear them)" % (g["name"], ticked,
-                                                                      len(keys)),
+                hdr = ttk.Label(self._inner, text="%s  — %d of %d ticked (click: tick or "
+                                                  "clear all)" % (g["name"], ticked, len(keys)),
                                 style="B.TLabel", cursor="hand2")
                 hdr.pack(anchor="w", pady=(6, 1), padx=4)
+                if g.get("path"):
+                    # the same file name in several places: the full path tells them apart
+                    ToolTip(hdr, g["path"])
+                    ttk.Label(self._inner, text=g["path"], style="M.TLabel").pack(
+                        anchor="w", padx=22)
                 hdr.bind("<Button-1>", lambda e, ks=keys: self._toggle(ks))
                 hdr.bind("<MouseWheel>", self._scope_scroll_fn)
                 self._headers.append(hdr)
@@ -1078,16 +1318,23 @@ class ScopeDlg(tk.Toplevel):
         sel = sum(1 for v in self._vars.values() if v.get())
         vis = len(self._visible_tables)
         vis_sel = sum(1 for k in self._visible_tables if self._vars[k].get())
-        self._summary.configure(text="%d of %d listed ticked  |  %d of %d ticked in all" % (
-            vis_sel, vis, sel, len(self._vars)))
+        total = len(self._vars)
+        views = sum(1 for k in self._vars if self._kinds[k][2])
+        hidden = total - vis
+        text = "%s of %s ticked (%s table%s + %s view%s)" % (
+            format(sel, ","), format(total, ","), format(total - views, ","),
+            "" if total - views == 1 else "s", format(views, ","), "" if views == 1 else "s")
+        if hidden:
+            text += "  \u00b7  %s listed, %s of them ticked (%s hidden: empty, or not " \
+                    "matching the find)" % (format(vis, ","), format(vis_sel, ","),
+                                            format(hidden, ","))
+        self._summary.configure(text=text)
         if self._multi:
             for hdr, g in zip(getattr(self, "_headers", []), self._groups):
                 tables, views = self._listed(g)
                 keys = [self._key(g, n) for n in tables + views]
-                hdr.configure(text="%s  (%d of %d listed ticked: click to tick or clear "
-                                   "them)" % (g["name"], sum(1 for k in keys
-                                                             if self._vars[k].get()),
-                                              len(keys)))
+                hdr.configure(text="%s  — %d of %d ticked (click: tick or clear all)" % (
+                    g["name"], sum(1 for k in keys if self._vars[k].get()), len(keys)))
 
     def _apply(self):
         if self._multi:
@@ -1166,6 +1413,12 @@ class RowWin(tk.Toplevel):
                 pass
         w = cls(parent, db, tbl, rid, search_term, match_col)
         cls._pool[key] = w
+
+        def forget(e, key=key, w=w):
+            # however the window goes (Close, destroy(), its app closing), it leaves the pool
+            if e.widget is w and cls._pool.get(key) is w:
+                del cls._pool[key]
+        w.bind("<Destroy>", forget, add="+")
         return w
 
     def __init__(self, parent, db, tbl, rid, search_term="", match_col=""):
@@ -1320,19 +1573,54 @@ class RowWin(tk.Toplevel):
                 out.append((row_f, key, kval, n))
             return out
 
+        shown = self._related_shown = getattr(self, "_related_shown", set())
+
         def done(result, error):
-            if error is not None or not self.winfo_exists():
+            try:
+                if error is not None or not self.winfo_exists():
+                    return
+            except tk.TclError:
                 return
             for row_f, key, kval, n in result:
-                if n and row_f.winfo_exists():
+                if n and row_f not in shown and row_f.winfo_exists():
+                    shown.add(row_f)
                     tk.Button(row_f, text="Related (%s)" % format(n, ","),
                               font=F["tiny_bold"],
                               fg=C["purple"], bg=C["bg2"], activebackground=C["acl"],
                               relief="flat", bd=0, highlightthickness=0,
                               cursor="hand2", padx=4, pady=1,
                               command=lambda k=key, v=kval: rel.related(tbl, k, v)
-                              ).grid(row=0, column=3, sticky="ne", padx=2, pady=1)
+                              ).pack(side="right", anchor="n", padx=2, pady=1,
+                                     before=row_f.pack_slaves()[1])     # right of Copy
         runner.submit("related", work, done)
+        # the link map may still be built (the first seconds after a database opens): the
+        # values are counted again once it is done, so their Related buttons still come
+        state = getattr(rel, "state", ("done",))
+        if state[0] in ("mapping", "idle") and not getattr(self, "_related_waiting", False):
+            self._related_waiting = True
+
+            def listener(st):
+                if st[0] == "mapping":
+                    return
+                try:
+                    rel.listeners.remove(listener)
+                except ValueError:
+                    pass
+                try:
+                    alive = self.winfo_exists() and not getattr(self, "_closing", False)
+                except tk.TclError:
+                    alive = False
+                if alive and st[0] == "done":
+                    runner.submit("related", work, done)
+            rel.listeners.append(listener)
+
+            def forget(e):
+                if e.widget is self:
+                    try:
+                        rel.listeners.remove(listener)
+                    except ValueError:
+                        pass
+            self.bind("<Destroy>", forget, add="+")
 
     def _set_region(self, width=None):
         """The scroll region: the stacked lines, and never shorter than the window (a
@@ -1428,10 +1716,20 @@ class RowWin(tk.Toplevel):
         return col
 
     def _populate(self):
-        # where the row is read from, always said
-        self._line(tk.Label(self._body, text=self._source_text, anchor="w", justify="left",
-                 wraplength=660, bg=C["bg"], fg=C["text2"],
-                 font=F["small"]), 6, (4, 2))
+        # where the row is read from, always said; the full path on hover and to copy
+        src = tk.Label(self._body, text=self._source_text, anchor="w", justify="left",
+                       wraplength=660, bg=C["bg"], fg=C["text2"], font=F["small"])
+        self._line(src, 6, (4, 2))
+        path = getattr(getattr(self._db, "evidence", None), "main", "") or ""
+        if path:
+            ToolTip(src, "%s\nRight-click: copy the path" % path)
+            menu = tk.Menu(src, tearoff=0)
+            menu.add_command(label="Copy the database's path",
+                             command=lambda: self._copy_text(path))
+            menu.add_command(label="Copy where the row is from",
+                             command=lambda: self._copy_text("%s\n%s" % (self._source_text,
+                                                                         path)))
+            src.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
         data, cols = self._db.full_row(self._tbl, self._rid)
         if not data:
             self._line(tk.Label(self._body, text="Row not found: no row with this key in table %s now "
@@ -1440,6 +1738,8 @@ class RowWin(tk.Toplevel):
                      fg=C["red"], bg=C["bg"], wraplength=660, justify="left",
                      anchor="w"), 6, (6, 6))
             self._place()
+            self._row_cols = []
+            self.complete = True
             return
         self._row_data = data
         self._row_cols = cols
@@ -1453,6 +1753,12 @@ class RowWin(tk.Toplevel):
                          justify="left", wraplength=660, bg=C["bg"],
                          fg=C["red"] if ROW_FLAGS[flag][2] == "flag_damaged" else C["orange"],
                          font=F["body_bold"]), 6, (4, 0))
+        body_font = tkfont.Font(font=F["body"])
+        zero_w = max(1, body_font.measure("0"))
+        name_font = tkfont.Font(font=F["mono_small_bold"])
+        name_w = max([name_font.measure(c) for c in cols] or [0]) + 12
+        self.update_idletasks()         # the window's width, for the room a value has
+
         def add(i, col):
             """One column's line: its name, its value (with dates, BLOB tools), Copy."""
             val = data.get(col)
@@ -1467,11 +1773,11 @@ class RowWin(tk.Toplevel):
                                highlightthickness=0, width=len(col) + 1)
             col_lbl.insert(0, col)
             col_lbl.configure(state="readonly")
-            col_lbl.grid(row=0, column=0, sticky="nw", padx=(4, 2), pady=1)
+            col_lbl.pack(side="left", anchor="n", padx=(4, 2), pady=1)
 
-            # Value
-            vf = tk.Frame(row_f, bg=bg)
-            vf.grid(row=0, column=1, sticky="nsew", padx=(0, 2), pady=1)
+            # Value: its widgets go straight into the line, after the name (a frame of their
+            # own was one more native window a line, ~1.6 ms each to show on Windows)
+            vf = row_f
             val_widget = None  # Track widget for highlighting
 
             if val is None:
@@ -1489,11 +1795,15 @@ class RowWin(tk.Toplevel):
                     what = what[:90] + "…"
                 tk.Label(vf, text=f"{what}  ({fmtb(len(val))})",
                          fg=C["orange"], bg=bg, font=F["small_bold"]).pack(side="left")
-                tk.Button(vf, text="Inspect BLOB…", font=F["tiny"], padx=2, pady=0,
-                          command=lambda v=val, c=col: BlobViewer(self, v, c, self._blob_context(c))
-                          ).pack(side="left", padx=2)
-                tk.Button(vf, text="Export", font=F["tiny"], padx=2, pady=0,
-                          command=lambda v=val, c=col: self._export_single(v, c)).pack(side="left", padx=2)
+                # themed buttons: readable in the dark theme too (a classic button keeps the
+                # system's light face under the theme's light text)
+                ttk.Button(vf, text="Inspect BLOB…", style="Sm.TButton",
+                           command=lambda v=val, c=col: BlobViewer(self, v, c,
+                                                                   self._blob_context(c))
+                           ).pack(side="left", padx=2)
+                ttk.Button(vf, text="Export", style="Sm.TButton",
+                           command=lambda v=val, c=col: self._export_single(v, c)
+                           ).pack(side="left", padx=2)
                 if is_image(val) and HAS_PIL:
                     try:
                         pimg = previews.thumbnail(val, (80, 80))
@@ -1527,35 +1837,48 @@ class RowWin(tk.Toplevel):
             else:
                 sv = str(val)
                 is_multiline = '\n' in sv or '\r' in sv
-                if is_multiline or len(sv) > 300:
-                    # Multi-line or long text: Text widget with scrollbar
+                # the room a value has on one line: the window less the name column, the
+                # Copy / Related buttons and the paddings (measured, never counted in
+                # characters: a count clips the last letter of a wide text, and hides the
+                # end of a long one)
+                avail = max(240, self.winfo_width() - name_w - 150)
+                px = body_font.measure(sv)
+                if is_multiline or px > avail:
+                    # wrapped, every character shown: a Text sized to its lines (a scrollbar
+                    # only when it would be taller than eight lines)
                     txt_frame = tk.Frame(vf, bg=bg)
                     txt_frame.pack(fill="x", expand=True)
-                    line_count = sv.count('\n') + 1
-                    h = min(8, max(2, line_count)) if is_multiline else min(6, max(2, len(sv) // 80))
-                    t = tk.Text(txt_frame, height=h, wrap="word",
-                                font=F["mono"], bg=bg, relief="groove", bd=1,
-                                highlightthickness=0)
-                    tsb = ttk.Scrollbar(txt_frame, orient="vertical", command=t.yview)
-                    t.configure(yscrollcommand=tsb.set)
+                    if is_multiline:
+                        lines = sum(max(1, -(-body_font.measure(ln) // avail))
+                                    for ln in sv.splitlines() or [""])
+                    else:
+                        lines = -(-px // (avail - 16))
+                    h = max(2, min(8, lines))
+                    t = tk.Text(txt_frame, height=h, wrap="char" if not is_multiline else
+                                "word", font=F["mono"], bg=bg, fg=C["text"], relief="flat",
+                                bd=0, highlightthickness=0, padx=2, pady=1)
                     t.insert("1.0", sv)
                     # Read-only but selectable: block keys except Ctrl+C, Ctrl+A, arrows
                     t.bind("<Key>", lambda e: None if (e.state & 4 and e.keysym.lower() in ('c', 'a')) else "break")
-                    tsb.pack(side="right", fill="y")
+                    if lines > 8:
+                        tsb = ttk.Scrollbar(txt_frame, orient="vertical", command=t.yview)
+                        t.configure(yscrollcommand=tsb.set)
+                        tsb.pack(side="right", fill="y")
                     t.pack(side="left", fill="both", expand=True)
                     val_widget = t
                 else:
-                    # Short single-line text: Entry widget (selectable, copyable, read-only)
+                    # one line: an Entry as wide as the text (selectable, copyable, read-only)
                     e = tk.Entry(vf, font=F["body"], bg=bg, fg=C["text"],
                                  relief="flat", bd=0, highlightthickness=0,
-                                 readonlybackground=bg, width=min(len(sv) + 2, 100))
+                                 readonlybackground=bg,
+                                 width=-(-(px + 12) // max(1, zero_w)))
                     e.insert(0, sv)
                     e.configure(state="readonly")
                     e.pack(side="left")
                     val_widget = e
                 # plausible dates of a number, beside the raw value (engine.decode.timestamps):
                 # the best reading is shown in full; the rest are demoted to a tooltip so
-                # a wrong alternative can never be mistaken for the answer (P0-1).
+                # a wrong alternative can never be mistaken for the answer.
                 _readings = self._date_readings(col, val)
                 if _readings:
                     _kind, label, when = _readings[0]
@@ -1572,13 +1895,34 @@ class RowWin(tk.Toplevel):
                                  "and \u203a Date format to write it another way")
                     re_.bind("<Button-3>", lambda e, c=col, v=val: self._value_menu(e, c, v))
                     if len(_readings) > 1:
-                        _alt = "; ".join("%s: %s" % (lb, wh)
-                                          for _k, lb, wh in _readings[1:])
-                        _alt_lbl = tk.Label(vf, text="%d other possible date%s" % (
-                            len(_readings) - 1, "" if len(_readings) == 2 else "s"),
-                            font=F["tiny"], fg=C["text2"], bg=bg, cursor="question_arrow")
-                        _alt_lbl.pack(side="left", padx=2)
-                        ToolTip(_alt_lbl, "Other possible readings (less likely):\n" + _alt)
+                        # every other reading one click away (FILETIME vs Cocoa ns, ...)
+                        _alt = "\n".join("%s: %s" % (lb, wh) for _k, lb, wh in _readings[1:])
+                        _others = len(_readings) - 1
+                        _alt_btn = tk.Button(
+                            vf, text="Read as: %d other%s \u25be" % (
+                                _others, "" if _others == 1 else "s"),
+                            font=F["tiny"], fg=C["accent"],
+                            bg=bg, activebackground=C["acl"], relief="flat", bd=0,
+                            highlightthickness=0, cursor="hand2", padx=4, pady=0)
+                        _alt_btn.configure(command=lambda b=_alt_btn, c=col, v=val,
+                                           r=_readings: self._read_as_menu(
+                                               type("E", (), {"x_root": b.winfo_rootx(),
+                                                              "y_root": b.winfo_rooty() +
+                                                              b.winfo_height()})(), c, v, r))
+                        _alt_btn.pack(side="left", padx=2)
+                        # say which reading is shown and why, and that the others are only
+                        # what the same number would mean in another format
+                        why = _readings[0][1]
+                        if "(found for the column)" in why:
+                            basis = ("found for the whole column, as the Timeline reads it")
+                        elif "(Show as date)" in why:
+                            basis = "the date kind chosen for this column in Browse"
+                        else:
+                            basis = "the most plausible reading of this value"
+                        ToolTip(_alt_btn, "Shown: %s - %s.\n\nThe same number would also "
+                                          "read as (another format, not chosen):\n%s\n\nPick "
+                                          "one to read the whole column that way." % (
+                                              why.split(" (")[0], basis, _alt))
 
             # Copy button
             cpb = tk.Button(row_f, text="Copy", font=F["tiny_bold"],
@@ -1586,7 +1930,10 @@ class RowWin(tk.Toplevel):
                             relief="flat", bd=0, highlightthickness=0,
                             cursor="hand2", padx=4, pady=1,
                             command=lambda v=val: self._copy_val(v))
-            cpb.grid(row=0, column=2, sticky="ne", padx=2, pady=1)
+            # at the right of the line, whatever the value packed after the name
+            after_name = row_f.pack_slaves()[1:2]
+            cpb.pack(side="right", anchor="n", padx=2, pady=1,
+                     **({"before": after_name[0]} if after_name else {}))
             # Rows of other tables holding this value: a button only when there are some
             # (counted on a worker below, so a large table never holds the window up)
             if rel is not None:
@@ -1725,10 +2072,10 @@ class RowWin(tk.Toplevel):
             return []
         if isinstance(val, (int, float)) and val <= 0:
             return []
+        fmt, custom = self._display_format()
         kind = self._chosen_kind(col)
         if kind is not None:
-            fmt, custom = self._display_format()
-            when = tl.formatter(kind, fmt, custom)(val)
+            when = tl.utc_text(tl.formatter(kind, fmt, custom)(val))
             if when:
                 rest = [r for r in timestamps.readings(val) if r[0] != kind]
                 return [(kind, "%s (Show as date)" % tl.LABELS[kind], when)] + rest
@@ -1736,7 +2083,64 @@ class RowWin(tk.Toplevel):
             guess = tl.name_hint(col) in ("strong", "weak")
         if not guess:
             return []
+        # the kind the date detector finds for the whole column (as the Timeline does) comes
+        # first: one value alone can read as several dates (FILETIME / Cocoa nanoseconds)
+        found = self._column_kind(col)
+        if found is not None:
+            when = tl.utc_text(tl.formatter(found, fmt, custom)(val))
+            if when and "not set" not in when:
+                rest = [r for r in timestamps.readings(val) if r[0] != found]
+                return [(found, "%s (found for the column)" % tl.LABELS[found], when)] + rest
         return timestamps.readings(val) if isinstance(val, (int, float)) else []
+
+    from date_reading import COLUMN_KINDS as _column_kinds   # shared with recovered records
+
+    def _column_kind(self, col):
+        """The date kind the detector picks for a sample of this column (cached per database
+        table and column), or None."""
+        from engine import timeline as tl
+        key = (id(self._db), self._tbl, col)
+        if key not in RowWin._column_kinds:
+            kind = None
+            try:
+                session = getattr(self._db, "session", None)
+                if session is not None:
+                    kind = tl.suggest_kind(col, tl.sample_column(session, self._tbl, col))
+            except Exception:           # noqa: BLE001 - no column reading: the value's own
+                kind = None
+            RowWin._column_kinds[key] = kind if kind in tl.KINDS else None
+        return RowWin._column_kinds[key]
+
+    def _read_as_menu(self, event, col, val, readings):
+        """'Read as ▾': every plausible reading of the value with its date; picking one makes
+        it this column's date kind (in Browse too) and shows the row again."""
+        m = tk.Menu(self, tearoff=0)
+        current = readings[0][0] if readings else None
+        for kind, label, when in readings:
+            label = label.split(" (")[0]
+            m.add_command(label="%s%s:  %s" % ("\u2713 " if kind == current else "   ",
+                                                label, when),
+                          command=lambda k=kind: self._set_column_kind(col, k))
+        m.add_separator()
+        m.add_command(label="Copy all readings", command=lambda: self._copy_text("\n".join(
+            "%s: %s" % (lb.split(" (")[0], wh) for _k, lb, wh in readings)))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def _set_column_kind(self, col, kind):
+        dates = getattr(self.master, "_browse_dates", None)
+        if dates is None:
+            return
+        try:
+            dates.set(self._tbl, col, kind)
+        except Exception:               # noqa: BLE001 - not the table Browse shows: kept
+            try:
+                dates._store(self._tbl, col, kind)
+            except Exception:           # noqa: BLE001
+                return
+        self._redisplay()
 
     def _display_format(self):
         """(format, custom strftime) chosen for dates (Browse › Date display), else ISO."""

@@ -25,7 +25,7 @@ HH:MM:SS[.fff] UTC'; ISO 8601 with 'Z' in machine-readable exports).
 """
 
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # kind -> (label, epoch, microseconds per unit as (numerator, denominator))
 KINDS = (
@@ -58,6 +58,10 @@ READING_KINDS = ("unix_s", "unix_ms", "unix_us", "unix_ns", "webkit_us", "fileti
                  "cocoa_s", "cocoa_ns", "dotnet_ticks")
 READING_MIN = 10 ** 8
 READING_EPOCH_GAP = timedelta(days=366)
+# kinds a lone number is rarely stored in: ranked after the common ones whatever their date
+# (an 18-digit FILETIME also reads as a Cocoa-nanoseconds date some 20 years earlier)
+RARE_KINDS = frozenset(("unix_ns", "cocoa_ns", "dotnet_ticks"))
+FUTURE_SLACK = timedelta(days=366)  # a date further ahead of today ranks after past dates
 
 
 def _number(value):
@@ -140,23 +144,30 @@ def fmt_utc(dt):
     return fmt_time(dt) + " UTC"
 
 
-def readings(value, kinds=READING_KINDS, lo_year=LO_YEAR, hi_year=HI_YEAR):
+def readings(value, kinds=READING_KINDS, lo_year=LO_YEAR, hi_year=HI_YEAR, now=None):
     """Plausible dates of a lone number (a row window's value, the Browse row inspector):
-    [(kind, long label, 'YYYY-MM-DD HH:MM:SS UTC')], most plausible first. Numbers below
-    READING_MIN, BLOBs, text and booleans give []; see READING_KINDS for the kinds tried."""
+    [(kind, long label, 'YYYY-MM-DD HH:MM:SS UTC')], most plausible first: the common kinds
+    before RARE_KINDS, dates up to a year ahead of `now` (default: today) before later ones,
+    then the nearest to `now`. Numbers below READING_MIN, BLOBs, text and booleans give [];
+    see READING_KINDS for the kinds tried. A column's kind is better decided from many of its
+    values (engine.timeline); this ranking is for one value on its own."""
     number = value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
     if number is None or (isinstance(number, float) and not math.isfinite(number)) \
             or abs(number) < READING_MIN:
         return []
-    out = []
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    found = []
     for kind, _text in guess(number, lo_year, hi_year):
         if kind not in kinds:
             continue
         dt = to_datetime(number, kind)
         if dt is None or abs(dt - _BY_KIND[kind][2]) <= READING_EPOCH_GAP:
             continue
-        out.append((kind, LABELS[kind], fmt_utc(dt)))
-    return out
+        key = (kind in RARE_KINDS, dt > now + FUTURE_SLACK, abs((now - dt).total_seconds()),
+               READING_KINDS.index(kind) if kind in READING_KINDS else 99)
+        found.append((key, (kind, LABELS[kind], fmt_utc(dt))))
+    found.sort(key=lambda x: x[0])
+    return [r for _k, r in found]
 
 
 def guess(value, lo_year=LO_YEAR, hi_year=HI_YEAR):

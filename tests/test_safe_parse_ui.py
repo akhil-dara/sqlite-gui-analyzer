@@ -47,7 +47,7 @@ class SafeParseUiTest(AppCase):
             self.assertIs(saved["a.db"]["safe_parse"], True)
             self.assertIs(saved["b.db"]["safe_parse"], False)
             app._refresh_header()
-            self.assertIn("1 Safe parse", app._evidence_chip.text)
+            self.assertIn("1 with Safe parse", app._evidence_chip.text)
             self.assertIn("Safe parse", app._evidence_tip.text)
             texts = " ".join(b.short for b in by["a.db"].db.banners())
             self.assertIn("Safe parse", texts)

@@ -16,7 +16,7 @@ import time
 from ..fileformat.btree import (INDEX_INTERIOR, INDEX_LEAF, TABLE_INTERIOR, TABLE_LEAF,
                                 parse_page_header)
 from ..fileformat.wal import STALE, UNCOMMITTED
-from .pages import MASTER
+from .pages import MASTER, is_btree_page
 
 INFO, WARNING, ERROR = "info", "warning", "error"
 _NONZERO = re.compile(b"[^\x00]")
@@ -53,6 +53,11 @@ def audit(fx, time_limit=30.0, dropped=None):
         _btrees(fx, out, deadline)
     except Exception as e:
         out.append(Finding(WARNING, "AUDIT_CHECK_FAILED", "b-tree check failed: %s" % e))
+    try:
+        _unreferenced(fx, out, deadline)
+    except Exception as e:
+        out.append(Finding(WARNING, "AUDIT_CHECK_FAILED",
+                           "unreferenced page check failed: %s" % e))
     if dropped:
         out.append(Finding(WARNING, "DROPPED_SCHEMA",
                            "%d dropped or redefined schema object(s) recovered" % len(dropped),
@@ -296,6 +301,39 @@ def _schema_roots(fx, out):
                                % t1))
     except Exception as e:
         out.append(Finding(ERROR, "PAGE1_TYPE", "page 1 has no b-tree header: %s" % e))
+
+
+def _unreferenced(fx, out, deadline):
+    """B-tree pages with cells that no table, index or the freelist references. SQLite never
+    leaves such pages behind in a consistent file (a freed page goes on the freelist); they
+    come from a damaged or manipulated tree (a changed root or child pointer hides live rows)
+    or from a freelist that lost pages (the rows there were deleted). Their rows are carved
+    and listed under Unreferenced pages, never as plain deleted rows."""
+    s = fx.session
+    usable = s.pager.usable_size
+    pmap = fx.eff_map
+    pages, cells = [], 0
+    for n in range(1, pmap.view.page_count + 1):
+        if deadline is not None and n % 1024 == 0 and time.time() > deadline:
+            break
+        if n == fx.lock_byte_page or pmap.status(n) != "other":
+            continue
+        data = s.pager.page(n)
+        if not is_btree_page(data, n, usable):
+            continue
+        h = parse_page_header(data, n)
+        if h.cell_count:
+            pages.append(n)
+            cells += h.cell_count
+    if pages:
+        out.append(Finding(WARNING, "UNREFERENCED_PAGES",
+                           "%d b-tree page(s) holding %d cell(s) are referenced by no table, "
+                           "index or the freelist: the tree may be damaged or manipulated "
+                           "(live rows hidden), or free pages were lost from the freelist; "
+                           "their rows are listed under Unreferenced pages"
+                           % (len(pages), cells),
+                           {"pages": pages[:MAX_LISTED], "more": max(0, len(pages) -
+                                                                     MAX_LISTED)}))
 
 
 def _btrees(fx, out, deadline):

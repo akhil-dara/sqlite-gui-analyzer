@@ -105,6 +105,11 @@ class RelationsTab(ttk.Frame):
         """All links' columns: the Database column only in a case of several databases."""
         return self.LIST_COLUMNS if self._multi else self.LIST_COLUMNS[:-1]
 
+    def shown_columns(self):
+        """The columns All links shows: not Strength (Link, Why and Values found say it in
+        words; the number stays in each row for sorting and exports)."""
+        return [c for c, _t, _w in self.columns() if c != "score"]
+
     # -- layout --------------------------------------------------------------------------------
     def _build(self):
         top = self.top_bar = FlowFrame(self)
@@ -174,7 +179,7 @@ class RelationsTab(ttk.Frame):
         self.table_tree = ttk.Treeview(left, columns=[c for c, _t, _w in cols],
                                        show="tree headings", selectmode="browse")
         self.table_tree.heading("#0", text="Table")
-        self.table_tree.column("#0", width=210, stretch=True)
+        self.table_tree.column("#0", width=300, minwidth=220, stretch=True)
         for c, title, w in cols:
             self.table_tree.heading(c, text=title)
             self.table_tree.column(c, width=w, stretch=False, anchor="e")
@@ -462,7 +467,7 @@ class RelationsTab(ttk.Frame):
         self.tree.tag_configure("verified", foreground=C["green"])
         self.tree.tag_configure("weaker", foreground=C["text2"])
         self.tree.tag_configure("value", foreground=C["orange"])
-        self.tree.configure(displaycolumns=[c for c, _t, _w in self.columns()])
+        self.tree.configure(displaycolumns=self.shown_columns())
         self.tree.bind("<Double-1>", lambda e: self.open_selected())
         TreeviewTooltip(self.tree)
 
@@ -545,7 +550,7 @@ class RelationsTab(ttk.Frame):
             members = [m for m in members if m.uid in chosen] or members
         if multi != self._multi:
             self._multi = multi
-            self.tree.configure(displaycolumns=[c for c, _t, _w in self.columns()])
+            self.tree.configure(displaycolumns=self.shown_columns())
             self.table_tree.configure(displaycolumns=["rows", "refers", "referred"] +
                                       (["across"] if multi else []))
             self.top_bar.show(self.cross_only_cb, multi)
@@ -597,9 +602,14 @@ class RelationsTab(ttk.Frame):
             if res is not None:
                 details.append("Links between databases are matched by value; " +
                                res.limits_text() + ".")
+                if res.same_tables:
+                    n_same = len(res.same_tables)
+                    text += " · %d same table%s across databases (copies, not links)" % (
+                        n_same, "" if n_same == 1 else "s")
+                    details.append(res.same_text()[0].upper() + res.same_text()[1:] + ".")
         if weaker:
             text += ", %d weaker" % weaker
-        # P1-9: 'between 0 tables' contradicts itself; count all mapped tables
+        # 'between 0 tables' would contradict itself: count all mapped tables
         n_tables = len(self.graph.nodes)
         if n_tables == 0:
             try:
@@ -644,6 +654,9 @@ class RelationsTab(ttk.Frame):
             self._rows[l.src] = l.src_rows
             self._rows[l.dst] = l.dst_rows
         self.empty_cb.configure(text="Show empty tables (%d)" % self._empty_count())
+        # in a case the widest view covers every database in scope, and says so
+        self.overview_btn.configure(text="Whole case (%d databases)" % len(self._members)
+                                    if self._multi else "Whole database")
         self.graph = TabGraph(self._scope_links(), self.erd)
         if self.focus is None or self.focus not in self.graph.nodes:
             self.focus = self._default_focus()
@@ -872,8 +885,11 @@ class RelationsTab(ttk.Frame):
             shown[1] += len(links)
             if not links:
                 return
-            head = tree.insert("", "end", text="%s (%d)" % (title, len(links)), open=open_,
-                               tags=("section",))
+            tables = len(set(other(l) for l in links))
+            head = tree.insert("", "end", text="%s: %d link%s %s %d table%s" % (
+                title, len(links), "" if len(links) == 1 else "s",
+                "from" if title == "Referred by" else "to" if title == "Refers to" else "with",
+                tables, "" if tables == 1 else "s"), open=open_, tags=("section",))
             if term and not match:
                 tree.insert(head, "end", text="(none matches “%s”)" % term, tags=("weak",))
                 return
@@ -980,9 +996,22 @@ class RelationsTab(ttk.Frame):
         return self._members.get(node[0])
 
     def open_selected(self):
+        """The column map of the selected link's column; for a link between two databases,
+        the values found in both (each opens its rows in Browse)."""
         l = self.selected()
-        if l is not None and not l.cross:
-            self.manager.column_map(l.src[1], l.src_col, self.member_of(l.src))
+        if l is None:
+            return None
+        if l.cross:
+            return CrossMatchWindow(self, l)
+        return self.manager.column_map(l.src[1], l.src_col, self.member_of(l.src))
+
+    def browse_value(self, node, column, value):
+        """Browse the rows of a table whose column holds value (its database made active)."""
+        m = self.member_of(node)
+        activate = getattr(self.app, "activate_member", None)
+        if m is not None and m.uid is not None and activate is not None:
+            activate(m)
+        self.app.browse_related(node[1], column, value)
 
     def browse_node(self, node):
         """Browse a table (its database made active first, in a case)."""
@@ -1408,9 +1437,9 @@ class RelationsTab(ttk.Frame):
             refers, referred, across = self._counts(node)
             rows = self._rows.get(node)
             self.side_title.configure(text=node_label(node))
-            self.side_info.configure(text="Refers to %d, referred by %d%s — %s rows" % (
+            self.side_info.configure(text="Refers to %d, referred by %d%s — %s rows%s" % (
                 refers, referred, ", %d across databases" % across if across else "",
-                "?" if rows is None else format(rows, ",")))
+                "?" if rows is None else format(rows, ","), self._trigger_lines(node)))
             shown = ("browse", "related", "focus")
         for k, b in self.side_btns.items():
             bar.show(b, k in shown)
@@ -1436,6 +1465,28 @@ class RelationsTab(ttk.Frame):
             self._side_rows[iid] = (l, other)
             n += 1
         self.side_search.set_count(n, len(links), "link", "links")
+
+    TRIGGER_LINES = 4           # trigger lines in the side panel; the rest are counted
+
+    def _trigger_lines(self, node):
+        """'\\n\\nTriggers ...' - what the database's triggers do on and to this table (the
+        navigator shows each one with its SQL); '' when none involve it."""
+        m = self._members.get(node[0]) if isinstance(node, tuple) else None
+        session = getattr(getattr(m, "db", None), "session", None)
+        if session is None:
+            return ""
+        try:
+            from engine.triggers import for_session
+            lines = for_session(session).table_text(node[1])
+        except Exception:               # noqa: BLE001 - nothing said then
+            return ""
+        if not lines:
+            return ""
+        shown = lines[:self.TRIGGER_LINES]
+        more = len(lines) - len(shown)
+        return "\n\nTriggers (the database does this by itself):\n" + "\n".join(
+            "• " + x for x in shown) + ("\n+%d more — each trigger with its SQL is in the "
+                                        "navigator under Triggers" % more if more else "")
 
     def _fill_rel_side(self, rel):
         """A relationship: its columns, kind and evidence, cardinality, a sample JOIN and
@@ -1659,6 +1710,158 @@ class RelationsTab(ttk.Frame):
         export_rows(self.app, "Export the links", path, "csv", names, lambda: iter(rows),
                     "Relationships: links listed", self._export_members(),
                     scope=self._export_scope(), total=len(rows), unit="links")
+
+
+def cross_matches(src_conn, src_table, src_col, dst_conn, dst_table, dst_col, limit,
+                  cancel=None):
+    """The values of src_table.src_col also found in dst_table.dst_col (two databases):
+    ([(value, rows in source, rows in target)], distinct source values read, more left)."""
+    from engine.relations import ROWID
+    from engine.schema import quote_ident
+
+    def ident(c):
+        return "rowid" if c is ROWID else quote_ident(c)
+    sc, dc = ident(src_col), ident(dst_col)
+    rows = src_conn.execute("SELECT %s, COUNT(*) FROM %s WHERE %s IS NOT NULL GROUP BY %s "
+                            "LIMIT ?" % (sc, quote_ident(src_table), sc, sc),
+                            (limit + 1,)).fetchall()
+    more = len(rows) > limit
+    rows = rows[:limit]
+    counts = dict((v, n) for v, n in rows)
+    found = {}
+    values = list(counts)
+    for i in range(0, len(values), 400):
+        if cancel is not None and cancel():
+            break
+        part = values[i:i + 400]
+        sql = "SELECT %s, COUNT(*) FROM %s WHERE %s IN (%s) GROUP BY %s" % (
+            dc, quote_ident(dst_table), dc, ",".join("?" * len(part)), dc)
+        for v, n in dst_conn.execute(sql, part):
+            found[v] = found.get(v, 0) + n
+    out = [(v, counts.get(v, 0), n) for v, n in found.items() if v in counts]
+    out.sort(key=lambda x: (-x[2], str(x[0])))
+    return out, len(rows), more
+
+
+class CrossMatchWindow(tk.Toplevel):
+    """The values a link between two databases matched: each value with its rows on both
+    sides; double-click (or the buttons) opens those rows in Browse."""
+
+    def __init__(self, tab, link):
+        tk.Toplevel.__init__(self, tab.app)
+        self.tab, self.link = tab, link
+        self.title("Values in both databases — %s → %s" % (
+            link.where(link.src, link.src_col), link.where(link.dst, link.dst_col)))
+        self.configure(bg=C["bg"])
+        self.geometry("720x460")
+        head = ttk.Frame(self)
+        head.pack(fill="x", padx=8, pady=(8, 2))
+        ttk.Label(head, text="%s  →  %s" % (link.where(link.src, link.src_col),
+                                               link.where(link.dst, link.dst_col)),
+                  style="B.TLabel").pack(anchor="w")
+        ttk.Label(head, text=link.reason, style="M.TLabel", wraplength=680,
+                  justify="left").pack(anchor="w", pady=(2, 0))
+        self.status = ttk.Label(self, text="Reading the values…", style="M.TLabel")
+        self.status.pack(fill="x", padx=8, pady=2)
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", side="bottom", padx=8, pady=6)
+        self.btn_src = ttk.Button(btns, text="Browse source rows",
+                                  command=lambda: self.browse(False), state="disabled")
+        self.btn_src.pack(side="left")
+        self.btn_dst = ttk.Button(btns, text="Browse target rows",
+                                  command=lambda: self.browse(True), state="disabled")
+        self.btn_dst.pack(side="left", padx=6)
+        ToolTip(self.btn_src, "Open the source table in Browse, filtered to the selected value")
+        ToolTip(self.btn_dst, "Open the target table in Browse, filtered to the selected value")
+        ttk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+        box = ttk.Frame(self)
+        box.pack(fill="both", expand=True, padx=8, pady=2)
+        self.tree = ttk.Treeview(box, columns=("value", "src", "dst"), show="headings",
+                                 selectmode="browse")
+        for c, title, w in (("value", "Value", 360), ("src", "Rows in %s" % link.src[0], 150),
+                            ("dst", "Rows in %s" % link.dst[0], 150)):
+            self.tree.heading(c, text=title)
+            self.tree.column(c, width=w, stretch=c == "value", anchor="w")
+        ysb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ysb.set)
+        ysb.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._selected())
+        self.tree.bind("<Double-1>", lambda e: self.browse(False))
+        self.values = []
+        self._result = None
+        self._stop = False
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Destroy>", lambda e: e.widget is self and setattr(self, "_stop", True))
+        self.start()
+
+    def start(self):
+        l = self.link
+        src_m, dst_m = self.tab.member_of(l.src), self.tab.member_of(l.dst)
+        if src_m is None or dst_m is None or src_m.db.session is None or \
+                dst_m.db.session is None:
+            self.status.configure(text="One of the two databases is not open any more.")
+            return
+        limit = limits.get("relations_cross_values")
+        self._limit = limit
+        src_s, dst_s = src_m.db.session, dst_m.db.session
+
+        def work():
+            try:
+                self._result = (cross_matches(src_s.conn(), l.src[1], l.src_col, dst_s.conn(),
+                                              l.dst[1], l.dst_col, limit,
+                                              lambda: self._stop), None)
+            except Exception as e:      # noqa: BLE001 - shown in the window
+                self._result = (None, e)
+            finally:
+                try:
+                    self.tab.app._release_worker_connection()
+                except Exception:       # noqa: BLE001 - nothing to report it to
+                    pass
+        import threading
+        threading.Thread(target=work, daemon=True).start()
+        self._poll()
+
+    def _poll(self):
+        if self._stop or not self.winfo_exists():
+            return
+        if self._result is None:
+            self.after(60, self._poll)
+            return
+        self.show(*self._result)
+
+    def show(self, result, error=None):
+        if error is not None:
+            self.status.configure(text="The values could not be read: %s" % error)
+            return
+        rows, read, more = result
+        self.values = rows
+        self.tree.delete(*self.tree.get_children())
+        for i, (v, a, b) in enumerate(rows):
+            self.tree.insert("", "end", iid=str(i), values=(
+                "NULL" if v is None else str(v)[:300], format(a, ","), format(b, ",")))
+        text = "%s of %s distinct %s found in %s" % (
+            format(len(rows), ","), format(read, ","),
+            "value" if read == 1 else "values", self.link.where(self.link.dst, self.link.dst_col))
+        if more:
+            text += " (only the first %s distinct source values were read)" % format(read, ",")
+        self.status.configure(text=text + ". Double-click a value to see its rows.")
+
+    def _selected(self):
+        state = "normal" if self.tree.selection() else "disabled"
+        self.btn_src.configure(state=state)
+        self.btn_dst.configure(state=state)
+
+    def browse(self, target):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        v = self.values[int(sel[0])][0]
+        l = self.link
+        if target:
+            self.tab.browse_value(l.dst, l.dst_col, v)
+        else:
+            self.tab.browse_value(l.src, l.src_col, v)
 
 
 def _move_selection(tree, forward=True, want=None):

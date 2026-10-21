@@ -8,6 +8,7 @@ import struct
 import unittest
 
 from tests.helpers import TempDirTest, dir_snapshot
+from engine.forensics import report as rp
 from tests.test_html_report import check_page
 from engine.html_report import read_rows
 from tests.fixtures import forensic_fixtures as ff
@@ -135,7 +136,9 @@ class ReportTest(Base):
         self.assertIn("&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;", page)
         recovered = [t for t in read_rows(page).values() if t["name"] == "Recovered records"]
         self.assertEqual(len(recovered[0]["rows"]), len(res))
-        self.assertTrue(any(self.HOSTILE in str(r[10]) for r in recovered[0]["rows"]))
+        preview_at = list(rp.RECORD_FIELDS).index("preview")
+        self.assertTrue(any(self.HOSTILE in str(r[preview_at]) for r in recovered[0]["rows"]))
+        self.assertEqual(recovered[0]["fields"][:2], ["state", "table"])             if "fields" in recovered[0] else None
         self.assertIn("9.9", page)
         with open(os.path.join(out, "report.json"), encoding="utf-8") as f:
             data = json.load(f)

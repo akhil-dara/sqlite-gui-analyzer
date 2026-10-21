@@ -123,7 +123,8 @@ def provenance_text(entry):
     if p.get("index"):
         parts.append("index entry of %s" % p["index"])
     if p.get("frame") is not None:
-        parts.append("WAL frame %s%s" % (p["frame"], " (%s)" % p["frame_state"]
+        parts.append("WAL frame %s%s" % (p["frame"] + 1 if isinstance(p["frame"], int)
+                                         else p["frame"], " (%s)" % p["frame_state"]
                                          if p.get("frame_state") else ""))
     elif p.get("frame_state"):
         parts.append(str(p["frame_state"]))
@@ -316,13 +317,22 @@ def html_report(entries, defs, info, layout="tag", title=None):
 
 def export_html(path, entries, defs, info, layout="tag", protected=None, title=None):
     """Write the HTML report to path (streamed; a very large group continues in part files
-    next to it, listed in the report); returns the path."""
+    next to it, listed in the report) and its <name>.manifest.json (tool, evidence, the
+    files with their SHA-256), as every other export; returns the path."""
+    from .export import write_manifest
     from .html_report import ReportError
     _check(protected, path)
     try:
-        build_report(entries, defs, info, layout, title).write(path, protected)
+        res = build_report(entries, defs, info, layout, title).write(path, protected)
     except ReportError as e:
         raise TagExportError(str(e))
+    prov = dict(info or {})
+    prov["source"] = "tagged rows (HTML report, by %s)" % layout
+    try:
+        write_manifest(path, prov, [path] + list(getattr(res, "parts", None) or ()),
+                       getattr(res, "complete", True), protected)
+    except OSError as e:
+        raise TagExportError("the report was written but its manifest could not be: %s" % e)
     return path
 
 

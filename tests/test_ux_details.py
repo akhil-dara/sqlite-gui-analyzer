@@ -1,4 +1,4 @@
-"""This round's UX fixes, by introspection: zone names, 'not set' dates, hide empty tables,
+"""UX details, by introspection: zone names, 'not set' dates, hide empty tables,
 full column types, Row History's per-table counts, the diagram's view control, the logo."""
 
 import os
@@ -51,7 +51,7 @@ class LogoTest(unittest.TestCase):
         self.assertTrue(appicons.logo_path(999).endswith("logo_256.png"))
 
 
-class Round5AppTest(TempDirTest):
+class UxDetailsAppTest(TempDirTest):
     def setUp(self):
         TempDirTest.setUp(self)
         self.data = tempfile.mkdtemp(prefix="sga_r5_data_")

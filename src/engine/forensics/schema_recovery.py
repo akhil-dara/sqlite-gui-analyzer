@@ -89,6 +89,7 @@ def recover(fx, cancel=None, deadline=None):
                     sources=(FREEBLOCK, UNALLOCATED, FREELIST, ORPHAN, WAL, REPLACED, JOURNAL),
                     cancel=cancel, deadline=deadline, include_schema=True, unattributed=False,
                     page_filter=wanted, free_filter=lambda data: bool(_CREATE_BYTES.search(data)))
+    carver.stage_label = "Looking for dropped tables"
     result = carver.run()
     current = {}
     for e in fx.session.schema.entries:

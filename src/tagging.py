@@ -18,6 +18,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 from constants import C, VERSION, wal_state_label
 from tokens import FONT as F
+from tokens import COLOR as _K, current_theme
 from engine import limits
 from engine.tag_export import (evidence_files, export_csv, export_html, export_info,
                                export_json)
@@ -48,6 +49,21 @@ def recent_entry(path, text=None):
     there = os.path.isfile(path)
     return "%s%s" % (text, "" if there else "  (not found)"), "normal" if there else "disabled"
 
+
+
+def row_tint(color):
+    """The background of a tagged row: the tag's colour as a light wash on the light theme
+    (light enough not to look selected), mixed into the dark card colour on the dark theme
+    (a light background under the dark theme's light text could not be read)."""
+    if current_theme() == "dark":
+        base = _K["card"]
+        try:
+            c = [int(color[k:k + 2], 16) for k in (1, 3, 5)]
+            b = [int(base[k:k + 2], 16) for k in (1, 3, 5)]
+        except (TypeError, ValueError, IndexError):
+            return base
+        return "#%02x%02x%02x" % tuple(int(bb + (cc - bb) * 0.28) for cc, bb in zip(c, b))
+    return tint(color, 0.88)
 
 class HitGroup(object):
     """One search hit shaped like a search_results.RowGroup (the flat result list)."""
@@ -630,7 +646,7 @@ class Tagging(object):
         if not tags:
             return None, None
         color = store.color_of(tags[0])
-        return tint(color), color
+        return row_tint(color), color
 
     def _group_key(self, g):
         first = g.hits[0] if g.hits else None
@@ -1059,7 +1075,7 @@ class Tagging(object):
         defs = store.defs if store is not None else []
         index = dict((d.name, i) for i, d in enumerate(defs))
         for i, d in enumerate(defs):
-            tree.tag_configure("tagcol%d" % i, background=tint(d.color))
+            tree.tag_configure("tagcol%d" % i, background=row_tint(d.color))
         for pos, iid in enumerate(tree.get_children("")):
             hit, g = app._sr_iid_map.get(iid, (None, None))
             if hit is None:
@@ -1080,7 +1096,7 @@ class Tagging(object):
                     tags.append("tagcol%d" % index.get(names[0], 0))
             elif not wal and "odd" not in tags and "even" not in tags:
                 tags.append("odd" if pos % 2 else "even")
-            tree.set(iid, "Source", label)
+            tree.set(iid, "Kind", label)
             tree.item(iid, tags=tags)
 
     # -- opening a tagged row -------------------------------------------------------------------------

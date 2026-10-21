@@ -10,6 +10,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
+os.environ.setdefault("SGA_NO_EXIT_QUESTION", "1")   # no modal question on close
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 

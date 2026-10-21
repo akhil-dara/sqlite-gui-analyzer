@@ -26,6 +26,7 @@ Limits: the checklist lists at most limits 'filter_distinct_values' values, coun
 most 'filter_distinct_scan_rows' rows; the popover says so when either cut something.
 """
 
+import bisect
 import collections
 import heapq
 import json
@@ -1354,6 +1355,54 @@ def _elide(text, font, avail):
     return text[:lo] + "…"
 
 
+FINE_BINS = 4               # the source counts this many times more bins than drawn
+
+
+def merge_bins(edges, totals, step, most):
+    """(edges, totals, step, step name) of bins merged k at a time so that at most `most`
+    are drawn (k = 1: as given)."""
+    from density import STEPS, STEP_NAMES
+    n = len(totals)
+    k = max(1, -(-n // max(1, most)))
+    if k == 1:
+        name = STEP_NAMES[STEPS.index(step)] if step in STEPS else ""
+        return list(edges), list(totals), step, name
+    out_e, out_t = [], []
+    for i in range(0, n, k):
+        out_e.append(edges[i])
+        out_t.append(sum(totals[i:i + k]))
+    out_e.append(edges[min(n, len(edges) - 1)])
+    big = step * k
+    if big in STEPS:
+        name = STEP_NAMES[STEPS.index(big)]
+    elif big.days >= 1:
+        name = "%d days" % big.days
+    else:
+        name = "%d minutes" % max(1, int(big.total_seconds() // 60))
+    return out_e, out_t, big, name
+
+
+def busy_bins(totals):
+    """(first, end) indexes of the bins holding all but density.FOCUS_TAIL of the counts at
+    each end, when they are fewer than density.FOCUS_SHARE of the bins; else None."""
+    from density import FOCUS_MIN, FOCUS_SHARE, FOCUS_TAIL
+    total = sum(totals)
+    if total < FOCUS_MIN or len(totals) < 8:
+        return None
+    cut = total * FOCUS_TAIL
+    i, acc = 0, 0
+    while i < len(totals) and acc + totals[i] <= cut:
+        acc += totals[i]
+        i += 1
+    j, acc = len(totals), 0
+    while j > i and acc + totals[j - 1] <= cut:
+        acc += totals[j - 1]
+        j -= 1
+    if j - i >= FOCUS_SHARE * len(totals):
+        return None
+    return i, j
+
+
 def _density_class():
     from density import DensityChart
 
@@ -1361,14 +1410,44 @@ def _density_class():
         """The popover's histogram: bins counted by the source (not a list of times)."""
 
         def set_bins(self, bins):
+            """The source's (fine) bins; drawn merged to a readable number of bars, on their
+            busy part when a few far dates would squash the rest (as the Timeline's chart)."""
             self.keys, self.per, self.selection = None, {}, None
+            self.view, self.view_auto, self.outside = None, False, (0, 0)
             if bins is None or not bins.edges:
+                self._fine = None
                 self.times, self.edges, self.totals = [], [], []
                 self.step, self.step_name = None, ""
             else:
+                self._fine = (list(bins.edges), list(bins.totals), bins.step)
                 self.times = [bins.edges[0], bins.edges[-1]]
-                self.edges, self.totals = list(bins.edges), list(bins.totals)
-                self.step, self.step_name = bins.step, bins.step_name
+                busy = busy_bins(bins.totals)
+                if busy is not None:
+                    self.view_auto = True
+                    self._show(*busy)
+                else:
+                    self._show(0, len(bins.totals))
+            self.redraw()
+
+        def _show(self, i, j):
+            edges, totals, step = self._fine
+            self.edges, self.totals, self.step, self.step_name = merge_bins(
+                edges[i:j + 1], totals[i:j], step, 60)
+            whole = (0, len(totals))
+            self.view = None if (i, j) == whole else (edges[i], edges[j])
+            self.outside = (sum(totals[:i]), sum(totals[j:]))
+
+        def set_view(self, start=None, end=None):
+            if getattr(self, "_fine", None) is None:
+                return
+            edges, totals, _step = self._fine
+            self.view_auto = False
+            if start is None or end is None:
+                self._show(0, len(totals))
+            else:
+                i = max(0, bisect.bisect_right(edges, start) - 1)
+                j = min(len(totals), max(i + 1, bisect.bisect_left(edges, end)))
+                self._show(i, j)
             self.redraw()
 
         def _bin(self):
@@ -2122,7 +2201,7 @@ class FilterPopover(tk.Toplevel):
                                                                  cancel), done)
         if self.chart is not None:
             kind = self.ct.date_kind
-            most = 60
+            most = 60 * FINE_BINS           # finer: the chart can show its busy part closely
             self._job("bins", lambda cancel: source_date_bins(src, column, flt, kind, most, scan,
                                                               cancel), self._got_bins)
 
@@ -2171,7 +2250,7 @@ class FilterPopover(tk.Toplevel):
             have = set(e.key for e in self._entries)
             if self._base_entries is None:
                 self._base_entries = list(self._entries)
-            new = [e for e in build_entries(result.values, self.ctx["display"])
+            new = [e for e in build_entries(result.values, self._label_of())
                    if e.key not in have]
             ticked = set(self.values.ticked) | set(e.key for e in new)
             self._entries = self._entries + new
@@ -2187,14 +2266,31 @@ class FilterPopover(tk.Toplevel):
         self._job("vsearch", lambda cancel: source_distinct(src, column, flt, limit, scan,
                                                             cancel), done)
 
+    def _label_of(self):
+        """How a value reads in the checklist: as the grid shows it; a column found to hold
+        dates but shown as stored numbers reads 'date · stored value' (a list of
+        1721147289700 says nothing; the stored value is never hidden)."""
+        display = self.ctx["display"]
+        ct = getattr(self, "ct", None)
+        if ct is None or ct.kind != "date" or not ct.date_kind:
+            return display
+        to_text = tl.formatter(ct.date_kind)
+
+        def label(v):
+            shown = display(v)
+            if shown != str(v) or isinstance(v, bool) or not isinstance(v, (int, float, str)):
+                return shown            # already shown as a date (or not a number)
+            when = to_text(v)
+            return "%s · %s" % (when, shown) if when else shown
+        return label
+
     def _got_distinct(self, result, error):
         if error is not None:
             if not isinstance(error, Cancelled):
                 self.values_note.configure(text="Could not read the values: %s" % error)
             return
         self._distinct = result
-        display = self.ctx["display"]
-        self._entries = build_entries(result.values, display)
+        self._entries = build_entries(result.values, self._label_of())
         ticked = set(e.key for e in self._entries)
         lst = self._pending_list
         if lst is not None:

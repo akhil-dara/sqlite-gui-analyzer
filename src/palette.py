@@ -47,10 +47,13 @@ def score(query, text):
 
 
 class Item(object):
-    __slots__ = ("kind", "label", "where", "key", "run", "text")
+    """weight: how much a table holds (its rows) - among equally good matches the bigger
+    table comes first (wa_contacts before system_contacts_version_table)."""
+    __slots__ = ("kind", "label", "where", "key", "run", "text", "weight")
 
-    def __init__(self, kind, label, where, key, run):
+    def __init__(self, kind, label, where, key, run, weight=0):
         self.kind, self.label, self.where, self.key, self.run = kind, label, where, key, run
+        self.weight = weight
         self.text = label if kind in ("action", "tab") else "%s %s" % (label, where)
 
 
@@ -70,8 +73,24 @@ def rank(query, items, recent=()):
             s = None if s2 is None else s2 + 1
         if s is not None:
             out.append((s, KIND_ORDER.get(it.kind, 9), i, it))
-    out.sort(key=lambda x: (x[0], x[1], x[2]))
+    # equally good matches: an internal table last (full-text-search shadow tables, sqlite_),
+    # then the bigger, then the shorter name
+    out.sort(key=lambda x: (x[0], x[1], _internal(x[3]), -(x[3].weight or 0),
+                            len(x[3].label), x[2]))
     return [(it, s) for s, _k, _i, it in out]
+
+
+_SHADOW = ("_content", "_segments", "_segdir", "_docsize", "_stat", "_data", "_idx",
+           "_config")
+
+
+def _internal(it):
+    """1 for tables a user rarely means: sqlite_*, and the shadow tables of a full-text index
+    (x_fts_content, x_fts_segdir ...)."""
+    if it.kind != "table":
+        return 0
+    n = it.label.lower()
+    return 1 if n.startswith("sqlite_") or ("_fts" in n and n.endswith(_SHADOW)) else 0
 
 
 class CommandPalette(tk.Toplevel):

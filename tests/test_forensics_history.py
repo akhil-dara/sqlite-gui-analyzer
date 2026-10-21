@@ -46,7 +46,7 @@ class RowHistoryTest(Base):
         gone = h.versions[-1]
         self.assertFalse(gone.present)
         self.assertEqual(gone.commit_group, 3)
-        self.assertIn("commit 3", gone.note)
+        self.assertIn("commit 4", gone.note)          # numbered from 1, as the WAL tab shows it
 
     def test_rowid_reuse_is_detected(self):
         s = self.open(ff.wal_history(self.tmp))

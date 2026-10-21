@@ -25,7 +25,7 @@ DEFAULTS = {
     "crossdb_profile_rows": 50000,      # rows read per column to sample them
     "crossdb_check_values": 200,        # values looked up in the other column per check
     "crossdb_min_shared": 3,            # sampled values two columns must share to be checked
-    "crossdb_min_found": 3,             # values a trusted link must have found
+    "crossdb_min_found": 10,            # values a trusted link must have found
     "crossdb_max_pairs": 5000,          # candidate column pairs checked at most
     "crossdb_common_value_columns": 50,  # a value in more columns than this links nothing
     # links inside a database (engine.relations)
@@ -124,6 +124,15 @@ DEFAULTS = {
     "html_thumb_bytes": 256 << 10,      # image BLOBs up to this size are shown as pictures
     "html_decoded_bytes": 256 << 10,    # BLOBs up to this size get their decoded value
     "html_decoded_chars": 20000,        # characters of that decoded value kept
+    "auto_recover_bytes": 256 << 20,    # databases up to this size are recovered on open
+    "search_recover_seconds": 300,      # a Search with 'Recovered records' recovers this long at most
+    "relations_cross_values": 2000,     # distinct values compared for a cross-database link
+    "query_rows": 1000000,              # rows one query returns at most (Query / SQL tab)
+    "blob_fields_sample": 1000,         # rows decoded to list the fields inside a column
+    "blob_fields_paths": 3000,          # field paths listed for one column at most
+    "derived_scan_rows": 200000,        # rows read into memory to sort / filter a derived column
+    "value_list_values": 1000,          # distinct values 'Pick values…' lists at most
+    "missing_keys_listed": 100000,      # missing row numbers listed one by one (all counted)
     "html_top_distinct": 10000,         # distinct values counted per column for 'top values'
     # untrusted input: SQL from the evidence, native parsing, decoders, previews
     "schema_replay_steps": 2000000,     # SQLite steps one replayed CREATE statement may take
@@ -251,6 +260,15 @@ RANGES = {
     "html_thumb_bytes": (0, 64 << 20),
     "html_decoded_bytes": (0, 64 << 20),
     "html_decoded_chars": (100, 10000000),
+    "auto_recover_bytes": (0, 1 << 40),
+    "search_recover_seconds": (10, 86400),
+    "relations_cross_values": (10, 10000000),
+    "query_rows": (1, 100000000),
+    "blob_fields_sample": (10, 1000000),
+    "blob_fields_paths": (10, 1000000),
+    "derived_scan_rows": (1000, 50000000),
+    "value_list_values": (10, 1000000),
+    "missing_keys_listed": (10, 100000000),
     "html_top_distinct": (10, 10000000),
     "schema_replay_steps": (10000, 1 << 40),
     "schema_value_bytes": (1 << 16, (1 << 31) - 1),
@@ -293,7 +311,9 @@ DESCRIPTIONS = {
     "crossdb_profile_rows": "rows read per column to sample them",
     "crossdb_check_values": "values looked up in the other column per check",
     "crossdb_min_shared": "sampled values two columns must share to be checked",
-    "crossdb_min_found": "values a trusted link between databases must have found",
+    "crossdb_min_found": "distinct values a trusted link between databases must have found "
+                         "(fewer is weak evidence: a few shared settings keys or small "
+                         "numbers match in any two databases)",
     "crossdb_max_pairs": "candidate column pairs checked at most",
     "crossdb_common_value_columns": "a value in more columns than this links nothing",
     "relations_min_name_values": "distinct values a link found by a column's name must match "
@@ -414,6 +434,27 @@ DESCRIPTIONS = {
                         "larger one is described and the report says why it is not shown",
     "html_decoded_bytes": "BLOBs up to this size get their decoded value (XML plist, protobuf "
                           "fields or JSON) in an HTML report's row details; 0: none",
+    "blob_fields_sample": "rows of a column decoded to list the fields found inside its "
+                          "values (Fields inside...)",
+    "missing_keys_listed": "missing row numbers listed one by one (Missing rows…); all are "
+                           "counted and given as ranges, the list says when it stops",
+    "value_list_values": "different values of a column 'Pick values…' lists (most frequent "
+                         "first); the list says when there were more",
+    "blob_fields_paths": "field paths listed for one column (Fields inside...); the list "
+                         "says when there were more",
+    "derived_scan_rows": "rows read into memory when a column the tool derives from a BLOB / "
+                         "JSON column (Fields inside...) is sorted or filtered in Browse; a "
+                         "larger table is sorted / filtered over its first rows only, and the "
+                         "status says so",
+    "query_rows": "rows one query of the Query or SQL tab returns at most, also with 'All "
+                  "rows', to protect memory (the results say when a query reaches it)",
+    "relations_cross_values": "distinct values of a link's source column compared with the "
+                              "other database when its matching values are listed; the "
+                              "window says when more were left",
+    "auto_recover_bytes": "databases up to this size (with their WAL and journal) have their "
+                          "deleted records recovered in the background after opening; 0 turns "
+                          "it off (Forensics › Recover deleted records still works)",
+    "search_recover_seconds": "seconds a Search with 'Recovered records' ticked spends recovering a database's deleted records when Forensics has not recovered it yet; at the limit the search goes on with what was recovered so far and says so (the Forensics tab recovers without this limit)",
     "html_decoded_chars": "characters of a BLOB's decoded value an HTML report keeps; the "
                           "report says when one is cut",
     "html_top_distinct": "distinct values an HTML report counts per column for its 'top "

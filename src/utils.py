@@ -284,12 +284,15 @@ def json_value(v):
 
 
 def _snippet(text, term, mode_key, ctx=150):
-    """Extract snippet of text around where term matches, for search display."""
+    """Extract snippet of text around where term matches, for search display: the match
+    near its start (a Preview column shows some 60 characters, so a match 200 characters into
+    a JSON value would not be seen), with '...' where text is left out."""
     if text is None:
         return "NULL"
     s = str(text)
-    if len(s) <= 400:
+    if len(s) <= 80:
         return s
+    lead = 24                           # characters kept before the match (a Preview cell shows ~60)
     # Find match position
     if mode_key == "rx":
         try:
@@ -302,9 +305,9 @@ def _snippet(text, term, mode_key, ctx=150):
     else:
         pos = s.lower().find(term.lower())
     if pos == -1:
-        return s[:400] + "..."
-    start = max(0, pos - ctx)
-    end = min(len(s), pos + len(term) + ctx)
+        return s if len(s) <= 400 else s[:400] + "..."
+    start = 0 if pos <= lead else pos - lead
+    end = min(len(s), max(start + 400, pos + len(term) + ctx))
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(s) else ""
     return f"{prefix}{s[start:end]}{suffix}"
