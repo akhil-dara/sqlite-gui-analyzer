@@ -1419,6 +1419,10 @@ def run_one(app, src_db, idx):
         raw = grid.row_data(row)[0][c]
         shown = grid.display_text(raw, c)
         grid.set_current_cell(row, c)
+        # the row may have scrolled into view (large text: fewer rows fit): let the grid draw
+        # there first, or the redraw hides the tip as it does whenever the rows move under it
+        grid.redraw_now()
+        app.update_idletasks()
         tip = grid.show_cell_tip(row, c, -5000, -5000)
         grid._tip_hide()
         note(tag, "date format %s.%s: %r -> %r (%s)" % (col.table, col.column, raw, shown,

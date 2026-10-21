@@ -166,8 +166,8 @@ class ViewerTest(unittest.TestCase):
         v.withdraw()
         opened = time.time() - t0
         worst = self.pump(v)
-        self.assertLess(opened, 1.0)
-        self.assertLess(worst, 1.0, "the window stopped responding for %.2fs" % worst)
+        within(self, opened, 1.0, "opening a 6.6 MB value")
+        within(self, worst, 1.0, "the longest pause while it fills")
         v.find_var.set("abcdefghij")
         v.find_next()
         self.assertEqual(v.match_count(), 300000)
