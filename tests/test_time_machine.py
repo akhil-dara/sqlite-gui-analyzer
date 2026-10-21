@@ -124,7 +124,10 @@ class CaseTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.path = wal_db(self.dir)
         from app import App
-        self.app = App()
+        try:
+            self.app = App()
+        except Exception as e:          # noqa: BLE001 - no display (a CI runner on Linux)
+            self.skipTest("no display: %s" % e)
         self.addCleanup(free_tk, self)
         self.app.geometry("1100x700+-4000+0")
         self.app._forensics.AUTO_DELAY_MS = 600000

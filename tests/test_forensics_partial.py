@@ -58,6 +58,8 @@ class UnallocatedPartialTest(unittest.TestCase):
         cls.dir = tempfile.mkdtemp()
         p = os.path.join(cls.dir, "places.db")
         c = sqlite3.connect(p)
+        # deleted rows kept: some SQLite builds (Debian's and Ubuntu's) zero them by default
+        c.execute("PRAGMA secure_delete=OFF")
         c.execute("PRAGMA page_size=1024")
         c.execute("CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT, "
                   "visit_count INTEGER, last_visit_date INTEGER)")
