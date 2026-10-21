@@ -6,8 +6,9 @@ release.
 ## 3.0.0
 
 Deleted-record recovery rebuilt around what examiners need to trust it, a query builder that
-needs no SQL, the values inside BLOBs as columns, and plain words for what a database does by
-itself.
+needs no SQL, the values inside BLOBs as columns, formulas of your own, folder scans picked by
+your own conditions, scrolling that keeps up with millions of rows, and plain words for what a
+database does by itself.
 
 ### Highlights
 
