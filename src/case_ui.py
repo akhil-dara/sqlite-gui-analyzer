@@ -168,13 +168,18 @@ class OpenFolderDialog(tk.Toplevel):
         frame.pack(fill="x", padx=8, pady=(6, 0))
         head = ttk.Frame(frame)
         head.pack(fill="x")
-        ttk.Label(head, text="2  Which files", style="Heading.TLabel").pack(side="left", padx=(0, 8))
+        # a grid, the hint's column the only one with weight: on a narrow window the hint
+        # gives up room first, never the button or the Match choice
+        ttk.Label(head, text="2  Which files", style="Heading.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8))
         self.cond_hint = ttk.Label(head, text="every SQLite file (optional: add conditions "
                                              "to look for particular files)",
                                    style="M.TLabel")
-        self.cond_hint.pack(side="left")
-        ttk.Button(head, text="+ Add a condition", command=self.add_condition).pack(
-            side="left", padx=8)
+        self.cond_hint.grid(row=0, column=1, sticky="w")
+        ttk.Button(head, text="+ Add a condition", command=self.add_condition).grid(
+            row=0, column=2, sticky="w", padx=8)
+        head.columnconfigure(1, weight=1)
+        head.columnconfigure(4, weight=100)     # (the room left over goes after the row)
         self.mode_frame = ttk.Frame(head)
         ttk.Label(self.mode_frame, text="Match").pack(side="left")
         self.mode_var = tk.StringVar(value="all")
@@ -320,9 +325,9 @@ class OpenFolderDialog(tk.Toplevel):
         complete = [c for c in self.condition_list() if c.complete()]
         if len(self.conditions) >= 2:
             if not self.mode_frame.winfo_manager():
-                self.mode_frame.pack(side="left", padx=4)
+                self.mode_frame.grid(row=0, column=3, sticky="w", padx=4)
         elif self.mode_frame.winfo_manager():
-            self.mode_frame.pack_forget()
+            self.mode_frame.grid_remove()
         self.cond_hint.configure(text="every SQLite file (optional: add conditions to look "
                                       "for particular files)" if not self.conditions else
                                  "the files where:")

@@ -724,7 +724,9 @@ class ForensicsTab(ttk.Frame):
                 len(text), ",")
         return "%s\n%s%s" % (col, text, "\n" + date if date else "")
 
-    REC_COLUMN_BASE = {"col": 70, "value": 80, "date": 90}   # px; Tk stretches them to fit
+    # px; Tk stretches them to fill a wider panel but never shrinks them below these, so
+    # together they fit the narrowest panel (180 px) - a small screen gives a narrow one
+    REC_COLUMN_BASE = {"col": 60, "value": 55, "date": 60}
 
     def _fit_rec_columns(self):
         """The record's columns fill the panel: the Date column only when a value reads as a
